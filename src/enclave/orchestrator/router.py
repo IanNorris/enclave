@@ -111,21 +111,22 @@ class MessageRouter:
         thread_id = self._get_thread_id(source)
 
         # 👀 Acknowledge receipt
+        eyes_eid = None
         if event_id:
-            await self.matrix.send_reaction(room_id, event_id, "👀")
+            eyes_eid = await self.matrix.send_reaction(room_id, event_id, "👀")
 
         if room_id == self.control_room_id:
             await self._handle_control_message(
-                sender, body, source, event_id
+                sender, body, source, event_id, eyes_eid
             )
         else:
             await self._handle_project_message(
-                room_id, sender, body, source, thread_id, event_id
+                room_id, sender, body, source, thread_id, event_id, eyes_eid
             )
 
     async def _handle_control_message(
         self, sender: str, body: str, source: dict[str, Any],
-        event_id: str | None = None,
+        event_id: str | None = None, eyes_eid: str | None = None,
     ) -> None:
         """Handle a message in the control room."""
         cmd = parse_command(body)
@@ -134,11 +135,13 @@ class MessageRouter:
 
         log.info("Command from %s: %s %s", sender, cmd.command.value, cmd.raw_args)
 
-        # 🌧 Mark as processing + typing indicator
-        rain_eid = None
+        # Remove 👀, add 🤔 + typing indicator
+        if eyes_eid:
+            await self.matrix.redact_event(self.control_room_id, eyes_eid)
+        thinking_eid = None
         if event_id:
-            rain_eid = await self.matrix.send_reaction(
-                self.control_room_id, event_id, "🌧️"
+            thinking_eid = await self.matrix.send_reaction(
+                self.control_room_id, event_id, "🤔"
             )
         await self.matrix.set_typing(self.control_room_id, True)
 
@@ -163,11 +166,11 @@ class MessageRouter:
                     f"Command `{cmd.command.value}` not yet implemented."
                 )
         finally:
-            # ✅ Done — remove 🌧, add ✅, stop typing
+            # ✅ Done — remove 🤔, add ✅, stop typing
             await self.matrix.set_typing(self.control_room_id, False)
-            if rain_eid:
+            if thinking_eid:
                 await self.matrix.redact_event(
-                    self.control_room_id, rain_eid
+                    self.control_room_id, thinking_eid
                 )
             if event_id:
                 await self.matrix.send_reaction(
@@ -182,6 +185,7 @@ class MessageRouter:
         source: dict[str, Any],
         thread_id: str | None,
         event_id: str | None = None,
+        eyes_eid: str | None = None,
     ) -> None:
         """Handle a message in a project room — forward to the agent."""
         session = self.containers.get_session_by_room(room_id)
@@ -197,14 +201,15 @@ class MessageRouter:
             )
             return
 
-        # 🌧 Mark as processing + typing
-        rain_eid = None
+        # Remove 👀, add 🤔 + typing
+        if eyes_eid:
+            await self.matrix.redact_event(room_id, eyes_eid)
+        thinking_eid = None
         if event_id:
-            rain_eid = await self.matrix.send_reaction(
-                room_id, event_id, "🌧️"
+            thinking_eid = await self.matrix.send_reaction(
+                room_id, event_id, "🤔"
             )
-            # Store rain reaction for cleanup when agent responds
-            self._pending_reactions[f"{room_id}:{event_id}"] = rain_eid or ""
+            self._pending_reactions[f"{room_id}:{event_id}"] = thinking_eid or ""
         await self.matrix.set_typing(room_id, True)
 
         # Store context for routing the response back
@@ -228,8 +233,8 @@ class MessageRouter:
         sent = await self.ipc.send_to(session.id, msg)
         if not sent:
             await self.matrix.set_typing(room_id, False)
-            if rain_eid:
-                await self.matrix.redact_event(room_id, rain_eid)
+            if thinking_eid:
+                await self.matrix.redact_event(room_id, thinking_eid)
             await self.matrix.send_message(
                 room_id,
                 "❌ Failed to reach the agent. It may have disconnected.",
@@ -288,7 +293,7 @@ class MessageRouter:
             thread_event_id=thread_id,
         )
 
-        # Complete the emoji flow: remove 🌧, add ✅
+        # Complete the emoji flow: remove 🤔, add ✅
         user_event_id = self._thread_events.pop(
             f"{session.id}:event_id", None
         )
@@ -296,10 +301,10 @@ class MessageRouter:
             f"{session.id}:room_id", None
         )
         if user_event_id and user_room_id:
-            rain_key = f"{user_room_id}:{user_event_id}"
-            rain_eid = self._pending_reactions.pop(rain_key, None)
-            if rain_eid:
-                await self.matrix.redact_event(user_room_id, rain_eid)
+            thinking_key = f"{user_room_id}:{user_event_id}"
+            thinking_eid = self._pending_reactions.pop(thinking_key, None)
+            if thinking_eid:
+                await self.matrix.redact_event(user_room_id, thinking_eid)
             await self.matrix.send_reaction(
                 user_room_id, user_event_id, "✅"
             )
