@@ -70,6 +70,9 @@ class MessageRouter:
         # session_id → event_id of the message that starts the sub-agent thread
         self._subagent_threads: dict[str, str] = {}
 
+        # Pending messages queued during session restore (sent once agent is ready)
+        self._pending_messages: dict[str, list[dict[str, Any]]] = {}
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
@@ -251,8 +254,17 @@ class MessageRouter:
             session = self.containers.get_any_session_by_room(room_id)
             if session is not None:
                 log.info("Restoring session %s for room %s", session.id, room_id)
+                # Queue the message so it's sent once the agent is ready
+                self._pending_messages.setdefault(session.id, []).append({
+                    "body": body,
+                    "sender": sender,
+                    "room_id": room_id,
+                    "thread_id": thread_id,
+                    "event_id": event_id,
+                    "attachments": attachments,
+                })
                 await self._restore_session(session, room_id, event_id)
-                return  # Agent will connect; user can re-send
+                return
             log.debug("No session for room %s", room_id)
             return
 
@@ -555,6 +567,23 @@ class MessageRouter:
             log.info(
                 "Agent %s ready (copilot=%s)", session.id, copilot
             )
+
+            # Flush any messages queued during session restore
+            pending = self._pending_messages.pop(session.id, [])
+            for queued in pending:
+                log.info(
+                    "Sending queued message to %s: %s",
+                    session.id, queued["body"][:60],
+                )
+                await self._handle_project_message(
+                    room_id=queued["room_id"],
+                    sender=queued["sender"],
+                    body=queued["body"],
+                    source={},
+                    thread_id=queued.get("thread_id"),
+                    event_id=queued.get("event_id"),
+                    attachments=queued.get("attachments"),
+                )
 
     async def _handle_file_send(
         self, session: Session, msg: Message
