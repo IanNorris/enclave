@@ -200,6 +200,20 @@ class ContainerManager:
             "-e", f"SESSION_NAME={session.name}",
         ]
 
+        # Bind-mount host paths read-only at /host/<path>
+        for host_path in self.config.host_mounts:
+            if Path(host_path).exists():
+                container_path = f"/host{host_path}"
+                cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
+
+        # Extend PATH and LD_LIBRARY_PATH to include host mounts
+        host_bin_dirs = "/host/usr/bin:/host/usr/games:/host/usr/local/bin"
+        host_lib_dirs = "/host/usr/lib:/host/usr/local/lib"
+        cmd.extend([
+            "-e", f"PATH=/usr/local/bin:/usr/bin:/bin:{host_bin_dirs}",
+            "-e", f"LD_LIBRARY_PATH={host_lib_dirs}",
+        ])
+
         # Custom DNS resolver (restricts what the container can resolve)
         if self.config.dns and network != "none":
             cmd.extend(["--dns", self.config.dns])

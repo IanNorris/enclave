@@ -263,19 +263,16 @@ async def try_init_copilot(
                 "IMPORTANT: When you create images or files that the user should see, "
                 "use the `send_file` tool to send them to the chat. The `view` tool "
                 "only lets YOU see the file — the user cannot see it unless you send it.\n\n"
+                "HOST BINARIES: The host system's /usr/bin, /usr/lib, /usr/include, etc. "
+                "are mounted read-only at /host/usr/... and are in your PATH. After packages "
+                "are installed on the host via sudo, you can run them directly in your shell "
+                "(e.g., `figlet Hello` just works). You can also compile against host libraries.\n\n"
                 "PRIVILEGE ESCALATION: You have a `sudo` tool that executes commands as root "
-                "on the HOST system (not inside your container). The user must approve each "
-                "request via a poll in the chat. Use it for package installation (apt), "
-                "service management (systemctl), system configuration, etc.\n\n"
-                "CRITICAL: Your `sudo` tool runs commands on the HOST, not in this container. "
-                "After installing packages with sudo, you can also RUN them with sudo since "
-                "they exist on the host filesystem. For example, to install and run figlet:\n"
-                "  1. sudo(command='apt-get', args=['install', '-y', 'figlet'], reason='...')\n"
-                "  2. sudo(command='figlet', args=['Hello!'], reason='Run figlet')\n"
-                "Both calls execute on the host. Your container has its own separate filesystem.\n\n"
-                "Always provide a clear 'reason' so the user knows why root is needed. "
-                "Suggest a regex pattern via suggested_pattern when the command category "
-                "might be repeated (e.g., '^apt\\s+' for all apt commands). "
+                "on the HOST system. The user must approve each request via a poll in the chat. "
+                "Use it for package installation (apt), service management (systemctl), "
+                "system configuration, etc. Always provide a clear 'reason' so the user "
+                "knows why root is needed. Suggest a regex pattern via suggested_pattern "
+                "when the command category might be repeated.\n\n"
                 "You have internet access via slirp4netns networking."
             )
         )
@@ -401,15 +398,15 @@ async def try_init_copilot(
         sudo_tool = Tool(
             name="sudo",
             description=(
-                "Execute a command on the HOST system (outside your container). "
-                "Commands run as root. The user approves via a poll in the chat. "
-                "Use for: package install (apt), service management (systemctl), "
-                "running host binaries, editing system config, anything needing root or host access. "
-                "IMPORTANT: This runs on the HOST, not in your container. After installing a "
-                "package with sudo, run it with sudo too since it's on the host filesystem. "
+                "Execute a command as root on the HOST system. The user approves via a poll. "
+                "Use ONLY for operations that need root: package installation (apt), "
+                "service management (systemctl), editing system config files, etc. "
+                "Do NOT use sudo to run regular programs — host binaries are mounted "
+                "read-only in your container at /host/usr/ and are in your PATH. "
+                "After `sudo apt install figlet`, just run `figlet Hello` directly. "
                 "Suggest a regex pattern for repeated command categories. "
                 "Example: sudo(command='apt-get', args=['install', '-y', 'nginx'], "
-                "reason='Install nginx', suggested_pattern='^apt\\s+')."
+                "reason='Install nginx', suggested_pattern='^apt-get\\s+')."
             ),
             handler=_sudo_handler,
             parameters={

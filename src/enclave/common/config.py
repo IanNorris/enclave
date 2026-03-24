@@ -48,6 +48,18 @@ class ContainerConfig:
     session_base: str = str(Path.home() / ".local" / "share" / "enclave" / "sessions")
     socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
     github_token: str = ""
+    # Read-only host paths to bind-mount into containers.
+    # Mapped as /host/<path> inside the container (e.g., /usr → /host/usr).
+    host_mounts: list[str] = field(default_factory=lambda: [
+        "/usr/bin",
+        "/usr/lib",
+        "/usr/include",
+        "/usr/share",
+        "/usr/games",
+        "/usr/local/bin",
+        "/usr/local/lib",
+        "/usr/local/include",
+    ])
 
 
 @dataclass
