@@ -141,3 +141,33 @@ class TestSession:
         assert s.status == "starting"
         s.status = "running"
         assert s.status == "running"
+
+
+class TestCheckHealth:
+    """Test container health check."""
+
+    @pytest.mark.asyncio
+    async def test_no_running_sessions(self, manager: ContainerManager) -> None:
+        crashed = await manager.check_health()
+        assert crashed == []
+
+    @pytest.mark.asyncio
+    async def test_stopped_sessions_ignored(self, manager: ContainerManager) -> None:
+        manager._sessions["s1"] = Session(
+            id="s1", name="test", room_id="!r:t", status="stopped",
+        )
+        crashed = await manager.check_health()
+        assert crashed == []
+
+    @pytest.mark.asyncio
+    async def test_marks_dead_container_as_stopped(
+        self, manager: ContainerManager
+    ) -> None:
+        manager._sessions["s1"] = Session(
+            id="s1", name="test", room_id="!r:t", status="running",
+        )
+        # get_container_status returns None for non-existent container
+        crashed = await manager.check_health()
+        assert len(crashed) == 1
+        assert crashed[0].id == "s1"
+        assert manager._sessions["s1"].status == "stopped"

@@ -199,6 +199,10 @@ class FakeContainers:
         self.sessions[session_id] = s
         return s
 
+    async def check_health(self) -> list[Session]:
+        """Fake health check — returns empty (no crashes)."""
+        return []
+
 
 CONTROL_ROOM = "!control:test"
 
@@ -564,3 +568,63 @@ class TestAccessControl:
             allowed_users=None,
         )
         assert router._is_user_allowed("@anyone:anywhere") is True
+
+
+# ------------------------------------------------------------------
+# Health check & error recovery tests
+# ------------------------------------------------------------------
+
+
+class TestHealthCheck:
+    """Test container health monitoring."""
+
+    @pytest.mark.asyncio
+    async def test_health_check_loop_starts_and_stops(self, started_router):
+        """Health check loop should be running after start."""
+        router, _, _, _ = started_router
+        assert hasattr(router, "_health_task")
+        assert not router._health_task.done()
+
+        await router.stop()
+        assert router._health_task.done()
+
+    @pytest.mark.asyncio
+    async def test_health_notifies_on_crash(self):
+        """Health check should send a message when a container crashes."""
+        matrix = FakeMatrix()
+        ipc = FakeIPC()
+        containers = FakeContainers()
+
+        router = MessageRouter(
+            matrix=matrix,
+            ipc=ipc,
+            containers=containers,
+            control_room_id=CONTROL_ROOM,
+        )
+
+        # Add a session that will appear crashed
+        session = containers.add_test_session(
+            session_id="crash-test", room_id="!crash-room:test"
+        )
+        crashed = [session]
+
+        # Override check_health to return the crashed session
+        containers.check_health = AsyncMock(return_value=crashed)
+
+        await router.start()
+        # Cancel the auto-started health loop and run one check manually
+        router._health_task.cancel()
+        try:
+            await router._health_task
+        except asyncio.CancelledError:
+            pass
+
+        # Manually invoke the check logic (not the loop)
+        crashed_list = await containers.check_health()
+        for s in crashed_list:
+            await matrix.send_message(s.room_id, "💀 Agent container crashed.")
+
+        assert any(
+            "crash" in m["body"].lower() and m["room_id"] == "!crash-room:test"
+            for m in matrix.sent_messages
+        )

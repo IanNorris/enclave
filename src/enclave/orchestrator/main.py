@@ -75,8 +75,23 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_signal)
 
-    # Start Matrix sync in background
+    # Start Matrix sync in background with watchdog
     sync_task = asyncio.create_task(matrix.sync_forever())
+
+    def _on_sync_done(task: asyncio.Task[None]) -> None:
+        """Restart sync if it exits unexpectedly."""
+        if stop_event.is_set():
+            return
+        exc = task.exception() if not task.cancelled() else None
+        if exc:
+            log.error("Sync loop crashed: %s — restarting", exc)
+        else:
+            log.warning("Sync loop exited unexpectedly — restarting")
+        nonlocal sync_task
+        sync_task = asyncio.create_task(matrix.sync_forever())
+        sync_task.add_done_callback(_on_sync_done)
+
+    sync_task.add_done_callback(_on_sync_done)
 
     # Wait for shutdown
     await stop_event.wait()

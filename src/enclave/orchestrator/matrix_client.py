@@ -149,21 +149,36 @@ class EnclaveMatrixClient:
         log.info("Initial sync complete — %d rooms", len(self.client.rooms))
 
     async def sync_forever(self, timeout: int = 30000) -> None:
-        """Start the sync loop. Blocks until stopped."""
+        """Start the sync loop with automatic reconnection.
+
+        On transient errors, retries with exponential backoff (1s → 60s max).
+        Resets backoff after a successful sync.
+        """
         self._syncing = True
         log.info("Starting sync loop")
         sync_count = 0
-        try:
-            while self._syncing:
+        backoff = 1.0
+        max_backoff = 60.0
+
+        while self._syncing:
+            try:
                 resp = await self.client.sync(timeout=timeout)
                 sync_count += 1
-                if sync_count <= 3 or sync_count % 20 == 0:
+                backoff = 1.0  # reset on success
+                if sync_count <= 3 or sync_count % 100 == 0:
                     log.debug("Sync #%d complete", sync_count)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            log.error("Sync error: %s", e, exc_info=True)
-            raise
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error(
+                    "Sync error (retry in %.0fs): %s", backoff, e,
+                    exc_info=True,
+                )
+                try:
+                    await asyncio.sleep(backoff)
+                except asyncio.CancelledError:
+                    return
+                backoff = min(backoff * 2, max_backoff)
 
     def stop_sync(self) -> None:
         """Signal the sync loop to stop."""

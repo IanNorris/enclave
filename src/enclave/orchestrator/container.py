@@ -263,6 +263,29 @@ class ContainerManager:
             pass
         return None
 
+    async def check_health(self) -> list[Session]:
+        """Check all 'running' sessions and mark crashed ones as stopped.
+
+        Returns a list of sessions that were found to be crashed.
+        """
+        crashed: list[Session] = []
+        for session in list(self._sessions.values()):
+            if session.status != "running":
+                continue
+            actual = await self.get_container_status(session.id)
+            if actual is None or actual not in ("running", "created"):
+                log.warning(
+                    "Session %s marked running but container status is %s — "
+                    "marking stopped",
+                    session.id,
+                    actual,
+                )
+                session.status = "stopped"
+                crashed.append(session)
+        if crashed:
+            self._save_sessions()
+        return crashed
+
 
 @dataclass
 class CommandResult:

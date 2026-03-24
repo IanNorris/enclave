@@ -6,6 +6,7 @@ and routes agent responses back to Matrix. Handles control room commands.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -74,11 +75,43 @@ class MessageRouter:
             self.control_room_id,
             "🏰 Enclave orchestrator online. Type `help` for commands.",
         )
+
+        # Start periodic health check
+        self._health_task = asyncio.create_task(self._health_check_loop())
+
         log.info("Router started")
 
     async def stop(self) -> None:
         """Clean up."""
+        if hasattr(self, "_health_task") and not self._health_task.done():
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
         log.info("Router stopped")
+
+    # ------------------------------------------------------------------
+    # Periodic health monitoring
+    # ------------------------------------------------------------------
+
+    _HEALTH_INTERVAL = 60  # seconds
+
+    async def _health_check_loop(self) -> None:
+        """Periodically check container health and notify on crashes."""
+        while True:
+            try:
+                await asyncio.sleep(self._HEALTH_INTERVAL)
+                crashed = await self.containers.check_health()
+                for session in crashed:
+                    await self.matrix.send_message(
+                        session.room_id,
+                        "💀 Agent container crashed. Send a message to auto-restore.",
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error("Health check error: %s", e)
 
     def _is_user_allowed(self, sender: str) -> bool:
         """Check if a sender is allowed to use Enclave."""
