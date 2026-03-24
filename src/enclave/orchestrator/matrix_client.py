@@ -402,11 +402,14 @@ class EnclaveMatrixClient:
             if space_id:
                 await self._add_room_to_space(space_id, room_id)
 
-            # Sync to pick up the new room in nio's store (required for E2EE).
-            # Event deduplication in _on_message/_on_media prevents the sync
-            # from re-processing the command that triggered room creation.
-            await self.client.sync(timeout=5000)
-            await self._trust_devices_in_room(room_id)
+            # Trust invited users' devices directly.  We intentionally do NOT
+            # call sync() here — doing so inside a sync_forever callback
+            # causes nio to re-deliver the triggering event, resulting in
+            # double room creation.  sync_forever will pick up the room on
+            # its next iteration; the first message send will handle E2EE
+            # key sharing via _ensure_keys_for_room().
+            if invite:
+                await self._trust_users(invite)
 
             return room_id
         else:

@@ -82,6 +82,9 @@ class MessageRouter:
         # Sessions currently being restored (prevent double-restore)
         self._restoring: set[str] = set()
 
+        # Projects currently being created (prevent double room creation)
+        self._creating_projects: set[str] = set()
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
@@ -196,7 +199,7 @@ class MessageRouter:
         if cmd is None:
             return
 
-        log.info("Command from %s: %s %s", sender, cmd.command.value, cmd.raw_args)
+        log.info("Command from %s (event %s): %s %s", sender, event_id, cmd.command.value, cmd.raw_args)
 
         # 👀 ack → immediately replace with 🤔 + typing
         eyes_eid = None
@@ -778,6 +781,19 @@ class MessageRouter:
 
         project_name = cmd.args[0]
 
+        # Guard against duplicate creation (e.g. from event re-delivery)
+        if project_name in self._creating_projects:
+            log.warning("Already creating project %s, skipping duplicate", project_name)
+            return
+        self._creating_projects.add(project_name)
+
+        try:
+            await self._cmd_project_inner(sender, project_name)
+        finally:
+            self._creating_projects.discard(project_name)
+
+    async def _cmd_project_inner(self, sender: str, project_name: str) -> None:
+        """Inner implementation of project creation."""
         room_id = await self.matrix.create_room(
             name=f"🏰 {project_name}",
             topic=f"Enclave project: {project_name}",
