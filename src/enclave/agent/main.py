@@ -215,6 +215,7 @@ async def handle_user_message(
 
 async def try_init_copilot(
     working_directory: str = "/workspace",
+    ipc: IPCClient | None = None,
 ) -> tuple[_CopilotClient, _CopilotSession] | None:
     """Try to initialize the Copilot SDK.
 
@@ -230,6 +231,7 @@ async def try_init_copilot(
             SubprocessConfig,
             SystemMessageAppendConfig,
         )
+        from copilot.types import Tool, ToolResult
     except ImportError:
         return None
 
@@ -257,9 +259,67 @@ async def try_init_copilot(
             append=(
                 "You are an AI assistant running inside an Enclave sandbox. "
                 "You can help the user with coding, research, and system tasks. "
-                "File operations are limited to the /workspace directory."
+                "File operations are limited to the /workspace directory.\n\n"
+                "IMPORTANT: When you create images or files that the user should see, "
+                "use the `send_file` tool to send them to the chat. The `view` tool "
+                "only lets YOU see the file — the user cannot see it unless you send it."
             )
         )
+
+        # Custom tool: send_file — sends a file to the user via Matrix
+        async def _send_file_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            file_path = args.get("path", "")
+            caption = args.get("caption", "")
+            if not file_path:
+                return ToolResult(
+                    text_result_for_llm="Error: 'path' parameter is required",
+                    result_type="error",
+                )
+            if not os.path.isfile(file_path):
+                return ToolResult(
+                    text_result_for_llm=f"Error: file not found: {file_path}",
+                    result_type="error",
+                )
+            if ipc and ipc.is_connected:
+                await ipc.send(Message(
+                    type=MessageType.FILE_SEND,
+                    payload={"file_path": file_path, "body": caption},
+                ))
+                return ToolResult(
+                    text_result_for_llm=f"File sent to chat: {file_path}",
+                )
+            return ToolResult(
+                text_result_for_llm="Error: not connected to orchestrator",
+                result_type="error",
+            )
+
+        send_file_tool = Tool(
+            name="send_file",
+            description=(
+                "Send a file (image, document, etc.) to the user in the chat room. "
+                "Use this after creating images, screenshots, or any file the user should see. "
+                "The 'view' tool only shows files to YOU — use send_file to show them to the USER."
+            ),
+            handler=_send_file_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to send",
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption/description for the file",
+                    },
+                },
+                "required": ["path"],
+            },
+            skip_permission=True,
+        )
+
+        custom_tools = [send_file_tool]
 
         # Try to resume the most recent session (preserves conversation history)
         try:
@@ -271,6 +331,7 @@ async def try_init_copilot(
                     on_permission_request=perm_handler,
                     system_message=sys_msg,
                     working_directory=working_directory,
+                    tools=custom_tools,
                 )
                 print(f"[agent] Session resumed: {last_id}", file=sys.stderr)
                 return (client, session)
@@ -282,6 +343,7 @@ async def try_init_copilot(
             on_permission_request=perm_handler,
             system_message=sys_msg,
             working_directory=working_directory,
+            tools=custom_tools,
         )
         return (client, session)
     except Exception as e:
@@ -319,7 +381,7 @@ async def main() -> None:
     print("[agent] Connected to orchestrator")
 
     # Try to init Copilot SDK
-    sdk_result = await try_init_copilot()
+    sdk_result = await try_init_copilot(ipc=ipc)
     listener_ctl = None
     if sdk_result:
         sdk_client, sdk_session = sdk_result
