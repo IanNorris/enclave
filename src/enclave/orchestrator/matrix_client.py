@@ -12,9 +12,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
+import mimetypes
+
 from nio import (
     AsyncClient,
     AsyncClientConfig,
+    DownloadResponse,
     Event,
     InviteMemberEvent,
     LoginResponse,
@@ -22,8 +25,11 @@ from nio import (
     MegolmEvent,
     RoomCreateResponse,
     RoomEncryptionEvent,
+    RoomMessageMedia,
     RoomMessageText,
+    RoomEncryptedMedia,
     RoomSendResponse,
+    UploadResponse,
 )
 from nio.crypto import TrustState
 
@@ -32,8 +38,11 @@ from enclave.common.logging import get_logger
 log = get_logger("matrix")
 
 # Type for message handler callbacks
-MatrixMessageHandler = Callable[[str, str, str, dict[str, Any]], Awaitable[None]]
-# (room_id, sender, body, event_source)
+MatrixMessageHandler = Callable[
+    [str, str, str, dict[str, Any], list[dict[str, Any]]],
+    Awaitable[None],
+]
+# (room_id, sender, body, event_source, attachments)
 
 
 class EnclaveMatrixClient:
@@ -86,6 +95,9 @@ class EnclaveMatrixClient:
 
         # Register internal callbacks
         self.client.add_event_callback(self._on_message, RoomMessageText)
+        self.client.add_event_callback(
+            self._on_media, (RoomMessageMedia, RoomEncryptedMedia)
+        )
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
         self.client.add_event_callback(self._on_megolm, MegolmEvent)
         self.client.add_event_callback(self._on_encrypted, RoomEncryptionEvent)
@@ -474,9 +486,150 @@ class EnclaveMatrixClient:
         source = event.source or {}
         for handler in self._message_handlers:
             try:
-                await handler(room.room_id, event.sender, event.body, source)
+                await handler(room.room_id, event.sender, event.body, source, [])
             except Exception as e:
                 log.error("Message handler error: %s", e)
+
+    async def _on_media(self, room: MatrixRoom, event) -> None:
+        """Handle incoming media messages (images, files, audio, video)."""
+        if event.sender == self.client.user_id:
+            return
+
+        if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+
+        source = event.source or {}
+        content = source.get("content", {})
+        info = content.get("info", {})
+        filename = getattr(event, "body", "attachment")
+        url = getattr(event, "url", None) or content.get("url", "")
+        mimetype = info.get("mimetype", "")
+        size = info.get("size", 0)
+
+        attachment = {
+            "filename": filename,
+            "url": url,
+            "content_type": mimetype,
+            "size": size,
+        }
+
+        # For encrypted media, store decryption info
+        file_info = content.get("file", {})
+        if file_info:
+            attachment["url"] = file_info.get("url", url)
+            attachment["encryption"] = {
+                "key": file_info.get("key", {}),
+                "iv": file_info.get("iv", ""),
+                "hashes": file_info.get("hashes", {}),
+            }
+
+        body = f"[Sent a file: {filename}]"
+        log.info(
+            "Media from %s in %s: %s (%s, %d bytes)",
+            event.sender, room.room_id, filename, mimetype, size,
+        )
+
+        for handler in self._message_handlers:
+            try:
+                await handler(
+                    room.room_id, event.sender, body, source, [attachment]
+                )
+            except Exception as e:
+                log.error("Message handler error (media): %s", e)
+
+    async def download_media(self, mxc_url: str, dest: str | Path) -> bool:
+        """Download a file from the Matrix content repository.
+
+        Args:
+            mxc_url: The mxc:// URL of the file.
+            dest: Local path to save the file to.
+
+        Returns:
+            True if downloaded successfully.
+        """
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            resp = await self.client.download(mxc_url)
+            if isinstance(resp, DownloadResponse):
+                with open(dest, "wb") as f:
+                    f.write(resp.body)
+                log.info("Downloaded %s → %s (%d bytes)", mxc_url, dest, len(resp.body))
+                return True
+            else:
+                log.error("Download failed for %s: %s", mxc_url, resp)
+                return False
+        except Exception as e:
+            log.error("Download error for %s: %s", mxc_url, e)
+            return False
+
+    async def upload_file(
+        self, room_id: str, file_path: str | Path, body: str | None = None
+    ) -> str | None:
+        """Upload a file to Matrix and send it to a room.
+
+        Args:
+            room_id: The room to send the file to.
+            file_path: Local path of the file to upload.
+            body: Optional message body (defaults to filename).
+
+        Returns:
+            The event ID if sent, or None on failure.
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            log.error("File not found: %s", file_path)
+            return None
+
+        mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        filename = file_path.name
+        file_size = file_path.stat().st_size
+
+        if mime_type.startswith("image/"):
+            msgtype = "m.image"
+        elif mime_type.startswith("video/"):
+            msgtype = "m.video"
+        elif mime_type.startswith("audio/"):
+            msgtype = "m.audio"
+        else:
+            msgtype = "m.file"
+
+        try:
+            with open(file_path, "rb") as f:
+                resp, _keys = await self.client.upload(
+                    f, content_type=mime_type,
+                    filename=filename, filesize=file_size,
+                )
+
+            if not isinstance(resp, UploadResponse):
+                log.error("Upload failed for %s: %s", file_path, resp)
+                return None
+
+            content = {
+                "msgtype": msgtype,
+                "body": body or filename,
+                "url": resp.content_uri,
+                "info": {
+                    "mimetype": mime_type,
+                    "size": file_size,
+                },
+            }
+
+            send_resp = await self.client.room_send(
+                room_id=room_id,
+                message_type="m.room.message",
+                content=content,
+            )
+            if isinstance(send_resp, RoomSendResponse):
+                log.info("Uploaded %s to %s: %s", filename, room_id, send_resp.event_id)
+                return send_resp.event_id
+            else:
+                log.error("Send failed for uploaded file: %s", send_resp)
+                return None
+        except Exception as e:
+            log.error("Upload error for %s: %s", file_path, e)
+            return None
 
     async def _on_invite(self, room: MatrixRoom, event: InviteMemberEvent) -> None:
         """Auto-accept room invites."""

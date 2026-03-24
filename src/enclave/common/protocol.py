@@ -30,6 +30,7 @@ class MessageType(str, Enum):
     GUI_LAUNCH_REQUEST = "gui_launch_request"
     SCREENSHOT_REQUEST = "screenshot_request"
     FILE_SEND = "file_send"
+    DOWNLOAD_REQUEST = "download_request"
     STATUS_UPDATE = "status_update"
 
 

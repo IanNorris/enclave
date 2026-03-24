@@ -114,9 +114,9 @@ async def handle_user_message(
     unsubscribe = sdk_session.on(on_event)
     try:
         await sdk_session.send(content)
-        await asyncio.wait_for(idle_event.wait(), timeout=120.0)
+        await asyncio.wait_for(idle_event.wait(), timeout=600.0)
     except TimeoutError:
-        error_msg = "Agent timed out after 120s."
+        error_msg = "Agent timed out after 600s."
     finally:
         unsubscribe()
 

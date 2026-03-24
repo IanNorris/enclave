@@ -164,9 +164,11 @@ class ContainerManager:
             return False
 
         # Clean up any leftover container with the same name
-        await _run_command(
+        log.debug("Removing old container for %s...", session_id)
+        rm_result = await _run_command(
             [self.config.runtime, "rm", "-f", session_id], timeout=10.0
         )
+        log.debug("rm result: rc=%d stderr=%s", rm_result.returncode, rm_result.stderr[:100])
 
         session.status = "starting"
         socket_dir = str(Path(session.socket_path).parent)
@@ -201,8 +203,12 @@ class ContainerManager:
 
         cmd.append(self.config.image)
 
+        log.debug("Container cmd: %s", " ".join(cmd[:8]) + " ...")
+
         try:
             result = await _run_command(cmd)
+            log.debug("Container run result: rc=%d stdout=%s stderr=%s",
+                       result.returncode, result.stdout[:40], result.stderr[:100])
             if result.returncode == 0:
                 container_id = result.stdout.strip()
                 session.container_id = container_id

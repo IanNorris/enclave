@@ -141,6 +141,7 @@ class MessageRouter:
         sender: str,
         body: str,
         source: dict[str, Any],
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """Handle an incoming Matrix message."""
         if not self._is_user_allowed(sender):
@@ -152,18 +153,26 @@ class MessageRouter:
 
         if room_id == self.control_room_id:
             await self._handle_control_message(
-                sender, body, source, event_id
+                sender, body, source, event_id,
+                attachments=attachments or [],
             )
         else:
             await self._handle_project_message(
-                room_id, sender, body, source, thread_id, event_id
+                room_id, sender, body, source, thread_id, event_id,
+                attachments=attachments or [],
             )
 
     async def _handle_control_message(
         self, sender: str, body: str, source: dict[str, Any],
         event_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """Handle a message in the control room."""
+        # Ignore media-only messages in control room (not commands)
+        if attachments and body.startswith("[Sent a file:"):
+            log.debug("Ignoring media message in control room: %s", body)
+            return
+
         cmd = parse_command(body)
         if cmd is None:
             return
@@ -225,6 +234,7 @@ class MessageRouter:
         source: dict[str, Any],
         thread_id: str | None,
         event_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """Handle a message in a project room — forward to the agent."""
         session = self.containers.get_session_by_room(room_id)
@@ -278,6 +288,7 @@ class MessageRouter:
                 "sender": sender,
                 "room_id": room_id,
                 "thread_id": thread_id,
+                "attachments": attachments or [],
             },
         )
 
@@ -319,6 +330,10 @@ class MessageRouter:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
             await self._handle_permission_request(session, msg)
+        elif msg.type == MessageType.FILE_SEND:
+            return await self._handle_file_send(session, msg)
+        elif msg.type == MessageType.DOWNLOAD_REQUEST:
+            return await self._handle_download_request(session, msg)
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -453,6 +468,62 @@ class MessageRouter:
             )
             log.info(
                 "Agent %s ready (copilot=%s)", session.id, copilot
+            )
+
+    async def _handle_file_send(
+        self, session: Session, msg: Message
+    ) -> Message | None:
+        """Handle a file upload request from an agent."""
+        file_path = msg.payload.get("file_path", "")
+        body = msg.payload.get("body")
+
+        if not file_path:
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"error": "No file_path provided"},
+                reply_to=msg.id,
+            )
+
+        event_id = await self.matrix.upload_file(
+            session.room_id, file_path, body=body
+        )
+
+        return Message(
+            type=MessageType.AGENT_RESPONSE,
+            payload={
+                "sent": event_id is not None,
+                "event_id": event_id,
+            },
+            reply_to=msg.id,
+        )
+
+    async def _handle_download_request(
+        self, session: Session, msg: Message
+    ) -> Message | None:
+        """Handle a file download request from an agent."""
+        url = msg.payload.get("url", "")
+        dest = msg.payload.get("dest", "")
+
+        if not url or not dest:
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"error": "url and dest are required"},
+                reply_to=msg.id,
+            )
+
+        if url.startswith("mxc://"):
+            success = await self.matrix.download_media(url, dest)
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"downloaded": success, "path": dest},
+                reply_to=msg.id,
+            )
+        else:
+            # External URL — agent should handle this itself
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"error": "Only mxc:// URLs supported for download"},
+                reply_to=msg.id,
             )
 
     async def _handle_permission_request(
