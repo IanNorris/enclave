@@ -1,7 +1,7 @@
-"""Approval flow: reaction-based permission approval via Matrix.
+"""Approval flow: poll-based permission approval via Matrix.
 
-Posts permission requests to Matrix with emoji options. Users react to
-approve/deny. The orchestrator watches for reactions and resolves requests.
+Posts permission requests as polls in the project room. Users vote to
+approve/deny. The orchestrator watches for poll responses and resolves requests.
 """
 
 from __future__ import annotations
@@ -20,98 +20,54 @@ from enclave.orchestrator.permissions import (
 
 log = get_logger("approval")
 
-# Emoji for approval options
-EMOJI_ONCE = "1\ufe0f\u20e3"       # 1️⃣ Approve once
-EMOJI_SESSION = "2\ufe0f\u20e3"    # 2️⃣ Approve for session
-EMOJI_PROJECT = "3\ufe0f\u20e3"    # 3️⃣ Approve for project
-EMOJI_PATTERN = "4\ufe0f\u20e3"    # 4️⃣ Approve with pattern
-EMOJI_DENY = "\u274c"              # ❌ Deny
+# Poll answer IDs
+ANSWER_APPROVE_ONCE = "approve_once"
+ANSWER_APPROVE_PROJECT = "approve_project"
+ANSWER_APPROVE_PATTERN = "approve_pattern"
+ANSWER_CUSTOM_PATTERN = "custom_pattern"
+ANSWER_DENY_ONCE = "deny_once"
+ANSWER_DENY_PROJECT = "deny_project"
 
-SCOPE_MAP = {
-    EMOJI_ONCE: PermissionScope.ONCE,
-    EMOJI_SESSION: PermissionScope.SESSION,
-    EMOJI_PROJECT: PermissionScope.PROJECT,
-    EMOJI_PATTERN: PermissionScope.PATTERN,
+# Maps answer IDs to (status, scope)
+ANSWER_MAP: dict[str, tuple[RequestStatus, PermissionScope | None]] = {
+    ANSWER_APPROVE_ONCE: (RequestStatus.APPROVED, PermissionScope.ONCE),
+    ANSWER_APPROVE_PROJECT: (RequestStatus.APPROVED, PermissionScope.PROJECT),
+    ANSWER_APPROVE_PATTERN: (RequestStatus.APPROVED, PermissionScope.PATTERN),
+    ANSWER_CUSTOM_PATTERN: (RequestStatus.APPROVED, PermissionScope.PATTERN),
+    ANSWER_DENY_ONCE: (RequestStatus.DENIED, None),
+    ANSWER_DENY_PROJECT: (RequestStatus.DENIED, PermissionScope.PROJECT),
 }
 
 
 def suggest_pattern(target: str) -> str:
-    """Suggest a regex pattern for a filesystem path.
+    """Suggest a regex pattern for a command or path.
 
-    For example: /home/user/projects/myapp → /home/user/projects/.*
+    For commands: apt-get install -y cowsay → ^apt-get\\s+
+    For paths: /home/user/projects/myapp → /home/user/projects/.*
     """
+    # If it looks like a command (no leading /), pattern on first word
+    if not target.startswith("/"):
+        first = target.split()[0] if target.strip() else target
+        return f"^{re.escape(first)}\\s+"
+    # For paths, generalize the last component
     parts = target.rstrip("/").rsplit("/", 1)
     if len(parts) == 2:
         return re.escape(parts[0]) + "/.*"
     return re.escape(target)
 
 
-def format_approval_message(
-    session_name: str,
-    perm_type: PermissionType,
-    target: str,
-    reason: str,
-    request_id: int,
-) -> tuple[str, str]:
-    """Format the approval request message for Matrix.
-
-    Returns (plain_text, html) tuple.
-    """
-    type_icon = {
-        PermissionType.FILESYSTEM: "📂",
-        PermissionType.NETWORK: "🌐",
-        PermissionType.PRIVILEGE: "🔐",
-    }.get(perm_type, "❓")
-
-    suggested = suggest_pattern(target)
-
-    plain = (
-        f"🔒 Permission Request #{request_id}\n\n"
-        f"{type_icon} {perm_type.value.title()}: {target}\n"
-        f"📦 Session: {session_name}\n"
-    )
-    if reason:
-        plain += f"💬 Reason: {reason}\n"
-
-    plain += (
-        f"\nReact to approve:\n"
-        f"  {EMOJI_ONCE} Approve once\n"
-        f"  {EMOJI_SESSION} Approve for this session\n"
-        f"  {EMOJI_PROJECT} Approve for all sessions of this project\n"
-        f"  {EMOJI_PATTERN} Approve pattern: `{suggested}`\n"
-        f"  {EMOJI_DENY} Deny\n"
-    )
-
-    html = (
-        f"<h4>🔒 Permission Request #{request_id}</h4>"
-        f"<p>{type_icon} <b>{perm_type.value.title()}</b>: <code>{target}</code><br/>"
-        f"📦 <b>Session</b>: {session_name}</p>"
-    )
-    if reason:
-        html += f"<p>💬 <b>Reason</b>: {reason}</p>"
-
-    html += (
-        f"<p>React to approve:<br/>"
-        f"&nbsp;&nbsp;{EMOJI_ONCE} Approve once<br/>"
-        f"&nbsp;&nbsp;{EMOJI_SESSION} Approve for this session<br/>"
-        f"&nbsp;&nbsp;{EMOJI_PROJECT} Approve for all sessions of this project<br/>"
-        f"&nbsp;&nbsp;{EMOJI_PATTERN} Approve pattern: <code>{suggested}</code><br/>"
-        f"&nbsp;&nbsp;{EMOJI_DENY} Deny</p>"
-    )
-
-    return plain, html
-
-
-# Type for the Matrix send function
+# Type for the Matrix send functions
 SendMessageFn = Callable[..., Awaitable[str | None]]
 SendReactionFn = Callable[..., Awaitable[str | None]]
+SendPollFn = Callable[..., Awaitable[str | None]]
+EndPollFn = Callable[..., Awaitable[str | None]]
 
 
 class ApprovalManager:
-    """Manages the reaction-based approval flow.
+    """Manages the poll-based approval flow.
 
-    Posts requests to Matrix, seeds emoji reactions, and watches for
-    user reactions to resolve permissions.
+    Posts requests as polls in the project room and watches for
+    poll responses to resolve permissions.
     """
 
     def __init__(
@@ -119,19 +75,26 @@ class ApprovalManager:
         permission_db: PermissionDB,
         send_message: SendMessageFn,
         send_reaction: SendReactionFn,
-        approval_room_id: str,
+        send_poll: SendPollFn,
+        end_poll: EndPollFn,
         timeout: float = 300.0,
     ):
         self.db = permission_db
         self.send_message = send_message
         self.send_reaction = send_reaction
-        self.approval_room_id = approval_room_id
+        self.send_poll = send_poll
+        self.end_poll = end_poll
         self.timeout = timeout
 
-        # Map: matrix_event_id → request_id
-        self._pending: dict[str, int] = {}
+        # Map: poll_event_id → (request_id, suggested_pattern)
+        self._pending: dict[str, tuple[int, str]] = {}
         # Map: request_id → asyncio.Event (for blocking callers)
         self._events: dict[int, asyncio.Event] = {}
+        # Map: request_id → resolved (status, scope, pattern)
+        self._results: dict[int, tuple[RequestStatus, PermissionScope | None, str | None]] = {}
+        # Requests awaiting custom pattern text input
+        # request_id → (room_id, suggested_pattern)
+        self._awaiting_pattern: dict[int, tuple[str, str]] = {}
 
     async def request_permission(
         self,
@@ -141,10 +104,16 @@ class ApprovalManager:
         perm_type: PermissionType,
         target: str,
         reason: str = "",
-    ) -> tuple[RequestStatus, PermissionScope | None]:
-        """Post a permission request and wait for user response.
+        room_id: str | None = None,
+        suggested_pattern: str | None = None,
+    ) -> tuple[RequestStatus, PermissionScope | None, str | None]:
+        """Post a permission request poll and wait for user response.
 
-        Returns (status, scope) — scope is None if denied/expired.
+        Args:
+            room_id: Room to post the poll in (project room).
+            suggested_pattern: Agent-suggested regex pattern (optional).
+
+        Returns (status, scope, pattern) — scope/pattern None if denied/expired.
         """
         # Check if already granted
         existing = self.db.check_permission(
@@ -152,7 +121,11 @@ class ApprovalManager:
         )
         if existing:
             self.db.use_grant(existing.id)
-            return RequestStatus.APPROVED, existing.scope
+            return RequestStatus.APPROVED, existing.scope, None
+
+        if not room_id:
+            log.error("No room_id for approval request")
+            return RequestStatus.EXPIRED, None, None
 
         # Create request in DB
         request_id = self.db.add_request(
@@ -163,32 +136,46 @@ class ApprovalManager:
             reason=reason,
         )
 
-        # Post to Matrix
-        plain, html = format_approval_message(
-            session_name, perm_type, target, reason, request_id
-        )
+        # Build suggested pattern
+        pattern = suggested_pattern or suggest_pattern(target)
 
-        event_id = await self.send_message(
-            self.approval_room_id, plain, html_body=html
-        )
+        # Build poll question & answers
+        type_icon = {
+            PermissionType.FILESYSTEM: "📂",
+            PermissionType.NETWORK: "🌐",
+            PermissionType.PRIVILEGE: "🔐",
+        }.get(perm_type, "❓")
 
-        if event_id is None:
+        question = (
+            f"{type_icon} {perm_type.value.title()}: `{target}`"
+        )
+        if reason:
+            question += f"\n💬 {reason}"
+
+        answers = [
+            (ANSWER_APPROVE_ONCE, "✅ Approve once"),
+            (ANSWER_APPROVE_PROJECT, "✅ Approve for project"),
+            (ANSWER_APPROVE_PATTERN, f"✅ Approve pattern: {pattern}"),
+            (ANSWER_CUSTOM_PATTERN, "✏️ Approve with custom pattern"),
+            (ANSWER_DENY_ONCE, "❌ Deny once"),
+            (ANSWER_DENY_PROJECT, "❌ Deny for project"),
+        ]
+
+        poll_event_id = await self.send_poll(room_id, question, answers)
+
+        if poll_event_id is None:
             self.db.resolve_request(request_id, RequestStatus.EXPIRED, "system")
-            return RequestStatus.EXPIRED, None
+            return RequestStatus.EXPIRED, None, None
 
         # Update request with event ID
         self.db._conn.execute(
             "UPDATE requests SET matrix_event_id = ? WHERE id = ?",
-            (event_id, request_id),
+            (poll_event_id, request_id),
         )
         self.db._conn.commit()
 
-        # Seed emoji reactions
-        for emoji in [EMOJI_ONCE, EMOJI_SESSION, EMOJI_PROJECT, EMOJI_PATTERN, EMOJI_DENY]:
-            await self.send_reaction(self.approval_room_id, event_id, emoji)
-
         # Register pending
-        self._pending[event_id] = request_id
+        self._pending[poll_event_id] = (request_id, pattern)
         wait_event = asyncio.Event()
         self._events[request_id] = wait_event
 
@@ -197,47 +184,107 @@ class ApprovalManager:
             await asyncio.wait_for(wait_event.wait(), timeout=self.timeout)
         except asyncio.TimeoutError:
             self.db.resolve_request(request_id, RequestStatus.EXPIRED, "system")
-            self._cleanup(event_id, request_id)
-            return RequestStatus.EXPIRED, None
+            self._cleanup(poll_event_id, request_id)
+            return RequestStatus.EXPIRED, None, None
+
+        # Close the poll
+        try:
+            await self.end_poll(room_id, poll_event_id)
+        except Exception:
+            pass
 
         # Get result
-        req = self.db.get_request(request_id)
-        self._cleanup(event_id, request_id)
+        result = self._results.pop(request_id, None)
+        self._cleanup(poll_event_id, request_id)
 
-        if req and req.status == RequestStatus.APPROVED:
-            return RequestStatus.APPROVED, None  # scope set by caller
-        return RequestStatus.DENIED, None
+        if result:
+            return result
+        return RequestStatus.DENIED, None, None
 
+    def handle_poll_response(
+        self,
+        poll_event_id: str,
+        answer_ids: list[str],
+        sender: str,
+        room_id: str,
+    ) -> tuple[int | None, PermissionScope | None, bool]:
+        """Handle a poll response.
+
+        Returns (request_id, scope, needs_custom_pattern).
+        """
+        pending = self._pending.get(poll_event_id)
+        if pending is None:
+            return None, None, False
+
+        request_id, suggested_pattern = pending
+
+        if not answer_ids:
+            return None, None, False
+
+        answer_id = answer_ids[0]  # Single-select poll
+        mapping = ANSWER_MAP.get(answer_id)
+        if mapping is None:
+            return None, None, False
+
+        status, scope = mapping
+
+        # "Custom pattern" — need follow-up text input
+        if answer_id == ANSWER_CUSTOM_PATTERN:
+            self._awaiting_pattern[request_id] = (room_id, suggested_pattern)
+            return request_id, PermissionScope.PATTERN, True
+
+        # Determine pattern for the pattern option
+        result_pattern = suggested_pattern if answer_id == ANSWER_APPROVE_PATTERN else None
+
+        self.db.resolve_request(request_id, status, sender)
+        self._results[request_id] = (status, scope, result_pattern)
+        if request_id in self._events:
+            self._events[request_id].set()
+
+        return request_id, scope, False
+
+    def handle_custom_pattern(
+        self,
+        request_id: int,
+        pattern: str,
+        sender: str,
+    ) -> bool:
+        """Handle the custom pattern text reply.
+
+        Returns True if the request was resolved.
+        """
+        if request_id not in self._awaiting_pattern:
+            return False
+
+        self._awaiting_pattern.pop(request_id, None)
+        self.db.resolve_request(request_id, RequestStatus.APPROVED, sender)
+        self._results[request_id] = (
+            RequestStatus.APPROVED,
+            PermissionScope.PATTERN,
+            pattern.strip(),
+        )
+        if request_id in self._events:
+            self._events[request_id].set()
+        return True
+
+    def get_awaiting_pattern(self, room_id: str) -> int | None:
+        """Check if there's a request awaiting a custom pattern in this room."""
+        for req_id, (rid, _) in self._awaiting_pattern.items():
+            if rid == room_id:
+                return req_id
+        return None
+
+    # Keep reaction handler for backwards compatibility
     def handle_reaction(
         self,
         event_id: str,
         emoji: str,
         sender: str,
     ) -> tuple[int | None, PermissionScope | None]:
-        """Handle a Matrix reaction on an approval message.
-
-        Returns (request_id, scope) if this resolved a request, else (None, None).
-        """
-        request_id = self._pending.get(event_id)
-        if request_id is None:
-            return None, None
-
-        if emoji == EMOJI_DENY:
-            self.db.resolve_request(request_id, RequestStatus.DENIED, sender)
-            if request_id in self._events:
-                self._events[request_id].set()
-            return request_id, None
-
-        scope = SCOPE_MAP.get(emoji)
-        if scope is None:
-            return None, None
-
-        self.db.resolve_request(request_id, RequestStatus.APPROVED, sender)
-        if request_id in self._events:
-            self._events[request_id].set()
-
-        return request_id, scope
+        """Handle a Matrix reaction on an approval message (legacy)."""
+        return None, None
 
     def _cleanup(self, event_id: str, request_id: int) -> None:
         self._pending.pop(event_id, None)
         self._events.pop(request_id, None)
+        self._results.pop(request_id, None)

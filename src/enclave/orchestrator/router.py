@@ -112,7 +112,8 @@ class MessageRouter:
             permission_db=self._perm_db,
             send_message=self.matrix.send_message,
             send_reaction=self.matrix.send_reaction,
-            approval_room_id=self.control_room_id,
+            send_poll=self.matrix.send_poll,
+            end_poll=self.matrix.end_poll,
             timeout=approval_timeout,
         )
 
@@ -123,6 +124,7 @@ class MessageRouter:
         self.matrix.on_message(self._on_matrix_message)
         self.matrix.on_user_join(self._on_user_join)
         self.matrix.on_reaction(self._on_matrix_reaction)
+        self.matrix.on_poll_response(self._on_poll_response)
         self.ipc.set_handler(self._on_ipc_message)
         self.ipc.on_connect(self._on_agent_connect)
         self.ipc.on_disconnect(self._on_agent_disconnect)
@@ -306,6 +308,19 @@ class MessageRouter:
         attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """Handle a message in a project room — forward to the agent."""
+        # Check if this is a custom pattern reply for an approval
+        awaiting_req = self._approval.get_awaiting_pattern(room_id)
+        if awaiting_req is not None and body.strip():
+            resolved = self._approval.handle_custom_pattern(
+                awaiting_req, body.strip(), sender
+            )
+            if resolved:
+                await self.matrix.send_message(
+                    room_id,
+                    f"✅ Custom pattern set: `{body.strip()}`",
+                )
+                return
+
         session = self.containers.get_session_by_room(room_id)
 
         if session is None:
@@ -771,14 +786,27 @@ class MessageRouter:
             session.id, perm_type.value, target, reason,
         )
 
-        status, scope = await self._approval.request_permission(
+        status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,
             session_name=session.name,
             project_name=session.name,
             perm_type=perm_type,
             target=target,
             reason=reason,
+            room_id=session.room_id,
         )
+
+        # If approved with a scope, create a grant
+        if status == RequestStatus.APPROVED and scope:
+            self._perm_db.add_grant(
+                session_id=session.id,
+                project_name=session.name,
+                perm_type=perm_type,
+                target=pattern or target,
+                scope=scope,
+                granted_by="approval",
+                pattern=pattern,
+            )
 
         # Send response back to agent
         response = Message(
@@ -797,12 +825,13 @@ class MessageRouter:
     ) -> None:
         """Handle a privilege escalation request from an agent.
 
-        Flow: check DB → post approval to Matrix → wait for reaction →
+        Flow: check DB → post poll in project room → wait for vote →
         if approved, execute via priv broker → return result.
         """
         command = msg.payload.get("command", "")
         args = msg.payload.get("args", [])
         reason = msg.payload.get("reason", "")
+        suggested_pattern = msg.payload.get("suggested_pattern")
         full_cmd = f"{command} {' '.join(args)}".strip() if args else command
 
         log.info(
@@ -810,18 +839,19 @@ class MessageRouter:
             session.id, full_cmd, reason,
         )
 
-        # Ask for approval via Matrix reaction flow
-        status, scope = await self._approval.request_permission(
+        # Ask for approval via poll in the project room
+        status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,
             session_name=session.name,
             project_name=session.name,
             perm_type=PermissionType.PRIVILEGE,
             target=full_cmd,
             reason=reason,
+            room_id=session.room_id,
+            suggested_pattern=suggested_pattern,
         )
 
         if status != RequestStatus.APPROVED:
-            # Denied or expired
             response = Message(
                 type=MessageType.PRIVILEGE_RESPONSE,
                 payload={
@@ -840,9 +870,10 @@ class MessageRouter:
                 session_id=session.id,
                 project_name=session.name,
                 perm_type=PermissionType.PRIVILEGE,
-                target=full_cmd,
+                target=pattern or full_cmd,
                 scope=scope,
                 granted_by="approval",
+                pattern=pattern,
             )
 
         # Execute via privilege broker
@@ -884,13 +915,40 @@ class MessageRouter:
         await self.ipc.send_to(session.id, response)
 
     # ------------------------------------------------------------------
-    # Matrix reaction → approval flow
+    # Matrix poll/reaction → approval flow
     # ------------------------------------------------------------------
+
+    async def _on_poll_response(
+        self, room_id: str, sender: str, poll_event_id: str, answer_ids: list[str]
+    ) -> None:
+        """Handle a poll response — check if it resolves an approval."""
+        request_id, scope, needs_pattern = self._approval.handle_poll_response(
+            poll_event_id=poll_event_id,
+            answer_ids=answer_ids,
+            sender=sender,
+            room_id=room_id,
+        )
+        if request_id is None:
+            return
+
+        if needs_pattern:
+            # Ask user for custom pattern
+            await self.matrix.send_message(
+                room_id,
+                "✏️ Enter your custom regex pattern for this approval:",
+            )
+            log.info("Awaiting custom pattern for request %s", request_id)
+        else:
+            action = "denied" if scope is None else f"approved ({scope.value})"
+            log.info(
+                "Poll approval from %s: request %s %s",
+                sender, request_id, action,
+            )
 
     async def _on_matrix_reaction(
         self, room_id: str, sender: str, reacts_to: str, emoji: str
     ) -> None:
-        """Handle a reaction from Matrix — check if it resolves an approval."""
+        """Handle a reaction from Matrix (legacy, kept for backwards compat)."""
         request_id, scope = self._approval.handle_reaction(
             event_id=reacts_to,
             emoji=emoji,

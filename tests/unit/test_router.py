@@ -89,6 +89,15 @@ class FakeMatrix:
     def on_reaction(self, handler):
         pass
 
+    def on_poll_response(self, handler):
+        pass
+
+    async def send_poll(self, room_id, question, answers, thread_event_id=None):
+        return "$fake-poll-id"
+
+    async def end_poll(self, room_id, poll_event_id):
+        return "$fake-end-poll"
+
 
 class FakeIPC:
     """Fake IPC server that records calls."""

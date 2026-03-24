@@ -332,6 +332,7 @@ async def try_init_copilot(
             command = args.get("command", "")
             cmd_args = args.get("args", [])
             reason = args.get("reason", "")
+            suggested_pattern = args.get("suggested_pattern", "")
             if not command:
                 return ToolResult(
                     text_result_for_llm="Error: 'command' parameter is required",
@@ -343,16 +344,19 @@ async def try_init_copilot(
                     result_type="error",
                 )
             try:
+                payload = {
+                    "command": command,
+                    "args": cmd_args,
+                    "reason": reason,
+                }
+                if suggested_pattern:
+                    payload["suggested_pattern"] = suggested_pattern
                 response = await ipc.request(
                     Message(
                         type=MessageType.PRIVILEGE_REQUEST,
-                        payload={
-                            "command": command,
-                            "args": cmd_args,
-                            "reason": reason,
-                        },
+                        payload=payload,
                     ),
-                    timeout=360.0,  # 6 min — user needs time to react
+                    timeout=360.0,  # 6 min — user needs time to vote
                 )
                 payload = response.payload
                 if not payload.get("approved"):
@@ -389,11 +393,13 @@ async def try_init_copilot(
             name="sudo",
             description=(
                 "Execute a command with root privileges on the HOST system. "
-                "The user will be prompted to approve the request via Matrix reactions. "
+                "The user will be prompted to approve via a poll in the chat. "
                 "Use this for system administration tasks like installing packages, "
                 "managing services, editing system config files, or anything requiring root. "
+                "If the command is part of a category that might be repeated, suggest a regex "
+                "pattern via suggested_pattern (e.g., '^apt\\s+' for all apt commands). "
                 "Example: sudo(command='apt', args=['install', '-y', 'nginx'], "
-                "reason='User asked to install nginx')."
+                "reason='User asked to install nginx', suggested_pattern='^apt\\s+')."
             ),
             handler=_sudo_handler,
             parameters={
@@ -411,6 +417,10 @@ async def try_init_copilot(
                     "reason": {
                         "type": "string",
                         "description": "Why this privileged command is needed (shown to user for approval)",
+                    },
+                    "suggested_pattern": {
+                        "type": "string",
+                        "description": "Optional regex pattern to suggest for blanket approval (e.g., '^apt\\s+' for all apt commands)",
                     },
                 },
                 "required": ["command", "reason"],

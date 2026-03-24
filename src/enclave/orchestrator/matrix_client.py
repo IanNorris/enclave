@@ -30,6 +30,7 @@ from nio import (
     RoomMessageText,
     RoomEncryptedMedia,
     RoomSendResponse,
+    UnknownEvent,
     UploadResponse,
 )
 from nio.events.room_events import ReactionEvent
@@ -53,6 +54,10 @@ MatrixJoinHandler = Callable[[str, str], Awaitable[None]]
 # Type for reaction handler callbacks
 MatrixReactionHandler = Callable[[str, str, str, str], Awaitable[None]]
 # (room_id, sender, reacts_to_event_id, emoji_key)
+
+# Type for poll response handler callbacks
+MatrixPollResponseHandler = Callable[[str, str, str, list[str]], Awaitable[None]]
+# (room_id, sender, poll_event_id, selected_answer_ids)
 
 
 class EnclaveMatrixClient:
@@ -103,6 +108,7 @@ class EnclaveMatrixClient:
         self._message_handlers: list[MatrixMessageHandler] = []
         self._join_handlers: list[MatrixJoinHandler] = []
         self._reaction_handlers: list[MatrixReactionHandler] = []
+        self._poll_handlers: list[MatrixPollResponseHandler] = []
         self._syncing = False
 
         # Deduplication: track recently seen event IDs to prevent
@@ -119,6 +125,7 @@ class EnclaveMatrixClient:
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
         self.client.add_event_callback(self._on_room_member, RoomMemberEvent)
         self.client.add_event_callback(self._on_reaction, ReactionEvent)
+        self.client.add_event_callback(self._on_unknown_event, UnknownEvent)
         self.client.add_event_callback(self._on_megolm, MegolmEvent)
         self.client.add_event_callback(self._on_encrypted, RoomEncryptionEvent)
         # Catch-all for debugging — see all events
@@ -135,6 +142,10 @@ class EnclaveMatrixClient:
     def on_reaction(self, handler: MatrixReactionHandler) -> None:
         """Register a handler for reaction events."""
         self._reaction_handlers.append(handler)
+
+    def on_poll_response(self, handler: MatrixPollResponseHandler) -> None:
+        """Register a handler for poll response events."""
+        self._poll_handlers.append(handler)
 
     async def login(self) -> bool:
         """Login to the homeserver.
@@ -300,6 +311,84 @@ class EnclaveMatrixClient:
                     "event_id": event_id,
                     "key": emoji,
                 },
+            },
+        )
+        if isinstance(resp, RoomSendResponse):
+            return resp.event_id
+        return None
+
+    async def send_poll(
+        self,
+        room_id: str,
+        question: str,
+        answers: list[tuple[str, str]],
+        thread_event_id: str | None = None,
+    ) -> str | None:
+        """Send a poll to a room.
+
+        Args:
+            room_id: Target room ID.
+            question: The poll question text.
+            answers: List of (answer_id, answer_text) tuples.
+            thread_event_id: If set, post in this thread.
+
+        Returns:
+            Event ID of the poll event, or None on failure.
+        """
+        await self._ensure_keys_for_room(room_id)
+
+        poll_answers = [
+            {"id": aid, "org.matrix.msc1767.text": text}
+            for aid, text in answers
+        ]
+
+        content: dict[str, Any] = {
+            "org.matrix.msc3381.poll.start": {
+                "question": {"org.matrix.msc1767.text": question},
+                "kind": "org.matrix.msc3381.poll.disclosed",
+                "max_selections": 1,
+                "answers": poll_answers,
+            },
+            "org.matrix.msc1767.text": question,
+        }
+
+        if thread_event_id:
+            content["m.relates_to"] = {
+                "rel_type": "m.thread",
+                "event_id": thread_event_id,
+                "is_falling_back": True,
+                "m.in_reply_to": {"event_id": thread_event_id},
+            }
+
+        resp = await self.client.room_send(
+            room_id=room_id,
+            message_type="org.matrix.msc3381.poll.start",
+            content=content,
+        )
+
+        if isinstance(resp, RoomSendResponse):
+            log.debug("Poll sent to %s: %s", room_id, resp.event_id)
+            return resp.event_id
+        else:
+            log.error("Failed to send poll to %s: %s", room_id, resp)
+            return None
+
+    async def end_poll(
+        self,
+        room_id: str,
+        poll_event_id: str,
+    ) -> str | None:
+        """End/close a poll."""
+        await self._ensure_keys_for_room(room_id)
+        resp = await self.client.room_send(
+            room_id=room_id,
+            message_type="org.matrix.msc3381.poll.end",
+            content={
+                "m.relates_to": {
+                    "rel_type": "m.reference",
+                    "event_id": poll_event_id,
+                },
+                "org.matrix.msc1767.text": "Poll ended",
             },
         )
         if isinstance(resp, RoomSendResponse):
@@ -753,6 +842,47 @@ class EnclaveMatrixClient:
                 await handler(room.room_id, event.sender, event.reacts_to, event.key)
             except Exception as e:
                 log.error("Reaction handler error: %s", e)
+
+    async def _on_unknown_event(self, room: MatrixRoom, event: UnknownEvent) -> None:
+        """Handle unknown events — catches poll responses and other MSC events."""
+        if event.sender == self.client.user_id:
+            return
+        if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+
+        # Check for poll response events
+        event_type = getattr(event, "type", "")
+        if "poll.response" not in event_type:
+            return
+
+        if self._dedup_event(event.event_id):
+            return
+
+        source = event.source or {}
+        content = source.get("content", {})
+
+        # Extract the poll event ID this responds to
+        relates_to = content.get("m.relates_to", {})
+        poll_event_id = relates_to.get("event_id", "")
+        if not poll_event_id:
+            return
+
+        # Extract selected answer IDs
+        poll_response = (
+            content.get("org.matrix.msc3381.poll.response", {})
+        )
+        answers = poll_response.get("answers", [])
+
+        log.debug(
+            "Poll response in %s from %s: answers=%s for poll %s",
+            room.room_id, event.sender, answers, poll_event_id,
+        )
+
+        for handler in self._poll_handlers:
+            try:
+                await handler(room.room_id, event.sender, poll_event_id, answers)
+            except Exception as e:
+                log.error("Poll response handler error: %s", e)
 
     async def _on_megolm(self, room: MatrixRoom, event: MegolmEvent) -> None:
         """Handle undecryptable messages — forward to handlers and notify."""
