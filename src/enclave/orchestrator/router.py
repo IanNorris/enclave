@@ -110,23 +110,18 @@ class MessageRouter:
         event_id = self._get_event_id(source)
         thread_id = self._get_thread_id(source)
 
-        # 👀 Acknowledge receipt
-        eyes_eid = None
-        if event_id:
-            eyes_eid = await self.matrix.send_reaction(room_id, event_id, "👀")
-
         if room_id == self.control_room_id:
             await self._handle_control_message(
-                sender, body, source, event_id, eyes_eid
+                sender, body, source, event_id
             )
         else:
             await self._handle_project_message(
-                room_id, sender, body, source, thread_id, event_id, eyes_eid
+                room_id, sender, body, source, thread_id, event_id
             )
 
     async def _handle_control_message(
         self, sender: str, body: str, source: dict[str, Any],
-        event_id: str | None = None, eyes_eid: str | None = None,
+        event_id: str | None = None,
     ) -> None:
         """Handle a message in the control room."""
         cmd = parse_command(body)
@@ -135,14 +130,19 @@ class MessageRouter:
 
         log.info("Command from %s: %s %s", sender, cmd.command.value, cmd.raw_args)
 
-        # Remove 👀, add 🤔 + typing indicator
-        if eyes_eid:
-            await self.matrix.redact_event(self.control_room_id, eyes_eid)
+        # 👀 ack → immediately replace with 🤔 + typing
+        eyes_eid = None
+        if event_id:
+            eyes_eid = await self.matrix.send_reaction(
+                self.control_room_id, event_id, "👀"
+            )
         thinking_eid = None
         if event_id:
             thinking_eid = await self.matrix.send_reaction(
                 self.control_room_id, event_id, "🤔"
             )
+        if eyes_eid:
+            await self.matrix.redact_event(self.control_room_id, eyes_eid)
         await self.matrix.set_typing(self.control_room_id, True)
 
         try:
@@ -185,7 +185,6 @@ class MessageRouter:
         source: dict[str, Any],
         thread_id: str | None,
         event_id: str | None = None,
-        eyes_eid: str | None = None,
     ) -> None:
         """Handle a message in a project room — forward to the agent."""
         session = self.containers.get_session_by_room(room_id)
@@ -201,15 +200,20 @@ class MessageRouter:
             )
             return
 
-        # Remove 👀, add 🤔 + typing
-        if eyes_eid:
-            await self.matrix.redact_event(room_id, eyes_eid)
+        # 👀 ack → immediately replace with 🤔 + typing
+        eyes_eid = None
+        if event_id:
+            eyes_eid = await self.matrix.send_reaction(
+                room_id, event_id, "👀"
+            )
         thinking_eid = None
         if event_id:
             thinking_eid = await self.matrix.send_reaction(
                 room_id, event_id, "🤔"
             )
             self._pending_reactions[f"{room_id}:{event_id}"] = thinking_eid or ""
+        if eyes_eid:
+            await self.matrix.redact_event(room_id, eyes_eid)
         await self.matrix.set_typing(room_id, True)
 
         # Store context for routing the response back
