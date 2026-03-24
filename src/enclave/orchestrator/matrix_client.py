@@ -396,11 +396,11 @@ class EnclaveMatrixClient:
             if space_id:
                 await self._add_room_to_space(space_id, room_id)
 
-            # Don't sync here — sync_forever picks up the room on its next
-            # iteration.  Calling sync() from inside a sync callback causes
-            # duplicate event delivery and can duplicate room_create on 429.
-            # Device trust is handled lazily by _ensure_keys_for_room before
-            # each message send.
+            # Query and trust devices for invited users so they can decrypt
+            # our messages.  We avoid calling sync() here because it conflicts
+            # with sync_forever and can cause duplicate room creation on 429.
+            if invite:
+                await self._trust_users(invite)
 
             return room_id
         else:
@@ -455,6 +455,25 @@ class EnclaveMatrixClient:
             return
 
         for user_id in room.users:
+            for device_id, device in self.client.device_store[user_id].items():
+                if device.deleted:
+                    continue
+                if device.trust_state != TrustState.verified:
+                    self.client.verify_device(device)
+                    log.debug("Trusted device %s for %s", device_id, user_id)
+
+    async def _trust_users(self, user_ids: list[str]) -> None:
+        """Query keys and trust all devices for specific users.
+
+        Used after room creation when the room may not be in the sync
+        store yet — trusts by user ID rather than room membership.
+        """
+        try:
+            await self.client.keys_query()
+        except Exception:
+            pass  # "No key query required" is normal
+
+        for user_id in user_ids:
             for device_id, device in self.client.device_store[user_id].items():
                 if device.deleted:
                     continue
