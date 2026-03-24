@@ -57,6 +57,12 @@ class MessageRouter:
         self.ipc.set_handler(self._on_ipc_message)
         self.ipc.on_connect(self._on_agent_connect)
         self.ipc.on_disconnect(self._on_agent_disconnect)
+
+        # Send startup announcement — also establishes Megolm session
+        await self.matrix.send_message(
+            self.control_room_id,
+            "🏰 Enclave orchestrator online. Type `help` for commands.",
+        )
         log.info("Router started")
 
     async def stop(self) -> None:

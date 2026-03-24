@@ -15,11 +15,13 @@ from typing import Any, Callable, Awaitable
 from nio import (
     AsyncClient,
     AsyncClientConfig,
+    Event,
     InviteMemberEvent,
     LoginResponse,
     MatrixRoom,
     MegolmEvent,
     RoomCreateResponse,
+    RoomEncryptionEvent,
     RoomMessageText,
     RoomSendResponse,
 )
@@ -86,6 +88,7 @@ class EnclaveMatrixClient:
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
         self.client.add_event_callback(self._on_megolm, MegolmEvent)
+        self.client.add_event_callback(self._on_encrypted, RoomEncryptionEvent)
 
     def on_message(self, handler: MatrixMessageHandler) -> None:
         """Register a handler for incoming room messages."""
@@ -112,9 +115,9 @@ class EnclaveMatrixClient:
     async def initial_sync(self) -> None:
         """Perform initial sync and trust devices."""
         self._start_time = time.time()
-        await self.client.sync(timeout=10000)
+        await self.client.sync(timeout=10000, full_state=True)
         await self._trust_all_devices()
-        log.info("Initial sync complete")
+        log.info("Initial sync complete — %d rooms", len(self.client.rooms))
 
     async def sync_forever(self, timeout: int = 30000) -> None:
         """Start the sync loop. Blocks until stopped."""
@@ -187,9 +190,12 @@ class EnclaveMatrixClient:
         """Query keys and trust devices for a room before sending."""
         try:
             await self.client.keys_query()
+        except Exception:
+            pass  # "No key query required" is normal
+        try:
             await self._trust_devices_in_room(room_id)
         except Exception as e:
-            log.warning("Keys query/trust failed for %s: %s", room_id, e)
+            log.warning("Trust failed for %s: %s", room_id, e)
 
     async def send_reaction(
         self, room_id: str, event_id: str, emoji: str
@@ -361,4 +367,15 @@ class EnclaveMatrixClient:
             "Undecryptable message from %s (session: %s)",
             event.sender,
             event.session_id,
+        )
+
+    async def _on_encrypted(
+        self, room: MatrixRoom, event: RoomEncryptionEvent
+    ) -> None:
+        """Log encrypted events that couldn't be decrypted at all."""
+        log.warning(
+            "Encrypted event not decrypted in %s from %s: %s",
+            room.room_id,
+            event.sender,
+            type(event).__name__,
         )
