@@ -22,7 +22,8 @@ log = get_logger("main")
 
 async def run() -> None:
     """Run the orchestrator."""
-    config = load_config()
+    config_path = sys.argv[1] if len(sys.argv) > 1 else None
+    config = load_config(config_path)
     setup_logging(config.log_level)
 
     log.info("Starting Enclave orchestrator")

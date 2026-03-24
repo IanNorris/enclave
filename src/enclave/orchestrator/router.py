@@ -213,6 +213,10 @@ class MessageRouter:
             return
 
         thread_id = self._thread_events.get(session.id)
+        log.info(
+            "Forwarding agent response to %s (thread=%s): %s",
+            session.room_id, thread_id, content[:80],
+        )
         await self.matrix.send_message(
             session.room_id,
             content,

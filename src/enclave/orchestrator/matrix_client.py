@@ -57,6 +57,14 @@ class EnclaveMatrixClient:
 
         store = Path(store_path)
         store.mkdir(parents=True, exist_ok=True)
+        self._store_path = store
+
+        # Try to load persisted device ID
+        device_id_file = store / "device_id"
+        self._device_id_file = device_id_file
+        saved_device_id = None
+        if device_id_file.exists():
+            saved_device_id = device_id_file.read_text().strip()
 
         config = AsyncClientConfig(
             store_sync_tokens=True,
@@ -66,6 +74,7 @@ class EnclaveMatrixClient:
         self.client = AsyncClient(
             homeserver=self.homeserver,
             user=self.user_id,
+            device_id=saved_device_id,
             store_path=str(store),
             config=config,
         )
@@ -90,6 +99,8 @@ class EnclaveMatrixClient:
         resp = await self.client.login(self.password, device_name=self.device_name)
         if isinstance(resp, LoginResponse):
             log.info("Logged in as %s (device: %s)", resp.user_id, resp.device_id)
+            # Persist device ID for reuse across restarts
+            self._device_id_file.write_text(resp.device_id)
             if self.client.should_upload_keys:
                 await self.client.keys_upload()
                 log.info("E2EE keys uploaded")
@@ -140,6 +151,9 @@ class EnclaveMatrixClient:
         Returns:
             Event ID of sent message, or None on failure.
         """
+        # Ensure we have keys for all devices in the room
+        await self._ensure_keys_for_room(room_id)
+
         content: dict[str, Any] = {
             "msgtype": "m.text",
             "body": body,
@@ -169,10 +183,19 @@ class EnclaveMatrixClient:
             log.error("Failed to send message to %s: %s", room_id, resp)
             return None
 
+    async def _ensure_keys_for_room(self, room_id: str) -> None:
+        """Query keys and trust devices for a room before sending."""
+        try:
+            await self.client.keys_query()
+            await self._trust_devices_in_room(room_id)
+        except Exception as e:
+            log.warning("Keys query/trust failed for %s: %s", room_id, e)
+
     async def send_reaction(
         self, room_id: str, event_id: str, emoji: str
     ) -> str | None:
         """React to a message with an emoji."""
+        await self._ensure_keys_for_room(room_id)
         resp = await self.client.room_send(
             room_id=room_id,
             message_type="m.reaction",

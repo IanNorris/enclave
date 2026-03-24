@@ -43,10 +43,13 @@ class IPCConnection:
         self.writer.write(data.encode())
         await self.writer.drain()
 
-    async def recv(self, timeout: float = 30.0) -> Message | None:
+    async def recv(self, timeout: float | None = 30.0) -> Message | None:
         """Receive a message from the agent."""
         try:
-            line = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
+            if timeout is None:
+                line = await self.reader.readline()
+            else:
+                line = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
             if not line:
                 return None
             return Message.from_json(line.decode().strip())
