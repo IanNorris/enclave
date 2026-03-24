@@ -79,6 +79,32 @@ def setup_session_listener(
                     reply_to=reply_to,
                 )))
 
+        elif etype == SessionEventType.ASSISTANT_REASONING_DELTA:
+            delta = getattr(data, "delta_content", None) or ""
+            if delta:
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.AGENT_THINKING,
+                    payload={
+                        "reasoning_delta": delta,
+                        "reasoning_id": getattr(data, "reasoning_id", None) or "",
+                        "in_reply_to": reply_to,
+                    },
+                    reply_to=reply_to,
+                )))
+
+        elif etype == SessionEventType.ASSISTANT_REASONING:
+            text = getattr(data, "reasoning_text", None) or ""
+            if text:
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.AGENT_THINKING,
+                    payload={
+                        "reasoning": text,
+                        "reasoning_id": getattr(data, "reasoning_id", None) or "",
+                        "in_reply_to": reply_to,
+                    },
+                    reply_to=reply_to,
+                )))
+
         elif etype == SessionEventType.TOOL_EXECUTION_START:
             tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
             args = getattr(data, "arguments", None) or {}

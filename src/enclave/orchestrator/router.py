@@ -496,14 +496,36 @@ class MessageRouter:
     async def _handle_agent_thinking(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle an intent/thinking update — show as status message."""
-        intent = msg.payload.get("intent", "")
-        if not intent:
-            return
-        log.debug("Agent %s intent: %s", session.id, intent)
+        """Handle an intent/thinking/reasoning update — show as status message."""
         thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
-        status_text = f"💭 {intent}"
-        await self._update_activity(session, status_text, thread_id)
+
+        # Short intent (e.g. "Exploring the codebase")
+        intent = msg.payload.get("intent", "")
+        if intent:
+            log.debug("Agent %s intent: %s", session.id, intent)
+            status_text = f"💭 {intent}"
+            await self._update_activity(session, status_text, thread_id)
+            return
+
+        # Full reasoning text (complete thinking block)
+        reasoning = msg.payload.get("reasoning", "")
+        if reasoning:
+            # Truncate long reasoning to a preview
+            preview = reasoning[:200].replace("\n", " ")
+            if len(reasoning) > 200:
+                preview += "…"
+            log.debug("Agent %s reasoning: %s", session.id, preview[:80])
+            status_text = f"🧠 {preview}"
+            await self._update_activity(session, status_text, thread_id)
+            return
+
+        # Streaming reasoning delta — accumulate and show latest chunk
+        delta = msg.payload.get("reasoning_delta", "")
+        if delta:
+            preview = delta.strip()[:150].replace("\n", " ")
+            if preview:
+                status_text = f"🧠 …{preview}"
+                await self._update_activity(session, status_text, thread_id)
 
     async def _handle_tool_start(
         self, session: Session, msg: Message
