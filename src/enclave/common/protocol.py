@@ -16,6 +16,7 @@ class MessageType(str, Enum):
     USER_MESSAGE = "user_message"
     PERMISSION_RESPONSE = "permission_response"
     PRIVILEGE_RESPONSE = "privilege_response"
+    MOUNT_RESPONSE = "mount_response"
     SHUTDOWN = "shutdown"
 
     # Agent → Orchestrator
@@ -30,6 +31,7 @@ class MessageType(str, Enum):
     TURN_END = "turn_end"
     PERMISSION_REQUEST = "permission_request"
     PRIVILEGE_REQUEST = "privilege_request"
+    MOUNT_REQUEST = "mount_request"
     SUB_AGENT_REQUEST = "sub_agent_request"
     GUI_LAUNCH_REQUEST = "gui_launch_request"
     SCREENSHOT_REQUEST = "screenshot_request"

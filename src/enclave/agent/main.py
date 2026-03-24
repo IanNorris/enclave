@@ -273,6 +273,9 @@ async def try_init_copilot(
                 "system configuration, etc. Always provide a clear 'reason' so the user "
                 "knows why root is needed. Suggest a regex pattern via suggested_pattern "
                 "when the command category might be repeated.\n\n"
+                "DYNAMIC MOUNTS: You have a `request_mount` tool to mount host directories "
+                "into your container. Approved mounts appear at /workspace/<mount-name> "
+                "instantly. Use for accessing project code, data, or config on the host.\n\n"
                 "You have internet access via slirp4netns networking."
             )
         )
@@ -435,6 +438,96 @@ async def try_init_copilot(
             skip_permission=True,
         )
         custom_tools.append(sudo_tool)
+
+        # Custom tool: request_mount — request a host path be mounted into container
+        async def _mount_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            source_path = args.get("source_path", "")
+            reason = args.get("reason", "")
+            suggested_pattern = args.get("suggested_pattern", "")
+            if not source_path:
+                return ToolResult(
+                    text_result_for_llm="Error: 'source_path' parameter is required",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                payload: dict[str, Any] = {
+                    "source_path": source_path,
+                    "reason": reason,
+                }
+                if suggested_pattern:
+                    payload["suggested_pattern"] = suggested_pattern
+                response = await ipc.request(
+                    Message(
+                        type=MessageType.MOUNT_REQUEST,
+                        payload=payload,
+                    ),
+                    timeout=360.0,
+                )
+                rpayload = response.payload
+                if not rpayload.get("approved"):
+                    return ToolResult(
+                        text_result_for_llm=(
+                            f"Mount request denied: {rpayload.get('error', 'unknown')}"
+                        ),
+                        result_type="error",
+                    )
+                error = rpayload.get("error")
+                if error:
+                    return ToolResult(
+                        text_result_for_llm=f"Mount failed: {error}",
+                        result_type="error",
+                    )
+                container_path = rpayload.get("container_path", "")
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Mounted {source_path} at {container_path}\n"
+                        f"You can now access files at {container_path}"
+                    ),
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Mount request timed out (no approval received)",
+                    result_type="error",
+                )
+
+        mount_tool = Tool(
+            name="request_mount",
+            description=(
+                "Request a host directory be mounted into your container. "
+                "The user must approve via a poll. Once approved, the path appears "
+                "at /workspace/<mount-name> and is accessible immediately. "
+                "Use for: accessing project directories, data files, config dirs, etc. "
+                "Example: request_mount(source_path='/home/ian/projects/myapp', "
+                "reason='Access project source code')."
+            ),
+            handler=_mount_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source_path": {
+                        "type": "string",
+                        "description": "Absolute path on the host to mount (e.g., '/home/ian/projects/myapp')",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this mount is needed (shown to user for approval)",
+                    },
+                    "suggested_pattern": {
+                        "type": "string",
+                        "description": "Optional regex pattern for blanket approval (e.g., '^mount:/home/ian/projects/')",
+                    },
+                },
+                "required": ["source_path", "reason"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(mount_tool)
 
         # Try to resume the most recent session (preserves conversation history)
         try:

@@ -193,7 +193,11 @@ class ContainerManager:
             "--name", session_id,
             "--userns", self.config.userns,
             "--network", network,
-            "-v", f"{session.workspace_path}:/workspace:Z",
+            # Workspace with slave propagation so host-side mounts appear in container
+            "--mount", (
+                f"type=bind,source={session.workspace_path},"
+                f"destination=/workspace,bind-propagation=rslave"
+            ),
             "-v", f"{socket_dir}:/socket:Z",
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
             "-e", f"SESSION_ID={session_id}",

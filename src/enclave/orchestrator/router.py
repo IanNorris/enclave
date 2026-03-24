@@ -119,6 +119,9 @@ class MessageRouter:
 
         self._priv_client = PrivBrokerClient(socket_path=priv_broker_socket)
 
+        # Track workspaces that have shared mount propagation set up
+        self._propagation_ready: set[str] = set()
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
@@ -437,6 +440,8 @@ class MessageRouter:
             await self._handle_permission_request(session, msg)
         elif msg.type == MessageType.PRIVILEGE_REQUEST:
             await self._handle_privilege_request(session, msg)
+        elif msg.type == MessageType.MOUNT_REQUEST:
+            await self._handle_mount_request(session, msg)
         elif msg.type == MessageType.FILE_SEND:
             return await self._handle_file_send(session, msg)
         elif msg.type == MessageType.DOWNLOAD_REQUEST:
@@ -914,6 +919,139 @@ class MessageRouter:
         )
         await self.ipc.send_to(session.id, response)
 
+    async def _handle_mount_request(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle a dynamic mount request from an agent.
+
+        Flow: post approval poll → if approved, set up propagation (if needed)
+        → bind-mount source into workspace via priv broker → agent sees it at
+        /workspace/<mount_name>.
+        """
+        source_path = msg.payload.get("source_path", "")
+        reason = msg.payload.get("reason", "")
+        suggested_pattern = msg.payload.get("suggested_pattern")
+
+        log.info(
+            "Mount request from %s: %s (%s)",
+            session.id, source_path, reason,
+        )
+
+        # Ask for approval via poll in the project room
+        status, scope, pattern = await self._approval.request_permission(
+            session_id=session.id,
+            session_name=session.name,
+            project_name=session.name,
+            perm_type=PermissionType.FILESYSTEM,
+            target=f"mount:{source_path}",
+            reason=reason,
+            room_id=session.room_id,
+            suggested_pattern=suggested_pattern,
+        )
+
+        if status != RequestStatus.APPROVED:
+            response = Message(
+                type=MessageType.MOUNT_RESPONSE,
+                payload={
+                    "approved": False,
+                    "source_path": source_path,
+                    "error": f"Request {status.value}",
+                },
+                reply_to=msg.id,
+            )
+            await self.ipc.send_to(session.id, response)
+            return
+
+        # Record grant if scoped
+        if scope:
+            self._perm_db.add_grant(
+                session_id=session.id,
+                project_name=session.name,
+                perm_type=PermissionType.FILESYSTEM,
+                target=pattern or f"mount:{source_path}",
+                scope=scope,
+                granted_by="approval",
+                pattern=pattern,
+            )
+
+        # Ensure priv broker is connected
+        if not self._priv_client.is_connected:
+            if not await self._priv_client.connect():
+                response = Message(
+                    type=MessageType.MOUNT_RESPONSE,
+                    payload={
+                        "approved": True,
+                        "source_path": source_path,
+                        "error": "Privilege broker not available",
+                    },
+                    reply_to=msg.id,
+                )
+                await self.ipc.send_to(session.id, response)
+                return
+
+        workspace = session.workspace_path
+
+        # Set up shared mount propagation on workspace (once per workspace)
+        if workspace not in self._propagation_ready:
+            result = await self._priv_client.make_shared(
+                session_id=session.id, path=workspace,
+            )
+            if result.success:
+                self._propagation_ready.add(workspace)
+                log.info("Shared propagation set up: %s", workspace)
+            else:
+                log.warning(
+                    "Failed to set up propagation for %s: %s",
+                    workspace, result.error,
+                )
+                # Continue anyway — mount may still work if propagation was
+                # already set up from a previous run
+
+        # Create mount name from source path
+        mount_name = (
+            source_path.strip("/")
+            .replace("/", "-")
+            .replace(" ", "-")
+            .replace("..", "")[:64]
+        )
+        target = f"{workspace}/{mount_name}"
+
+        # Bind-mount via priv broker (runs as root)
+        result = await self._priv_client.mount(
+            session_id=session.id,
+            source=source_path,
+            target=target,
+        )
+
+        if result.success:
+            container_path = f"/workspace/{mount_name}"
+            response = Message(
+                type=MessageType.MOUNT_RESPONSE,
+                payload={
+                    "approved": True,
+                    "source_path": source_path,
+                    "container_path": container_path,
+                    "mount_name": mount_name,
+                },
+                reply_to=msg.id,
+            )
+            await self.matrix.send_message(
+                session.room_id,
+                f"📂 Mounted `{source_path}` → `{container_path}`",
+            )
+        else:
+            response = Message(
+                type=MessageType.MOUNT_RESPONSE,
+                payload={
+                    "approved": True,
+                    "source_path": source_path,
+                    "error": result.error or "Mount failed",
+                },
+                reply_to=msg.id,
+            )
+
+        await self.ipc.send_to(session.id, response)
+
     # ------------------------------------------------------------------
     # Matrix poll/reaction → approval flow
     # ------------------------------------------------------------------
@@ -997,6 +1135,38 @@ class MessageRouter:
         await self._reply_control(f"✅ Revoked grant `{gid}`.")
 
     # ------------------------------------------------------------------
+    # Mount propagation
+    # ------------------------------------------------------------------
+
+    async def _ensure_propagation(self, session: Session) -> None:
+        """Set up shared mount propagation on a session's workspace.
+
+        This makes it so bind-mounts added to the workspace directory on the
+        host are visible inside the running container. Must be called before
+        container start and requires the priv broker.
+        """
+        workspace = session.workspace_path
+        if workspace in self._propagation_ready:
+            return
+
+        if not self._priv_client.is_connected:
+            if not await self._priv_client.connect():
+                log.warning("Priv broker unavailable — skipping propagation setup")
+                return
+
+        result = await self._priv_client.make_shared(
+            session_id=session.id, path=workspace,
+        )
+        if result.success:
+            self._propagation_ready.add(workspace)
+            log.info("Shared propagation set up: %s", workspace)
+        else:
+            log.warning(
+                "Failed to set up propagation for %s: %s",
+                workspace, result.error,
+            )
+
+    # ------------------------------------------------------------------
     # Session restoration
     # ------------------------------------------------------------------
 
@@ -1012,6 +1182,9 @@ class MessageRouter:
 
             socket_path = await self.ipc.create_socket(session.id)
             session.socket_path = str(socket_path)
+
+            # Set up shared propagation before starting container
+            await self._ensure_propagation(session)
 
             started = await self.containers.start_session(session.id)
             if started:
@@ -1116,6 +1289,9 @@ class MessageRouter:
         await self.ipc.remove_socket(f"pending-{project_name}")
         socket_path = await self.ipc.create_socket(session.id)
         session.socket_path = str(socket_path)
+
+        # Set up shared propagation before starting container
+        await self._ensure_propagation(session)
 
         started = await self.containers.start_session(session.id)
 
