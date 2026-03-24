@@ -13,6 +13,7 @@ from typing import Any
 
 from enclave.common.logging import get_logger
 from enclave.common.protocol import Message, MessageType
+from enclave.orchestrator.approval import ApprovalManager
 from enclave.orchestrator.commands import (
     CommandType,
     ParsedCommand,
@@ -22,6 +23,13 @@ from enclave.orchestrator.commands import (
 from enclave.orchestrator.container import ContainerManager, Session
 from enclave.orchestrator.ipc import IPCServer
 from enclave.orchestrator.matrix_client import EnclaveMatrixClient
+from enclave.orchestrator.permissions import (
+    PermissionDB,
+    PermissionScope,
+    PermissionType,
+    RequestStatus,
+)
+from enclave.orchestrator.priv_client import PrivBrokerClient
 
 log = get_logger("router")
 
@@ -49,6 +57,9 @@ class MessageRouter:
         control_room_id: str,
         space_id: str | None = None,
         allowed_users: list[str] | None = None,
+        data_dir: str = "",
+        priv_broker_socket: str = "/run/enclave-priv/broker.sock",
+        approval_timeout: float = 300.0,
     ):
         self.matrix = matrix
         self.ipc = ipc
@@ -89,10 +100,29 @@ class MessageRouter:
         # room_id → list of message strings to send once the user joins
         self._awaiting_join: dict[str, list[str]] = {}
 
+        # ── Privilege & permission system ──
+        import os
+        db_path = os.path.join(
+            data_dir or os.path.expanduser("~/.local/share/enclave"),
+            "permissions.db",
+        )
+        self._perm_db = PermissionDB(db_path)
+
+        self._approval = ApprovalManager(
+            permission_db=self._perm_db,
+            send_message=self.matrix.send_message,
+            send_reaction=self.matrix.send_reaction,
+            approval_room_id=self.control_room_id,
+            timeout=approval_timeout,
+        )
+
+        self._priv_client = PrivBrokerClient(socket_path=priv_broker_socket)
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
         self.matrix.on_user_join(self._on_user_join)
+        self.matrix.on_reaction(self._on_matrix_reaction)
         self.ipc.set_handler(self._on_ipc_message)
         self.ipc.on_connect(self._on_agent_connect)
         self.ipc.on_disconnect(self._on_agent_disconnect)
@@ -102,6 +132,12 @@ class MessageRouter:
             self.control_room_id,
             "🏰 Enclave orchestrator online. Type `help` for commands.",
         )
+
+        # Connect to privilege broker (non-blocking — broker may not be running)
+        if not await self._priv_client.connect():
+            log.warning("Privilege broker not available — sudo requests will fail")
+        else:
+            log.info("Connected to privilege broker")
 
         # Start periodic health check
         self._health_task = asyncio.create_task(self._health_check_loop())
@@ -116,6 +152,8 @@ class MessageRouter:
                 await self._health_task
             except asyncio.CancelledError:
                 pass
+        await self._priv_client.disconnect()
+        self._perm_db.close()
         log.info("Router stopped")
 
     # ------------------------------------------------------------------
@@ -232,6 +270,10 @@ class MessageRouter:
                 await self._cmd_kill(cmd)
             elif cmd.command == CommandType.STATUS:
                 await self._cmd_status()
+            elif cmd.command == CommandType.PERMS:
+                await self._cmd_perms(cmd)
+            elif cmd.command == CommandType.REVOKE:
+                await self._cmd_revoke(cmd)
             elif cmd.command == CommandType.UNKNOWN:
                 await self._reply_control(
                     f"Unknown command: `{cmd.args[0] if cmd.args else '?'}`. "
@@ -378,6 +420,8 @@ class MessageRouter:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
             await self._handle_permission_request(session, msg)
+        elif msg.type == MessageType.PRIVILEGE_REQUEST:
+            await self._handle_privilege_request(session, msg)
         elif msg.type == MessageType.FILE_SEND:
             return await self._handle_file_send(session, msg)
         elif msg.type == MessageType.DOWNLOAD_REQUEST:
@@ -712,12 +756,187 @@ class MessageRouter:
     async def _handle_permission_request(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle a permission request from an agent (stub for Phase 2)."""
+        """Handle a permission request from an agent (filesystem/network)."""
+        target = msg.payload.get("target", "")
+        reason = msg.payload.get("reason", "")
+        perm_type_str = msg.payload.get("perm_type", "filesystem")
+
+        try:
+            perm_type = PermissionType(perm_type_str)
+        except ValueError:
+            perm_type = PermissionType.FILESYSTEM
+
         log.info(
-            "Permission request from %s: %s",
-            session.id,
-            msg.payload,
+            "Permission request from %s: %s %s (%s)",
+            session.id, perm_type.value, target, reason,
         )
+
+        status, scope = await self._approval.request_permission(
+            session_id=session.id,
+            session_name=session.name,
+            project_name=session.name,
+            perm_type=perm_type,
+            target=target,
+            reason=reason,
+        )
+
+        # Send response back to agent
+        response = Message(
+            type=MessageType.PERMISSION_RESPONSE,
+            payload={
+                "approved": status == RequestStatus.APPROVED,
+                "scope": scope.value if scope else None,
+                "target": target,
+            },
+            reply_to=msg.id,
+        )
+        await self.ipc.send_to(session.id, response)
+
+    async def _handle_privilege_request(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle a privilege escalation request from an agent.
+
+        Flow: check DB → post approval to Matrix → wait for reaction →
+        if approved, execute via priv broker → return result.
+        """
+        command = msg.payload.get("command", "")
+        args = msg.payload.get("args", [])
+        reason = msg.payload.get("reason", "")
+        full_cmd = f"{command} {' '.join(args)}".strip() if args else command
+
+        log.info(
+            "Privilege request from %s: %s (%s)",
+            session.id, full_cmd, reason,
+        )
+
+        # Ask for approval via Matrix reaction flow
+        status, scope = await self._approval.request_permission(
+            session_id=session.id,
+            session_name=session.name,
+            project_name=session.name,
+            perm_type=PermissionType.PRIVILEGE,
+            target=full_cmd,
+            reason=reason,
+        )
+
+        if status != RequestStatus.APPROVED:
+            # Denied or expired
+            response = Message(
+                type=MessageType.PRIVILEGE_RESPONSE,
+                payload={
+                    "approved": False,
+                    "command": command,
+                    "error": f"Request {status.value}",
+                },
+                reply_to=msg.id,
+            )
+            await self.ipc.send_to(session.id, response)
+            return
+
+        # If scope was set, create a grant for future requests
+        if scope:
+            self._perm_db.add_grant(
+                session_id=session.id,
+                project_name=session.name,
+                perm_type=PermissionType.PRIVILEGE,
+                target=full_cmd,
+                scope=scope,
+                granted_by="approval",
+            )
+
+        # Execute via privilege broker
+        if not self._priv_client.is_connected:
+            if not await self._priv_client.connect():
+                response = Message(
+                    type=MessageType.PRIVILEGE_RESPONSE,
+                    payload={
+                        "approved": True,
+                        "command": command,
+                        "error": "Privilege broker not available",
+                        "stdout": "",
+                        "stderr": "",
+                        "exit_code": -1,
+                    },
+                    reply_to=msg.id,
+                )
+                await self.ipc.send_to(session.id, response)
+                return
+
+        result = await self._priv_client.exec_command(
+            session_id=session.id,
+            command=command,
+            args=args,
+        )
+
+        response = Message(
+            type=MessageType.PRIVILEGE_RESPONSE,
+            payload={
+                "approved": True,
+                "command": command,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.exit_code,
+                "error": result.error if not result.success else "",
+            },
+            reply_to=msg.id,
+        )
+        await self.ipc.send_to(session.id, response)
+
+    # ------------------------------------------------------------------
+    # Matrix reaction → approval flow
+    # ------------------------------------------------------------------
+
+    async def _on_matrix_reaction(
+        self, room_id: str, sender: str, reacts_to: str, emoji: str
+    ) -> None:
+        """Handle a reaction from Matrix — check if it resolves an approval."""
+        request_id, scope = self._approval.handle_reaction(
+            event_id=reacts_to,
+            emoji=emoji,
+            sender=sender,
+        )
+        if request_id is not None:
+            action = "denied" if scope is None else f"approved ({scope.value})"
+            log.info(
+                "Approval reaction from %s: request %s %s",
+                sender, request_id, action,
+            )
+
+    # ------------------------------------------------------------------
+    # Permission management commands (!perms, !revoke)
+    # ------------------------------------------------------------------
+
+    async def _cmd_perms(self, cmd: ParsedCommand) -> None:
+        """List active permissions / grants."""
+        project = cmd.raw_args.strip() if cmd.raw_args.strip() else None
+        grants = self._perm_db.list_grants(project_name=project)
+        if not grants:
+            await self._reply_control("No active permissions.")
+            return
+
+        lines = ["**Active Permissions**\n"]
+        for g in grants[:20]:
+            status = "✅" if g.is_active else "❌"
+            lines.append(
+                f"{status} `{g.id}` **{g.perm_type.value}** `{g.target}` "
+                f"({g.scope.value}) — {g.project_name}"
+            )
+        await self._reply_control("\n".join(lines))
+
+    async def _cmd_revoke(self, cmd: ParsedCommand) -> None:
+        """Revoke a permission grant by ID."""
+        grant_id = cmd.raw_args.strip()
+        if not grant_id:
+            await self._reply_control("Usage: `revoke <grant-id>`")
+            return
+        try:
+            gid = int(grant_id)
+        except ValueError:
+            await self._reply_control(f"Invalid grant ID: `{grant_id}`")
+            return
+        self._perm_db.revoke_grant(gid, revoked_by="control")
+        await self._reply_control(f"✅ Revoked grant `{gid}`.")
 
     # ------------------------------------------------------------------
     # Session restoration

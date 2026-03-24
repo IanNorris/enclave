@@ -86,6 +86,9 @@ class FakeMatrix:
     def on_user_join(self, handler):
         pass
 
+    def on_reaction(self, handler):
+        pass
+
 
 class FakeIPC:
     """Fake IPC server that records calls."""

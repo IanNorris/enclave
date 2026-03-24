@@ -32,6 +32,7 @@ from nio import (
     RoomSendResponse,
     UploadResponse,
 )
+from nio.events.room_events import ReactionEvent
 from nio.crypto import TrustState
 
 from enclave.common.logging import get_logger
@@ -48,6 +49,10 @@ MatrixMessageHandler = Callable[
 # Type for user-join handler callbacks
 MatrixJoinHandler = Callable[[str, str], Awaitable[None]]
 # (room_id, user_id)
+
+# Type for reaction handler callbacks
+MatrixReactionHandler = Callable[[str, str, str, str], Awaitable[None]]
+# (room_id, sender, reacts_to_event_id, emoji_key)
 
 
 class EnclaveMatrixClient:
@@ -97,6 +102,7 @@ class EnclaveMatrixClient:
 
         self._message_handlers: list[MatrixMessageHandler] = []
         self._join_handlers: list[MatrixJoinHandler] = []
+        self._reaction_handlers: list[MatrixReactionHandler] = []
         self._syncing = False
 
         # Deduplication: track recently seen event IDs to prevent
@@ -112,6 +118,7 @@ class EnclaveMatrixClient:
         )
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
         self.client.add_event_callback(self._on_room_member, RoomMemberEvent)
+        self.client.add_event_callback(self._on_reaction, ReactionEvent)
         self.client.add_event_callback(self._on_megolm, MegolmEvent)
         self.client.add_event_callback(self._on_encrypted, RoomEncryptionEvent)
         # Catch-all for debugging — see all events
@@ -124,6 +131,10 @@ class EnclaveMatrixClient:
     def on_user_join(self, handler: MatrixJoinHandler) -> None:
         """Register a handler for when a user joins a room."""
         self._join_handlers.append(handler)
+
+    def on_reaction(self, handler: MatrixReactionHandler) -> None:
+        """Register a handler for reaction events."""
+        self._reaction_handlers.append(handler)
 
     async def login(self) -> bool:
         """Login to the homeserver.
@@ -721,6 +732,27 @@ class EnclaveMatrixClient:
                 await handler(room.room_id, event.state_key)
             except Exception as e:
                 log.error("Join handler error: %s", e)
+
+    async def _on_reaction(self, room: MatrixRoom, event: ReactionEvent) -> None:
+        """Handle reaction events — forward to registered handlers."""
+        # Skip own reactions (bot seeding emoji for approval)
+        if event.sender == self.client.user_id:
+            return
+        # Skip old events
+        if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+        if self._dedup_event(event):
+            return
+
+        log.debug(
+            "Reaction in %s from %s: %s on %s",
+            room.room_id, event.sender, event.key, event.reacts_to,
+        )
+        for handler in self._reaction_handlers:
+            try:
+                await handler(room.room_id, event.sender, event.reacts_to, event.key)
+            except Exception as e:
+                log.error("Reaction handler error: %s", e)
 
     async def _on_megolm(self, room: MatrixRoom, event: MegolmEvent) -> None:
         """Handle undecryptable messages — forward to handlers and notify."""
