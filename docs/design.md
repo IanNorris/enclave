@@ -144,6 +144,44 @@ Instead, the orchestrator controls a "workspace gateway":
 
 **Recommendation:** Start with **Approach A** (workspace staging), it covers 90% of use cases.
 
+**Critical design principle:** All permissions are managed by the **orchestrator**
+(external to the container), never by the agent itself. The orchestrator maintains
+a permission database per-session with entries that can be added, revoked, or
+modified at any time without restarting the container.
+
+**Approval UI — Reaction-based** (validated in spike testing):
+Polls (MSC3381) are unreliable in E2EE rooms. Instead, use reactions:
+
+```
+🔒 Permission Request
+
+Project Hello World wants to access:
+cdn.github.com/bla/bla/bla
+
+React to choose:
+1️⃣ Approve once
+2️⃣ Approve for this project
+3️⃣ Approve regex: *.github.com
+❌ Deny
+```
+
+Bot seeds the reaction emojis so user just taps. For regex approval,
+bot suggests a pattern based on the URL; user can override by replying
+with a custom pattern.
+
+**Permission types (stored in orchestrator DB):**
+- `once` — single-use, auto-revoked after request completes
+- `session` — valid for the current session only
+- `project` — persisted across sessions for this project
+- `pattern` — regex-based rule (e.g., `*.github.com`, `/home/ian/projects/*`)
+
+**Management interface** (control room commands):
+- `!perms <project>` — list active permissions for a project
+- `!revoke <id>` — revoke a specific permission
+- `!rules` — list all persistent permission rules
+- `!rules add <pattern> <scope>` — add a rule without a request
+- `!rules rm <id>` — remove a rule
+
 ### 4. Privilege Broker (root daemon)
 
 Separate systemd service running as root.
@@ -194,12 +232,16 @@ Runs inside the orchestrator. Detects and bridges to the desktop.
 
 ### 6. Matrix Room Model
 
+**Bot-managed rooms** — the bot owns the room lifecycle. On first startup,
+bot creates a Space and control room, invites the user. Project rooms are
+created on demand via commands.
+
 Using **Spaces + Rooms + Threads**:
 
 ```
-📁 Space: "Aeon"
-   ├── 🔧 #control          — system management, agent spawning
-   ├── 🔐 #approvals        — privilege/permission requests land here
+📁 Space: "Enclave"
+   ├── 🔧 #control          — commands only (agent spawning, system mgmt)
+   ├── 🔐 #approvals        — permission/privilege requests with reactions
    ├── 📂 #project-foo      — agent session for project foo
    │     ├── Thread: "refactor auth module"
    │     └── Thread: "debug CI pipeline"
@@ -207,11 +249,29 @@ Using **Spaces + Rooms + Threads**:
    └── 📊 #monitoring       — system stats, alerts
 ```
 
-**How threads work in Element:**
-- Hover over any message → click "Reply in thread" (🧵 icon)
-- This creates a side panel thread attached to that message
-- The bot can create threads programmatically via matrix-nio
-- Each thread = a conversation context for the Copilot SDK
+**Room creation flow:**
+1. User types `project Test Project` (or `!project Test Project`) in control room
+2. Bot creates encrypted room "Test Project" in the Space
+3. Bot invites user, spins up podman container
+4. User accepts invite, starts chatting with the agent
+
+**Command format:** Both `!command` and bare `command` are accepted
+(strip `!` prefix if present, then match command word). This makes mobile
+usage less painful.
+
+**Control room commands:**
+- `help` — list available commands
+- `project <name>` — create a new project session
+- `sessions` — list active sessions
+- `kill <id>` — stop a session
+- `status` — system info
+- `perms <project>` — list active permissions
+- `revoke <id>` — revoke a permission
+- `rules` — list persistent permission rules
+
+**Per-user homeserver:** Bot config supports different Matrix servers per user.
+Federation handles cross-server messaging natively. No need to tie all users
+to a single homeserver.
 
 **Mapping:**
 - 1 Room = 1 Project
@@ -289,7 +349,7 @@ Nothing existing combines: **AI agent + chat control + sandboxed containers + ap
    allowed but runs in a **separate search agent** to prevent prompt injection
    (see Search Isolation below).
 3. **Multi-user:** Designed in from the start, single-user first pass.
-4. **Homeserver:** Not yet set up. Will use Conduit. Currently in a VM, will
+4. **Homeserver:** Using Synapse at `matrix.iostream.uk`. Currently in a VM, will
    transplant to a more powerful local machine later.
 5. **Session persistence:** Always persisted until manually deleted.
    Conversation history + workspace state saved to disk.
@@ -300,6 +360,16 @@ Nothing existing combines: **AI agent + chat control + sandboxed containers + ap
 8. **Permission requests:** Per-user. One Matrix user = one Linux user.
 9. **Container image strategy:** Hybrid — base image + optional per-project
    layers (see Container Image Strategy below).
+10. **Approval UI:** Reaction-based (not polls). Bot seeds emoji options,
+    user taps to choose. Polls (MSC3381) unreliable in E2EE rooms.
+11. **Room lifecycle:** Bot-managed. Bot creates Space + rooms, invites users.
+    No manual room setup required.
+12. **Command prefix:** Both `!command` and bare `command` accepted.
+    Control room is commands-only.
+13. **Permission storage:** External to container. Orchestrator maintains
+    permission DB per-session. Can add/revoke at any time without container restart.
+14. **Per-user homeserver:** Bot supports different Matrix servers per user
+    via federation.
 
 ---
 
