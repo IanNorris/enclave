@@ -502,7 +502,7 @@ class MessageRouter:
             return
         log.debug("Agent %s intent: %s", session.id, intent)
         thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
-        status_text = f"-# 💭 {intent}"
+        status_text = f"💭 {intent}"
         await self._update_activity(session, status_text, thread_id)
 
     async def _handle_tool_start(
@@ -517,9 +517,9 @@ class MessageRouter:
         log.debug("Agent %s tool start: %s", session.id, tool_name)
         thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
         if description:
-            status_text = f"-# 🔧 **{tool_name}**: {description}"
+            status_text = f"🔧 **{tool_name}**: {description}"
         else:
-            status_text = f"-# 🔧 **{tool_name}**"
+            status_text = f"🔧 **{tool_name}**"
         await self._update_activity(session, status_text, thread_id)
 
     async def _handle_tool_complete(
