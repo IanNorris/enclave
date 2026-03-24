@@ -197,20 +197,40 @@ class EnclaveTestBot:
         else:
             await self._echo(room, event, body)
 
+    def _get_thread_context(self, event: RoomMessageText) -> dict | None:
+        """Extract thread relation from an event, if it's in a thread."""
+        source = event.source or {}
+        content = source.get("content", {})
+        relates_to = content.get("m.relates_to", {})
+        if relates_to.get("rel_type") == "m.thread":
+            # Message is in a thread — return relation to continue the thread
+            return {
+                "rel_type": "m.thread",
+                "event_id": relates_to["event_id"],  # thread root
+                "is_falling_back": True,
+                "m.in_reply_to": {"event_id": event.event_id},
+            }
+        return None
+
     async def _echo(
         self, room: MatrixRoom, event: RoomMessageText, body: str
     ) -> None:
-        """Echo a message back."""
+        """Echo a message back, preserving thread context."""
+        content: dict = {
+            "msgtype": "m.text",
+            "body": f"🔁 Echo: {body}",
+        }
+        thread_ctx = self._get_thread_context(event)
+        if thread_ctx:
+            content["m.relates_to"] = thread_ctx
+
         await self.client.room_send(
             room_id=room.room_id,
             message_type="m.room.message",
-            content={
-                "msgtype": "m.text",
-                "body": f"🔁 Echo: {body}",
-            },
+            content=content,
         )
         self.results["echo_sent"] = True
-        print(f"  → Echoed back")
+        print(f"  → Echoed back{' (in thread)' if thread_ctx else ''}")
 
     async def _test_thread(self, room: MatrixRoom, event: RoomMessageText) -> None:
         """Create a thread reply to the user's message."""
