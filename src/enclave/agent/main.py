@@ -19,11 +19,107 @@ if TYPE_CHECKING:
     from copilot.session import CopilotSession as _CopilotSession
 
 
+def setup_session_listener(
+    ipc: IPCClient,
+    sdk_session: _CopilotSession,
+    loop: asyncio.AbstractEventLoop,
+) -> callable:
+    """Register a persistent event listener on the SDK session.
+
+    Returns unsubscribe callable.  Events are forwarded to the orchestrator
+    via IPC for the lifetime of the session — this handles background agents
+    that produce additional turns after the initial SESSION_IDLE.
+    """
+    from copilot.generated.session_events import SessionEventType
+
+    # Track the "current" user message so replies are correlated.
+    current_msg_id: str | None = None
+    accumulated_content: list[str] = []
+
+    def _fire_and_forget(coro: object) -> None:
+        future = asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
+        future.add_done_callback(
+            lambda f: f.exception() if not f.cancelled() else None
+        )
+
+    def on_event(event: object) -> None:
+        etype = getattr(event, "type", None)
+        data = getattr(event, "data", None)
+        reply_to = current_msg_id
+
+        if etype == SessionEventType.ASSISTANT_MESSAGE_DELTA:
+            delta = getattr(data, "delta_content", None) or getattr(data, "content", None) or ""
+            if delta:
+                accumulated_content.append(delta)
+                full_text = "".join(accumulated_content)
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.AGENT_DELTA,
+                    payload={"content": full_text, "in_reply_to": reply_to},
+                    reply_to=reply_to,
+                )))
+
+        elif etype == SessionEventType.ASSISTANT_MESSAGE:
+            # Complete message from the assistant — send as AGENT_RESPONSE.
+            final = getattr(data, "content", None) or ""
+            if final:
+                accumulated_content.clear()
+                accumulated_content.append(final)
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.AGENT_RESPONSE,
+                    payload={"content": final, "in_reply_to": reply_to},
+                    reply_to=reply_to,
+                )))
+
+        elif etype == SessionEventType.ASSISTANT_INTENT:
+            intent = getattr(data, "intent", None) or ""
+            if intent:
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.AGENT_THINKING,
+                    payload={"intent": intent, "in_reply_to": reply_to},
+                    reply_to=reply_to,
+                )))
+
+        elif etype == SessionEventType.TOOL_EXECUTION_START:
+            tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.TOOL_START,
+                payload={"tool_name": tool_name, "in_reply_to": reply_to},
+                reply_to=reply_to,
+            )))
+
+        elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
+            tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.TOOL_COMPLETE,
+                payload={"tool_name": tool_name, "in_reply_to": reply_to},
+                reply_to=reply_to,
+            )))
+
+        elif etype == SessionEventType.SESSION_ERROR:
+            err = getattr(data, "message", str(data))
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"content": f"[error] {err}", "in_reply_to": reply_to},
+                reply_to=reply_to,
+            )))
+
+    def set_current_msg(msg_id: str | None) -> None:
+        nonlocal current_msg_id
+        current_msg_id = msg_id
+        accumulated_content.clear()
+
+    unsubscribe = sdk_session.on(on_event)
+    # Attach the helper so callers can update the current msg reference.
+    unsubscribe.set_current_msg = set_current_msg  # type: ignore[attr-defined]
+    return unsubscribe
+
+
 async def handle_user_message(
     ipc: IPCClient,
     sdk_session: _CopilotSession | None,
     msg: Message,
     loop: asyncio.AbstractEventLoop,
+    listener_ctl: object | None = None,
 ) -> None:
     """Handle a user message — stream events back via IPC."""
     content = msg.payload.get("content", "")
@@ -36,100 +132,20 @@ async def handle_user_message(
         ))
         return
 
-    try:
-        from copilot.generated.session_events import SessionEventType
-    except ImportError:
-        await ipc.send(Message(
-            type=MessageType.AGENT_RESPONSE,
-            payload={"content": f"[echo] {content}", "in_reply_to": msg.id},
-            reply_to=msg.id,
-        ))
-        return
+    # Point the persistent listener at this message
+    if listener_ctl and hasattr(listener_ctl, "set_current_msg"):
+        listener_ctl.set_current_msg(msg.id)
 
-    idle_event = asyncio.Event()
-    accumulated_content = []
-    error_msg: str | None = None
-
-    def _fire_and_forget(coro: object) -> None:
-        """Schedule an async send from a sync callback."""
-        future = asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
-        future.add_done_callback(
-            lambda f: f.exception() if not f.cancelled() else None
-        )
-
-    def on_event(event: object) -> None:
-        nonlocal error_msg
-        etype = getattr(event, "type", None)
-        data = getattr(event, "data", None)
-
-        if etype == SessionEventType.ASSISTANT_MESSAGE_DELTA:
-            delta = getattr(data, "delta_content", None) or getattr(data, "content", None) or ""
-            if delta:
-                accumulated_content.append(delta)
-                full_text = "".join(accumulated_content)
-                _fire_and_forget(ipc.send(Message(
-                    type=MessageType.AGENT_DELTA,
-                    payload={"content": full_text, "in_reply_to": msg.id},
-                    reply_to=msg.id,
-                )))
-
-        elif etype == SessionEventType.ASSISTANT_MESSAGE:
-            final = getattr(data, "content", None) or ""
-            if final:
-                accumulated_content.clear()
-                accumulated_content.append(final)
-
-        elif etype == SessionEventType.ASSISTANT_INTENT:
-            intent = getattr(data, "intent", None) or ""
-            if intent:
-                _fire_and_forget(ipc.send(Message(
-                    type=MessageType.AGENT_THINKING,
-                    payload={"intent": intent, "in_reply_to": msg.id},
-                    reply_to=msg.id,
-                )))
-
-        elif etype == SessionEventType.TOOL_EXECUTION_START:
-            tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
-            _fire_and_forget(ipc.send(Message(
-                type=MessageType.TOOL_START,
-                payload={"tool_name": tool_name, "in_reply_to": msg.id},
-                reply_to=msg.id,
-            )))
-
-        elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
-            tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
-            _fire_and_forget(ipc.send(Message(
-                type=MessageType.TOOL_COMPLETE,
-                payload={"tool_name": tool_name, "in_reply_to": msg.id},
-                reply_to=msg.id,
-            )))
-
-        elif etype == SessionEventType.SESSION_IDLE:
-            idle_event.set()
-
-        elif etype == SessionEventType.SESSION_ERROR:
-            error_msg = getattr(data, "message", str(data))
-            idle_event.set()
-
-    unsubscribe = sdk_session.on(on_event)
     try:
         await sdk_session.send(content)
-        await asyncio.wait_for(idle_event.wait(), timeout=600.0)
-    except TimeoutError:
-        error_msg = "Agent timed out after 600s."
-    finally:
-        unsubscribe()
-
-    # Send final response
-    final_content = "".join(accumulated_content) if accumulated_content else "[no response]"
-    if error_msg:
-        final_content = f"[error] {error_msg}"
-
-    await ipc.send(Message(
-        type=MessageType.AGENT_RESPONSE,
-        payload={"content": final_content, "in_reply_to": msg.id},
-        reply_to=msg.id,
-    ))
+        # Don't wait for SESSION_IDLE here — the persistent listener handles
+        # all responses including those from background sub-agents.
+    except Exception as e:
+        await ipc.send(Message(
+            type=MessageType.AGENT_RESPONSE,
+            payload={"content": f"[error] {e}", "in_reply_to": msg.id},
+            reply_to=msg.id,
+        ))
 
 
 async def try_init_copilot(
@@ -218,9 +234,17 @@ async def main() -> None:
 
     # Try to init Copilot SDK
     sdk_result = await try_init_copilot()
+    listener_ctl = None
     if sdk_result:
         sdk_client, sdk_session = sdk_result
         print("[agent] Copilot SDK initialized")
+        # Register persistent event listener (handles background agents too)
+        try:
+            listener_ctl = setup_session_listener(ipc, sdk_session, loop)
+            print("[agent] Persistent event listener registered")
+        except ImportError:
+            print("[agent] SessionEventType not available, running in echo mode")
+            sdk_client, sdk_session = None, None
     else:
         sdk_client, sdk_session = None, None
         print("[agent] Running in echo mode (no Copilot SDK)")
@@ -237,7 +261,7 @@ async def main() -> None:
 
     # Register message handlers
     async def on_user_message(msg: Message) -> Message | None:
-        await handle_user_message(ipc, sdk_session, msg, loop)
+        await handle_user_message(ipc, sdk_session, msg, loop, listener_ctl)
         return None
 
     async def on_shutdown(msg: Message) -> Message | None:
@@ -258,6 +282,11 @@ async def main() -> None:
         pass
 
     # Cleanup
+    if listener_ctl and callable(listener_ctl):
+        try:
+            listener_ctl()
+        except Exception:
+            pass
     if sdk_session:
         try:
             sdk_session.disconnect()
