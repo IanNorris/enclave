@@ -687,7 +687,7 @@ class EnclaveMatrixClient:
             await self.client.join(room.room_id)
 
     async def _on_megolm(self, room: MatrixRoom, event: MegolmEvent) -> None:
-        """Handle undecryptable messages — notify the sender."""
+        """Handle undecryptable messages — forward to handlers and notify."""
         log.warning(
             "Undecryptable message from %s in %s (session: %s)",
             event.sender,
@@ -700,13 +700,32 @@ class EnclaveMatrixClient:
         # Ignore old messages
         if event.server_timestamp < (self._start_time * 1000 - 5000):
             return
-        await self.send_message(
-            room.room_id,
-            "🔐 I couldn't decrypt your message. This usually happens when "
-            "encryption keys haven't been shared yet.\n\n"
-            "**Try:** Open your Element settings → Security → "
-            "verify this device, or just re-send your message.",
-        )
+
+        # Deduplicate
+        if self._dedup_event(event.event_id):
+            return
+
+        # Forward to message handlers with a placeholder body so that
+        # session restore and other routing logic still triggers.
+        source = event.source or {}
+        body = "[Encrypted message — unable to decrypt]"
+        for handler in self._message_handlers:
+            try:
+                await handler(room.room_id, event.sender, body, source, [])
+            except Exception as e:
+                log.error("Message handler error (megolm): %s", e)
+
+        # Also notify the user
+        try:
+            await self.send_message(
+                room.room_id,
+                "🔐 I couldn't decrypt your message. This can happen after "
+                "a restart. Your message was still forwarded to the agent "
+                "(it will see it as encrypted). Try re-sending if the agent "
+                "doesn't understand.",
+            )
+        except Exception:
+            pass  # Room might not be in sync store yet
 
     async def _on_encrypted(
         self, room: MatrixRoom, event: RoomEncryptionEvent
