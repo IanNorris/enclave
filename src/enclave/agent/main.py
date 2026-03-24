@@ -257,17 +257,26 @@ async def try_init_copilot(
         perm_handler = lambda _req, _meta: PermissionRequestResult(kind="approved")
         sys_msg = SystemMessageAppendConfig(
             append=(
-                "You are an AI assistant running inside an Enclave sandbox. "
+                "You are an AI assistant running inside an Enclave sandbox container. "
                 "You can help the user with coding, research, and system tasks. "
                 "File operations are limited to the /workspace directory.\n\n"
                 "IMPORTANT: When you create images or files that the user should see, "
                 "use the `send_file` tool to send them to the chat. The `view` tool "
                 "only lets YOU see the file — the user cannot see it unless you send it.\n\n"
                 "PRIVILEGE ESCALATION: You have a `sudo` tool that executes commands as root "
-                "on the HOST system. The user must approve each request via Matrix reactions. "
-                "Use it for package installation (apt), service management (systemctl), "
-                "system configuration, etc. Always provide a clear 'reason' so the user "
-                "knows why root is needed. You have internet access via slirp4netns networking."
+                "on the HOST system (not inside your container). The user must approve each "
+                "request via a poll in the chat. Use it for package installation (apt), "
+                "service management (systemctl), system configuration, etc.\n\n"
+                "CRITICAL: Your `sudo` tool runs commands on the HOST, not in this container. "
+                "After installing packages with sudo, you can also RUN them with sudo since "
+                "they exist on the host filesystem. For example, to install and run figlet:\n"
+                "  1. sudo(command='apt-get', args=['install', '-y', 'figlet'], reason='...')\n"
+                "  2. sudo(command='figlet', args=['Hello!'], reason='Run figlet')\n"
+                "Both calls execute on the host. Your container has its own separate filesystem.\n\n"
+                "Always provide a clear 'reason' so the user knows why root is needed. "
+                "Suggest a regex pattern via suggested_pattern when the command category "
+                "might be repeated (e.g., '^apt\\s+' for all apt commands). "
+                "You have internet access via slirp4netns networking."
             )
         )
 
@@ -392,14 +401,15 @@ async def try_init_copilot(
         sudo_tool = Tool(
             name="sudo",
             description=(
-                "Execute a command with root privileges on the HOST system. "
-                "The user will be prompted to approve via a poll in the chat. "
-                "Use this for system administration tasks like installing packages, "
-                "managing services, editing system config files, or anything requiring root. "
-                "If the command is part of a category that might be repeated, suggest a regex "
-                "pattern via suggested_pattern (e.g., '^apt\\s+' for all apt commands). "
-                "Example: sudo(command='apt', args=['install', '-y', 'nginx'], "
-                "reason='User asked to install nginx', suggested_pattern='^apt\\s+')."
+                "Execute a command on the HOST system (outside your container). "
+                "Commands run as root. The user approves via a poll in the chat. "
+                "Use for: package install (apt), service management (systemctl), "
+                "running host binaries, editing system config, anything needing root or host access. "
+                "IMPORTANT: This runs on the HOST, not in your container. After installing a "
+                "package with sudo, run it with sudo too since it's on the host filesystem. "
+                "Suggest a regex pattern for repeated command categories. "
+                "Example: sudo(command='apt-get', args=['install', '-y', 'nginx'], "
+                "reason='Install nginx', suggested_pattern='^apt\\s+')."
             ),
             handler=_sudo_handler,
             parameters={
