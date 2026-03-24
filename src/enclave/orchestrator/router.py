@@ -28,6 +28,9 @@ log = get_logger("router")
 # Minimum interval between Matrix message edits (seconds)
 _EDIT_THROTTLE = 1.5
 
+# Max length for accumulated activity messages before starting a new one
+_MAX_ACTIVITY_LEN = 3500
+
 
 class MessageRouter:
     """Routes messages between Matrix, IPC, and commands.
@@ -66,6 +69,8 @@ class MessageRouter:
 
         # Activity status message per session (editable tool/thinking display)
         self._activity_msg: dict[str, str] = {}  # session_id → Matrix event_id
+        # Accumulated activity lines per session (appended, not replaced)
+        self._activity_lines: dict[str, list[str]] = {}  # session_id → list of lines
 
         # Sub-agent thread tracking
         # session_id → event_id of the message that starts the sub-agent thread
@@ -391,10 +396,9 @@ class MessageRouter:
         now = time.monotonic()
 
         if stream is None:
-            # First delta — clean up activity message and start streaming
-            activity_eid = self._activity_msg.pop(session.id, None)
-            if activity_eid:
-                await self.matrix.redact_event(session.room_id, activity_eid)
+            # First delta — detach activity message (keep in chat) and start streaming
+            self._activity_msg.pop(session.id, None)
+            self._activity_lines.pop(session.id, None)
             # Send a new message as placeholder
             event_id = await self.matrix.send_message(
                 session.room_id,
@@ -486,21 +490,42 @@ class MessageRouter:
         log.info("Sub-agent completed for %s: %s (success=%s)", session.id, agent_name, success)
         # Clear the sub-agent thread so further events go to the main thread
         self._subagent_threads.pop(session.id, None)
-        # Clear any lingering activity message
+        # Clear any lingering activity message reference
         self._activity_msg.pop(session.id, None)
+        self._activity_lines.pop(session.id, None)
 
     async def _update_activity(
         self, session: Session, text: str, thread_id: str | None
     ) -> None:
-        """Send or edit a compact activity status message in the room."""
+        """Append a line to the activity status message.
+
+        Lines accumulate in a single message (edited in-place) until
+        the combined text exceeds _MAX_ACTIVITY_LEN, at which point the
+        current message is finalised and a new one is started.  Activity
+        messages are **not** deleted — they stay in the chat history.
+        """
+        lines = self._activity_lines.setdefault(session.id, [])
+        lines.append(text)
+        combined = "\n".join(lines)
+
         existing = self._activity_msg.get(session.id)
-        if existing:
-            # Edit the existing activity message
-            await self.matrix.edit_message(session.room_id, existing, text)
-        else:
-            # Send a new activity message
+
+        if existing and len(combined) <= _MAX_ACTIVITY_LEN:
+            # Still fits — edit the existing message
+            await self.matrix.edit_message(session.room_id, existing, combined)
+        elif existing:
+            # Over the limit — finalise current message and start a new one
+            self._activity_msg.pop(session.id, None)
+            self._activity_lines[session.id] = [text]
             event_id = await self.matrix.send_message(
                 session.room_id, text, thread_event_id=thread_id,
+            )
+            if event_id:
+                self._activity_msg[session.id] = event_id
+        else:
+            # No existing message — create one
+            event_id = await self.matrix.send_message(
+                session.room_id, combined, thread_event_id=thread_id,
             )
             if event_id:
                 self._activity_msg[session.id] = event_id
@@ -520,12 +545,10 @@ class MessageRouter:
             session.room_id, thread_id, content[:80],
         )
 
-        # Stop typing and clear activity status
+        # Stop typing and detach activity status (keep it in chat history)
         await self.matrix.set_typing(session.room_id, False)
-        # Redact the activity message since the response replaces it
-        activity_eid = self._activity_msg.pop(session.id, None)
-        if activity_eid:
-            await self.matrix.redact_event(session.room_id, activity_eid)
+        self._activity_msg.pop(session.id, None)
+        self._activity_lines.pop(session.id, None)
 
         # If we have a streaming message, edit it with final content.
         # Otherwise, send a new message.
