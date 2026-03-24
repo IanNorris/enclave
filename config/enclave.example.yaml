@@ -1,0 +1,48 @@
+# Enclave example configuration
+# Copy to enclave.yaml and fill in your values
+
+matrix:
+  homeserver: "https://matrix.example.com"
+  bot_user: "@enclave:example.com"
+  bot_password: ""  # Or use access_token instead
+  # access_token: "syt_..."
+
+  # Space and room configuration
+  space_name: "Enclave"
+  control_room: "#enclave-control:example.com"
+  approvals_room: "#enclave-approvals:example.com"
+
+users:
+  "@ian:example.com":
+    linux_user: ian
+    allowed_rooms: ["#project-*:example.com", "#enclave-control:example.com"]
+    max_sessions: 10
+    can_approve_privilege: true
+
+containers:
+  runtime: podman
+  base_image: "enclave-agent:base"
+  network: none  # default: no network
+  userns: keep-id
+  # Where session workspaces live on the host
+  workspace_root: "/home/aeon/workspaces"
+  session_root: "/home/aeon/sessions"
+
+privilege_broker:
+  socket: "/run/aeon-priv/broker.sock"
+  approval_timeout_seconds: 300
+  # Commands that are always denied
+  denylist:
+    - "rm -rf /"
+    - "dd if=/dev/zero"
+  # Commands that skip approval (auto-approved)
+  allowlist:
+    - "pacman -Qi *"
+    - "systemctl status *"
+
+display:
+  compositor: hyprland
+  screenshot_tool: grim
+  clipboard_tools:
+    copy: wl-copy
+    paste: wl-paste
