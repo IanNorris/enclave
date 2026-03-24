@@ -74,6 +74,9 @@ class MessageRouter:
         # Pending messages queued during session restore (sent once agent is ready)
         self._pending_messages: dict[str, list[dict[str, Any]]] = {}
 
+        # Sessions currently being restored (prevent double-restore)
+        self._restoring: set[str] = set()
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
@@ -254,7 +257,6 @@ class MessageRouter:
             # Check for a stopped/persisted session to restore
             session = self.containers.get_any_session_by_room(room_id)
             if session is not None:
-                log.info("Restoring session %s for room %s", session.id, room_id)
                 # Queue the message so it's sent once the agent is ready
                 self._pending_messages.setdefault(session.id, []).append({
                     "body": body,
@@ -264,7 +266,12 @@ class MessageRouter:
                     "event_id": event_id,
                     "attachments": attachments,
                 })
-                await self._restore_session(session, room_id, event_id)
+                # Only trigger restore if not already restoring
+                if session.id not in self._restoring:
+                    log.info("Restoring session %s for room %s", session.id, room_id)
+                    await self._restore_session(session, room_id, event_id)
+                else:
+                    log.info("Session %s already restoring, queued message", session.id)
                 return
             log.debug("No session for room %s", room_id)
             return
@@ -576,15 +583,23 @@ class MessageRouter:
                     "Sending queued message to %s: %s",
                     session.id, queued["body"][:60],
                 )
-                await self._handle_project_message(
-                    room_id=queued["room_id"],
-                    sender=queued["sender"],
-                    body=queued["body"],
-                    source={},
-                    thread_id=queued.get("thread_id"),
-                    event_id=queued.get("event_id"),
-                    attachments=queued.get("attachments"),
+                # Send directly via IPC — do NOT re-enter
+                # _handle_project_message which could trigger another restore
+                flush_msg = Message(
+                    type=MessageType.USER_MESSAGE,
+                    payload={
+                        "content": queued["body"],
+                        "sender": queued["sender"],
+                        "room_id": queued["room_id"],
+                        "thread_id": queued.get("thread_id"),
+                        "attachments": queued.get("attachments") or [],
+                    },
                 )
+                sent = await self.ipc.send_to(session.id, flush_msg)
+                if not sent:
+                    log.warning(
+                        "Failed to send queued message to %s", session.id
+                    )
 
     async def _handle_file_send(
         self, session: Session, msg: Message
@@ -674,20 +689,24 @@ class MessageRouter:
         self, session: Session, room_id: str, event_id: str | None = None,
     ) -> None:
         """Restore a stopped session — recreate IPC socket and container."""
-        await self.matrix.send_message(
-            room_id, "🔄 Restoring session... please wait."
-        )
-
-        socket_path = await self.ipc.create_socket(session.id)
-        session.socket_path = str(socket_path)
-
-        started = await self.containers.start_session(session.id)
-        if started:
-            log.info("Session restored: %s", session.id)
-        else:
+        self._restoring.add(session.id)
+        try:
             await self.matrix.send_message(
-                room_id, "❌ Failed to restore session."
+                room_id, "🔄 Restoring session... please wait."
             )
+
+            socket_path = await self.ipc.create_socket(session.id)
+            session.socket_path = str(socket_path)
+
+            started = await self.containers.start_session(session.id)
+            if started:
+                log.info("Session restored: %s", session.id)
+            else:
+                await self.matrix.send_message(
+                    room_id, "❌ Failed to restore session."
+                )
+        finally:
+            self._restoring.discard(session.id)
 
     # ------------------------------------------------------------------
     # Agent connect/disconnect

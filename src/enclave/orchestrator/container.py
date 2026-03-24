@@ -167,6 +167,11 @@ class ContainerManager:
 
         # Clean up any leftover container with the same name
         log.debug("Removing old container for %s...", session_id)
+        # First try to stop any running container, then remove
+        stop_result = await _run_command(
+            [self.config.runtime, "stop", "-t", "5", session_id], timeout=15.0
+        )
+        log.debug("stop result: rc=%d stderr=%s", stop_result.returncode, stop_result.stderr[:100])
         rm_result = await _run_command(
             [self.config.runtime, "rm", "-f", session_id], timeout=10.0
         )

@@ -396,9 +396,11 @@ class EnclaveMatrixClient:
             if space_id:
                 await self._add_room_to_space(space_id, room_id)
 
-            # Sync to pick up the new room, then trust devices
-            await self.client.sync(timeout=5000)
-            await self._trust_devices_in_room(room_id)
+            # Don't sync here — sync_forever picks up the room on its next
+            # iteration.  Calling sync() from inside a sync callback causes
+            # duplicate event delivery and can duplicate room_create on 429.
+            # Device trust is handled lazily by _ensure_keys_for_room before
+            # each message send.
 
             return room_id
         else:
