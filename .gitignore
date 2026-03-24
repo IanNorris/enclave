@@ -28,6 +28,7 @@ Thumbs.db
 *.sqlite
 sessions/
 workspaces/
+bot_store/
 
 # Secrets
 .env
