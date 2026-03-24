@@ -7,7 +7,9 @@ Handles workspace setup and mount propagation.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -312,24 +314,29 @@ class CommandResult:
     stderr: str
 
 
-async def _run_command(cmd: list[str], timeout: float = 30.0) -> CommandResult:
-    """Run a command asynchronously and return the result."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+def _run_command_sync(cmd: list[str], timeout: float) -> CommandResult:
+    """Run a command synchronously (for use in thread pool)."""
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return CommandResult(
+            returncode=result.returncode,
+            stdout=result.stdout or "",
+            stderr=result.stderr or "",
+        )
+    except subprocess.TimeoutExpired:
         return CommandResult(returncode=-1, stdout="", stderr="timeout")
 
-    return CommandResult(
-        returncode=proc.returncode or 0,
-        stdout=stdout.decode() if stdout else "",
-        stderr=stderr.decode() if stderr else "",
+
+async def _run_command(cmd: list[str], timeout: float = 30.0) -> CommandResult:
+    """Run a command in a thread pool to avoid event loop deadlocks."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, functools.partial(_run_command_sync, cmd, timeout)
     )
 
 
