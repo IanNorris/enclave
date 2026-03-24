@@ -95,8 +95,9 @@ class EnclaveMatrixClient:
 
         # Deduplication: track recently seen event IDs to prevent
         # double-processing when sync() is called inside callbacks.
-        self._seen_events: set[str] = set()
-        self._seen_events_max = 500
+        # Uses an ordered dict for proper LRU eviction (oldest first).
+        self._seen_events: dict[str, None] = {}
+        self._seen_events_max = 1000
 
         # Register internal callbacks
         self.client.add_event_callback(self._on_message, RoomMessageText)
@@ -500,16 +501,18 @@ class EnclaveMatrixClient:
             log.warning("Failed to add room to space: %s", e)
 
     def _dedup_event(self, event_id: str) -> bool:
-        """Return True if this event was already seen (duplicate)."""
+        """Return True if this event was already seen (duplicate).
+
+        Uses an ordered dict as an LRU cache so trimming always
+        evicts the oldest entries (not arbitrary ones).
+        """
         if event_id in self._seen_events:
             return True
-        self._seen_events.add(event_id)
-        # Trim set to prevent unbounded growth
-        if len(self._seen_events) > self._seen_events_max:
-            # Discard oldest ~half (sets are unordered but this is fine
-            # for dedup — we only need recent events)
-            to_remove = list(self._seen_events)[:self._seen_events_max // 2]
-            self._seen_events -= set(to_remove)
+        self._seen_events[event_id] = None
+        # Trim oldest entries when over capacity
+        while len(self._seen_events) > self._seen_events_max:
+            # popitem(last=False) removes the oldest (first-inserted) entry
+            self._seen_events.pop(next(iter(self._seen_events)))
         return False
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
@@ -699,10 +702,6 @@ class EnclaveMatrixClient:
             return
         # Ignore old messages
         if event.server_timestamp < (self._start_time * 1000 - 5000):
-            return
-
-        # Deduplicate
-        if self._dedup_event(event.event_id):
             return
 
         # Forward to message handlers with a placeholder body so that
