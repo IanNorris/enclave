@@ -63,6 +63,13 @@ class MessageRouter:
         # Key: session_id, Value: dict with streaming context
         self._streaming: dict[str, dict[str, Any]] = {}
 
+        # Activity status message per session (editable tool/thinking display)
+        self._activity_msg: dict[str, str] = {}  # session_id → Matrix event_id
+
+        # Sub-agent thread tracking
+        # session_id → event_id of the message that starts the sub-agent thread
+        self._subagent_threads: dict[str, str] = {}
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
@@ -326,6 +333,14 @@ class MessageRouter:
             await self._handle_tool_start(session, msg)
         elif msg.type == MessageType.TOOL_COMPLETE:
             await self._handle_tool_complete(session, msg)
+        elif msg.type == MessageType.SUBAGENT_STARTED:
+            await self._handle_subagent_started(session, msg)
+        elif msg.type == MessageType.SUBAGENT_COMPLETED:
+            await self._handle_subagent_completed(session, msg)
+        elif msg.type == MessageType.TURN_START:
+            pass  # Tracked implicitly via other events
+        elif msg.type == MessageType.TURN_END:
+            pass  # Tracked implicitly via other events
         elif msg.type == MessageType.STATUS_UPDATE:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
@@ -356,7 +371,11 @@ class MessageRouter:
         now = time.monotonic()
 
         if stream is None:
-            # First delta — send a new message as placeholder
+            # First delta — clean up activity message and start streaming
+            activity_eid = self._activity_msg.pop(session.id, None)
+            if activity_eid:
+                await self.matrix.redact_event(session.room_id, activity_eid)
+            # Send a new message as placeholder
             event_id = await self.matrix.send_message(
                 session.room_id,
                 content + " ▍",
@@ -381,28 +400,91 @@ class MessageRouter:
     async def _handle_agent_thinking(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle an intent/thinking update from the agent."""
+        """Handle an intent/thinking update — show as status message."""
         intent = msg.payload.get("intent", "")
-        if intent:
-            log.debug("Agent %s intent: %s", session.id, intent)
-            # Keep typing indicator active
-            await self.matrix.set_typing(session.room_id, True)
+        if not intent:
+            return
+        log.debug("Agent %s intent: %s", session.id, intent)
+        thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
+        status_text = f"-# 💭 {intent}"
+        await self._update_activity(session, status_text, thread_id)
 
     async def _handle_tool_start(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle tool execution start."""
+        """Handle tool execution start — show tool name and description."""
         tool_name = msg.payload.get("tool_name", "unknown")
+        description = msg.payload.get("description", "")
+        # Skip internal/noisy tools
+        if tool_name in ("report_intent",):
+            return
         log.debug("Agent %s tool start: %s", session.id, tool_name)
-        # Keep typing indicator active
-        await self.matrix.set_typing(session.room_id, True)
+        thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
+        if description:
+            status_text = f"-# 🔧 **{tool_name}**: {description}"
+        else:
+            status_text = f"-# 🔧 **{tool_name}**"
+        await self._update_activity(session, status_text, thread_id)
 
     async def _handle_tool_complete(
         self, session: Session, msg: Message
     ) -> None:
         """Handle tool execution complete."""
         tool_name = msg.payload.get("tool_name", "unknown")
-        log.debug("Agent %s tool complete: %s", session.id, tool_name)
+        success = msg.payload.get("success", True)
+        if tool_name in ("report_intent",):
+            return
+        log.debug("Agent %s tool complete: %s (success=%s)", session.id, tool_name, success)
+        # Keep typing indicator while more work may come
+        await self.matrix.set_typing(session.room_id, True)
+
+    async def _handle_subagent_started(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle sub-agent start — create a thread for its activity."""
+        agent_name = msg.payload.get("agent_name", "sub-agent")
+        description = msg.payload.get("description", "")
+        log.info("Sub-agent started for %s: %s (%s)", session.id, agent_name, description)
+
+        # Send a message that becomes the thread root for sub-agent activity
+        thread_id = self._thread_events.get(session.id)
+        label = f"🤖 **{agent_name}**"
+        if description:
+            label += f": {description}"
+        event_id = await self.matrix.send_message(
+            session.room_id, label, thread_event_id=thread_id,
+        )
+        if event_id:
+            self._subagent_threads[session.id] = event_id
+
+    async def _handle_subagent_completed(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle sub-agent completion — close its thread context."""
+        agent_name = msg.payload.get("agent_name", "sub-agent")
+        success = msg.payload.get("success", True)
+        log.info("Sub-agent completed for %s: %s (success=%s)", session.id, agent_name, success)
+        # Clear the sub-agent thread so further events go to the main thread
+        self._subagent_threads.pop(session.id, None)
+        # Clear any lingering activity message
+        self._activity_msg.pop(session.id, None)
+
+    async def _update_activity(
+        self, session: Session, text: str, thread_id: str | None
+    ) -> None:
+        """Send or edit a compact activity status message in the room."""
+        existing = self._activity_msg.get(session.id)
+        if existing:
+            # Edit the existing activity message
+            await self.matrix.edit_message(session.room_id, existing, text)
+        else:
+            # Send a new activity message
+            event_id = await self.matrix.send_message(
+                session.room_id, text, thread_event_id=thread_id,
+            )
+            if event_id:
+                self._activity_msg[session.id] = event_id
+        await self.matrix.set_typing(session.room_id, True)
 
     async def _handle_agent_response(
         self, session: Session, msg: Message
@@ -418,8 +500,12 @@ class MessageRouter:
             session.room_id, thread_id, content[:80],
         )
 
-        # Stop typing
+        # Stop typing and clear activity status
         await self.matrix.set_typing(session.room_id, False)
+        # Redact the activity message since the response replaces it
+        activity_eid = self._activity_msg.pop(session.id, None)
+        if activity_eid:
+            await self.matrix.redact_event(session.room_id, activity_eid)
 
         # If we have a streaming message, edit it with final content.
         # Otherwise, send a new message.

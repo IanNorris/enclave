@@ -81,17 +81,82 @@ def setup_session_listener(
 
         elif etype == SessionEventType.TOOL_EXECUTION_START:
             tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
+            args = getattr(data, "arguments", None) or {}
+            if isinstance(args, str):
+                try:
+                    import json as _json
+                    args = _json.loads(args)
+                except Exception:
+                    args = {}
+            description = args.get("description", "") or args.get("intent", "") or args.get("prompt", "")
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.TOOL_START,
-                payload={"tool_name": tool_name, "in_reply_to": reply_to},
+                payload={
+                    "tool_name": tool_name,
+                    "description": str(description)[:200],
+                    "tool_call_id": getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", "") or "",
+                    "in_reply_to": reply_to,
+                },
                 reply_to=reply_to,
             )))
 
         elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
             tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
+            success = getattr(data, "success", True)
+            result = getattr(data, "result", None)
+            result_preview = ""
+            if result:
+                result_preview = getattr(result, "content", "") or str(result)
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.TOOL_COMPLETE,
-                payload={"tool_name": tool_name, "in_reply_to": reply_to},
+                payload={
+                    "tool_name": tool_name,
+                    "success": success,
+                    "result_preview": str(result_preview)[:200],
+                    "tool_call_id": getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", "") or "",
+                    "in_reply_to": reply_to,
+                },
+                reply_to=reply_to,
+            )))
+
+        elif etype == SessionEventType.SUBAGENT_STARTED:
+            agent_name = getattr(data, "name", None) or getattr(data, "agent_name", "") or "sub-agent"
+            description = getattr(data, "description", "") or ""
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.SUBAGENT_STARTED,
+                payload={
+                    "agent_name": str(agent_name),
+                    "description": str(description)[:200],
+                    "in_reply_to": reply_to,
+                },
+                reply_to=reply_to,
+            )))
+
+        elif etype in (SessionEventType.SUBAGENT_COMPLETED, SessionEventType.SUBAGENT_FAILED):
+            agent_name = getattr(data, "name", None) or getattr(data, "agent_name", "") or "sub-agent"
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.SUBAGENT_COMPLETED,
+                payload={
+                    "agent_name": str(agent_name),
+                    "success": etype == SessionEventType.SUBAGENT_COMPLETED,
+                    "in_reply_to": reply_to,
+                },
+                reply_to=reply_to,
+            )))
+
+        elif etype == SessionEventType.ASSISTANT_TURN_START:
+            turn_id = getattr(data, "turn_id", None) or getattr(data, "turnId", "")
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.TURN_START,
+                payload={"turn_id": str(turn_id), "in_reply_to": reply_to},
+                reply_to=reply_to,
+            )))
+
+        elif etype == SessionEventType.ASSISTANT_TURN_END:
+            turn_id = getattr(data, "turn_id", None) or getattr(data, "turnId", "")
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.TURN_END,
+                payload={"turn_id": str(turn_id), "in_reply_to": reply_to},
                 reply_to=reply_to,
             )))
 
