@@ -52,7 +52,10 @@ async def handle_user_message(
 
     def _fire_and_forget(coro: object) -> None:
         """Schedule an async send from a sync callback."""
-        asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
+        future = asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
+        future.add_done_callback(
+            lambda f: f.exception() if not f.cancelled() else None
+        )
 
     def on_event(event: object) -> None:
         nonlocal error_msg
@@ -110,7 +113,7 @@ async def handle_user_message(
 
     unsubscribe = sdk_session.on(on_event)
     try:
-        sdk_session.send(content)
+        await sdk_session.send(content)
         await asyncio.wait_for(idle_event.wait(), timeout=120.0)
     except TimeoutError:
         error_msg = "Agent timed out after 120s."
