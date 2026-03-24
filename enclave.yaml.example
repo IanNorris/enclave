@@ -1,0 +1,26 @@
+matrix:
+  homeserver: "https://your.homeserver"
+  user_id: "@enclave-dev:your.homeserver"
+  password: 'YOUR_PASSWORD_HERE'
+  device_name: "Enclave Orchestrator"
+  store_path: "/home/ian/.local/share/enclave/matrix_store"
+  control_room_id: "!rrPHYeAltLgbZwwGJJ:your.homeserver"
+  space_id: ""
+
+container:
+  image: "enclave-agent:latest"
+  runtime: "podman"
+  network: "none"
+  userns: "keep-id"
+  workspace_base: "/home/ian/.local/share/enclave/workspaces"
+  session_base: "/home/ian/.local/share/enclave/sessions"
+  socket_dir: "/home/ian/.local/share/enclave/sockets"
+
+users:
+  - matrix_id: "@your_user:your.homeserver"
+    linux_user: "ian"
+    max_sessions: 10
+    can_approve_privilege: true
+
+log_level: "DEBUG"
+data_dir: "/home/ian/.local/share/enclave"
