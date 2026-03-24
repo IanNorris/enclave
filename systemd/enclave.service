@@ -1,0 +1,45 @@
+# Enclave Orchestrator — systemd user service
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/enclave.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now enclave
+#
+# View logs:
+#   journalctl --user -u enclave -f
+#
+# The orchestrator runs as the logged-in user. It manages Matrix
+# communication, podman containers, and IPC. Enable lingering so it
+# survives after logout:
+#   loginctl enable-linger $USER
+
+[Unit]
+Description=Enclave Orchestrator
+Documentation=https://github.com/IanNorris/enclave
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/enclave %h/.config/enclave/enclave.yaml
+Restart=on-failure
+RestartSec=5
+
+# Working directory is user home
+WorkingDirectory=%h
+
+# Environment for podman + Copilot SDK
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=enclave
+
+# Watchdog: restart if hung for 5 minutes
+WatchdogSec=300
+
+[Install]
+WantedBy=default.target
