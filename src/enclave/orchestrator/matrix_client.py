@@ -741,7 +741,7 @@ class EnclaveMatrixClient:
         # Skip old events
         if event.server_timestamp < (self._start_time * 1000 - 5000):
             return
-        if self._dedup_event(event):
+        if self._dedup_event(event.event_id):
             return
 
         log.debug(
