@@ -1,0 +1,22 @@
+# Enclave Agent Container
+#
+# Minimal Python image with the enclave agent package.
+# Copilot SDK is optional — agent runs in echo mode without it.
+
+FROM python:3.12-slim
+
+# Install useful tools for the agent
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git curl jq && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install enclave package
+COPY pyproject.toml /build/
+COPY src/ /build/src/
+RUN pip install --no-cache-dir /build && rm -rf /build
+
+WORKDIR /workspace
+
+# Agent entry point
+CMD ["python3", "-m", "enclave.agent.main"]

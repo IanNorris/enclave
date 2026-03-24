@@ -30,6 +30,8 @@ class MatrixConfig:
     password: str = ""
     device_name: str = "Enclave Bot"
     store_path: str = str(Path.home() / ".local" / "share" / "enclave" / "matrix_store")
+    control_room_id: str = ""
+    space_id: str = ""
 
 
 @dataclass
@@ -42,6 +44,7 @@ class ContainerConfig:
     userns: str = "keep-id"
     workspace_base: str = str(Path.home() / ".local" / "share" / "enclave" / "workspaces")
     session_base: str = str(Path.home() / ".local" / "share" / "enclave" / "sessions")
+    socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
 
 
 @dataclass
@@ -90,7 +93,10 @@ def _apply_env_overrides(config: EnclaveConfig) -> None:
         "ENCLAVE_MATRIX_PASSWORD": ("matrix", "password"),
         "ENCLAVE_MATRIX_DEVICE_NAME": ("matrix", "device_name"),
         "ENCLAVE_MATRIX_STORE_PATH": ("matrix", "store_path"),
+        "ENCLAVE_MATRIX_CONTROL_ROOM": ("matrix", "control_room_id"),
+        "ENCLAVE_MATRIX_SPACE": ("matrix", "space_id"),
         "ENCLAVE_CONTAINER_IMAGE": ("container", "image"),
+        "ENCLAVE_CONTAINER_SOCKET_DIR": ("container", "socket_dir"),
         "ENCLAVE_LOG_LEVEL": ("log_level",),
         "ENCLAVE_DATA_DIR": ("data_dir",),
     }
@@ -149,6 +155,8 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 password=m.get("password", ""),
                 device_name=m.get("device_name", "Enclave Bot"),
                 store_path=m.get("store_path", config.matrix.store_path),
+                control_room_id=m.get("control_room_id", ""),
+                space_id=m.get("space_id", ""),
             )
 
         if "container" in data:
@@ -160,6 +168,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 userns=c.get("userns", config.container.userns),
                 workspace_base=c.get("workspace_base", config.container.workspace_base),
                 session_base=c.get("session_base", config.container.session_base),
+                socket_dir=c.get("socket_dir", config.container.socket_dir),
             )
 
         if "priv_broker" in data:
