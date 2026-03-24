@@ -638,11 +638,25 @@ class EnclaveMatrixClient:
             await self.client.join(room.room_id)
 
     async def _on_megolm(self, room: MatrixRoom, event: MegolmEvent) -> None:
-        """Log undecryptable messages."""
-        log.debug(
-            "Undecryptable message from %s (session: %s)",
+        """Handle undecryptable messages — notify the sender."""
+        log.warning(
+            "Undecryptable message from %s in %s (session: %s)",
             event.sender,
+            room.room_id,
             event.session_id,
+        )
+        # Don't respond to our own undecryptable messages (e.g. from initial sync)
+        if event.sender == self.client.user_id:
+            return
+        # Ignore old messages
+        if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+        await self.send_message(
+            room.room_id,
+            "🔐 I couldn't decrypt your message. This usually happens when "
+            "encryption keys haven't been shared yet.\n\n"
+            "**Try:** Open your Element settings → Security → "
+            "verify this device, or just re-send your message.",
         )
 
     async def _on_encrypted(
