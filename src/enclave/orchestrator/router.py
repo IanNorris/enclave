@@ -7,6 +7,7 @@ and routes agent responses back to Matrix. Handles control room commands.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
@@ -599,8 +600,22 @@ class MessageRouter:
                 reply_to=msg.id,
             )
 
+        # Translate container path → host path
+        # Container mounts workspace_path:/workspace, so
+        # /workspace/foo.png → {workspace_path}/foo.png
+        if file_path.startswith("/workspace/"):
+            host_path = os.path.join(
+                session.workspace_path, file_path[len("/workspace/"):]
+            )
+        elif file_path.startswith("/workspace"):
+            host_path = session.workspace_path
+        else:
+            host_path = file_path
+
+        log.debug("File send: container=%s host=%s", file_path, host_path)
+
         event_id = await self.matrix.upload_file(
-            session.room_id, file_path, body=body
+            session.room_id, host_path, body=body
         )
 
         return Message(
