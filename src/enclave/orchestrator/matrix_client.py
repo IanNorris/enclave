@@ -93,6 +93,11 @@ class EnclaveMatrixClient:
         self._message_handlers: list[MatrixMessageHandler] = []
         self._syncing = False
 
+        # Deduplication: track recently seen event IDs to prevent
+        # double-processing when sync() is called inside callbacks.
+        self._seen_events: set[str] = set()
+        self._seen_events_max = 500
+
         # Register internal callbacks
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(
@@ -396,11 +401,11 @@ class EnclaveMatrixClient:
             if space_id:
                 await self._add_room_to_space(space_id, room_id)
 
-            # Query and trust devices for invited users so they can decrypt
-            # our messages.  We avoid calling sync() here because it conflicts
-            # with sync_forever and can cause duplicate room creation on 429.
-            if invite:
-                await self._trust_users(invite)
+            # Sync to pick up the new room in nio's store (required for E2EE).
+            # Event deduplication in _on_message/_on_media prevents the sync
+            # from re-processing the command that triggered room creation.
+            await self.client.sync(timeout=5000)
+            await self._trust_devices_in_room(room_id)
 
             return room_id
         else:
@@ -494,6 +499,19 @@ class EnclaveMatrixClient:
         except Exception as e:
             log.warning("Failed to add room to space: %s", e)
 
+    def _dedup_event(self, event_id: str) -> bool:
+        """Return True if this event was already seen (duplicate)."""
+        if event_id in self._seen_events:
+            return True
+        self._seen_events.add(event_id)
+        # Trim set to prevent unbounded growth
+        if len(self._seen_events) > self._seen_events_max:
+            # Discard oldest ~half (sets are unordered but this is fine
+            # for dedup — we only need recent events)
+            to_remove = list(self._seen_events)[:self._seen_events_max // 2]
+            self._seen_events -= set(to_remove)
+        return False
+
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
         """Handle incoming text messages."""
         # Ignore our own messages
@@ -502,6 +520,11 @@ class EnclaveMatrixClient:
 
         # Ignore old messages (before we started)
         if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+
+        # Deduplicate — sync inside callbacks can re-deliver events
+        if self._dedup_event(event.event_id):
+            log.debug("Duplicate event %s, skipping", event.event_id)
             return
 
         source = event.source or {}
@@ -517,6 +540,11 @@ class EnclaveMatrixClient:
             return
 
         if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+
+        # Deduplicate
+        if self._dedup_event(event.event_id):
+            log.debug("Duplicate media event %s, skipping", event.event_id)
             return
 
         source = event.source or {}
