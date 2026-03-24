@@ -34,3 +34,4 @@ bot_store/
 .env
 *.pem
 *.key
+enclave.yaml
