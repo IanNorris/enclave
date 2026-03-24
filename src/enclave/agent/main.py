@@ -218,6 +218,9 @@ async def try_init_copilot(
 ) -> tuple[_CopilotClient, _CopilotSession] | None:
     """Try to initialize the Copilot SDK.
 
+    Attempts to resume the most recent session first (preserving conversation
+    history across container restarts). Falls back to creating a new session.
+
     Returns (client, session) tuple or None if SDK unavailable.
     """
     try:
@@ -249,17 +252,35 @@ async def try_init_copilot(
             await client.stop()
             return None
 
-        session = await client.create_session(
-            on_permission_request=lambda _req, _meta: PermissionRequestResult(
-                kind="approved"
-            ),
-            system_message=SystemMessageAppendConfig(
-                append=(
-                    "You are an AI assistant running inside an Enclave sandbox. "
-                    "You can help the user with coding, research, and system tasks. "
-                    "File operations are limited to the /workspace directory."
+        perm_handler = lambda _req, _meta: PermissionRequestResult(kind="approved")
+        sys_msg = SystemMessageAppendConfig(
+            append=(
+                "You are an AI assistant running inside an Enclave sandbox. "
+                "You can help the user with coding, research, and system tasks. "
+                "File operations are limited to the /workspace directory."
+            )
+        )
+
+        # Try to resume the most recent session (preserves conversation history)
+        try:
+            last_id = await client.get_last_session_id()
+            if last_id:
+                print(f"[agent] Resuming session {last_id}", file=sys.stderr)
+                session = await client.resume_session(
+                    last_id,
+                    on_permission_request=perm_handler,
+                    system_message=sys_msg,
+                    working_directory=working_directory,
                 )
-            ),
+                print(f"[agent] Session resumed: {last_id}", file=sys.stderr)
+                return (client, session)
+        except Exception as e:
+            print(f"[agent] Session resume failed ({e}), creating new session", file=sys.stderr)
+
+        # No previous session or resume failed — create fresh
+        session = await client.create_session(
+            on_permission_request=perm_handler,
+            system_message=sys_msg,
             working_directory=working_directory,
         )
         return (client, session)
