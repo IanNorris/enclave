@@ -20,33 +20,111 @@ if TYPE_CHECKING:
 
 
 async def handle_user_message(
-    client: IPCClient,
+    ipc: IPCClient,
     sdk_session: _CopilotSession | None,
     msg: Message,
+    loop: asyncio.AbstractEventLoop,
 ) -> None:
-    """Handle a user message forwarded from the orchestrator.
-
-    Routes it through the Copilot SDK and sends the response back.
-    """
+    """Handle a user message — stream events back via IPC."""
     content = msg.payload.get("content", "")
 
     if sdk_session is None:
-        response_text = f"[echo] {content}"
-    else:
-        try:
-            event = await sdk_session.send_and_wait(content, timeout=120.0)
-            response_text = event.data.content if event and event.data else "[no response]"
-        except TimeoutError:
-            response_text = "[timeout] The agent took too long to respond."
-        except Exception as e:
-            response_text = f"[error] {e}"
+        await ipc.send(Message(
+            type=MessageType.AGENT_RESPONSE,
+            payload={"content": f"[echo] {content}", "in_reply_to": msg.id},
+            reply_to=msg.id,
+        ))
+        return
 
-    await client.send(Message(
+    try:
+        from copilot.generated.session_events import SessionEventType
+    except ImportError:
+        await ipc.send(Message(
+            type=MessageType.AGENT_RESPONSE,
+            payload={"content": f"[echo] {content}", "in_reply_to": msg.id},
+            reply_to=msg.id,
+        ))
+        return
+
+    idle_event = asyncio.Event()
+    accumulated_content = []
+    error_msg: str | None = None
+
+    def _fire_and_forget(coro: object) -> None:
+        """Schedule an async send from a sync callback."""
+        asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
+
+    def on_event(event: object) -> None:
+        nonlocal error_msg
+        etype = getattr(event, "type", None)
+        data = getattr(event, "data", None)
+
+        if etype == SessionEventType.ASSISTANT_MESSAGE_DELTA:
+            delta = getattr(data, "delta_content", None) or getattr(data, "content", None) or ""
+            if delta:
+                accumulated_content.append(delta)
+                full_text = "".join(accumulated_content)
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.AGENT_DELTA,
+                    payload={"content": full_text, "in_reply_to": msg.id},
+                    reply_to=msg.id,
+                )))
+
+        elif etype == SessionEventType.ASSISTANT_MESSAGE:
+            final = getattr(data, "content", None) or ""
+            if final:
+                accumulated_content.clear()
+                accumulated_content.append(final)
+
+        elif etype == SessionEventType.ASSISTANT_INTENT:
+            intent = getattr(data, "intent", None) or ""
+            if intent:
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.AGENT_THINKING,
+                    payload={"intent": intent, "in_reply_to": msg.id},
+                    reply_to=msg.id,
+                )))
+
+        elif etype == SessionEventType.TOOL_EXECUTION_START:
+            tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.TOOL_START,
+                payload={"tool_name": tool_name, "in_reply_to": msg.id},
+                reply_to=msg.id,
+            )))
+
+        elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
+            tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.TOOL_COMPLETE,
+                payload={"tool_name": tool_name, "in_reply_to": msg.id},
+                reply_to=msg.id,
+            )))
+
+        elif etype == SessionEventType.SESSION_IDLE:
+            idle_event.set()
+
+        elif etype == SessionEventType.SESSION_ERROR:
+            error_msg = getattr(data, "message", str(data))
+            idle_event.set()
+
+    unsubscribe = sdk_session.on(on_event)
+    try:
+        sdk_session.send(content)
+        await asyncio.wait_for(idle_event.wait(), timeout=120.0)
+    except TimeoutError:
+        error_msg = "Agent timed out after 120s."
+    finally:
+        unsubscribe()
+
+    # Send final response
+    final_content = "".join(accumulated_content) if accumulated_content else "[no response]"
+    if error_msg:
+        final_content = f"[error] {error_msg}"
+
+    await ipc.send(Message(
         type=MessageType.AGENT_RESPONSE,
-        payload={
-            "content": response_text,
-            "in_reply_to": msg.id,
-        },
+        payload={"content": final_content, "in_reply_to": msg.id},
         reply_to=msg.id,
     ))
 
@@ -69,12 +147,23 @@ async def try_init_copilot(
         return None
 
     try:
-        # Use token from env if available
         github_token = os.environ.get("GITHUB_TOKEN")
         sdk_config = SubprocessConfig(github_token=github_token) if github_token else None
 
         client = CopilotClient(sdk_config)
         await client.start()
+
+        # Verify authentication before creating a session
+        try:
+            auth = await client.get_auth_status()
+            if not auth.isAuthenticated:
+                print("[agent] Copilot SDK: not authenticated, falling back to echo", file=sys.stderr)
+                await client.stop()
+                return None
+        except Exception as e:
+            print(f"[agent] Copilot SDK auth check failed: {e}", file=sys.stderr)
+            await client.stop()
+            return None
 
         session = await client.create_session(
             on_permission_request=lambda _req, _meta: PermissionRequestResult(
@@ -103,6 +192,8 @@ async def main() -> None:
 
     print(f"[agent] Starting agent: {session_name} ({session_id})")
     print(f"[agent] Socket: {socket_path}")
+
+    loop = asyncio.get_running_loop()
 
     # Connect to orchestrator
     ipc = IPCClient(socket_path)
@@ -143,7 +234,7 @@ async def main() -> None:
 
     # Register message handlers
     async def on_user_message(msg: Message) -> Message | None:
-        await handle_user_message(ipc, sdk_session, msg)
+        await handle_user_message(ipc, sdk_session, msg, loop)
         return None
 
     async def on_shutdown(msg: Message) -> Message | None:

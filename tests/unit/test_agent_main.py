@@ -37,7 +37,7 @@ class TestHandleUserMessage:
             payload={"content": "hello", "sender": "@ian:example.org"},
         )
 
-        await handle_user_message(client, None, msg)
+        await handle_user_message(client, None, msg, asyncio.get_running_loop())
 
         assert len(client.sent) == 1
         resp = client.sent[0]
@@ -54,7 +54,7 @@ class TestHandleUserMessage:
             id="msg-123",
         )
 
-        await handle_user_message(client, None, msg)
+        await handle_user_message(client, None, msg, asyncio.get_running_loop())
 
         resp = client.sent[0]
         assert resp.reply_to == "msg-123"
@@ -69,7 +69,7 @@ class TestHandleUserMessage:
             payload={"content": "", "sender": "@u:x"},
         )
 
-        await handle_user_message(client, None, msg)
+        await handle_user_message(client, None, msg, asyncio.get_running_loop())
 
         resp = client.sent[0]
         assert "[echo] " in resp.payload["content"]
@@ -83,7 +83,7 @@ class TestHandleUserMessage:
             payload={"sender": "@u:x"},
         )
 
-        await handle_user_message(client, None, msg)
+        await handle_user_message(client, None, msg, asyncio.get_running_loop())
 
         resp = client.sent[0]
         assert "[echo]" in resp.payload["content"]

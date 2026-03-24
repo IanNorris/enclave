@@ -6,6 +6,7 @@ and routes agent responses back to Matrix. Handles control room commands.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from enclave.common.logging import get_logger
@@ -21,6 +22,9 @@ from enclave.orchestrator.ipc import IPCServer
 from enclave.orchestrator.matrix_client import EnclaveMatrixClient
 
 log = get_logger("router")
+
+# Minimum interval between Matrix message edits (seconds)
+_EDIT_THROTTLE = 1.5
 
 
 class MessageRouter:
@@ -51,9 +55,12 @@ class MessageRouter:
         # Track thread event IDs per session for threading replies
         self._thread_events: dict[str, str] = {}
 
-        # Track pending reaction event IDs for cleanup (🌧 → ✅)
-        # Key: f"{room_id}:{msg_event_id}", Value: reaction event ID
+        # Track pending reaction event IDs for cleanup (🤔 → ✅)
         self._pending_reactions: dict[str, str] = {}
+
+        # Streaming state per session
+        # Key: session_id, Value: dict with streaming context
+        self._streaming: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         """Wire up all the event handlers."""
@@ -267,6 +274,14 @@ class MessageRouter:
 
         if msg.type == MessageType.AGENT_RESPONSE:
             await self._handle_agent_response(session, msg)
+        elif msg.type == MessageType.AGENT_DELTA:
+            await self._handle_agent_delta(session, msg)
+        elif msg.type == MessageType.AGENT_THINKING:
+            await self._handle_agent_thinking(session, msg)
+        elif msg.type == MessageType.TOOL_START:
+            await self._handle_tool_start(session, msg)
+        elif msg.type == MessageType.TOOL_COMPLETE:
+            await self._handle_tool_complete(session, msg)
         elif msg.type == MessageType.STATUS_UPDATE:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
@@ -280,10 +295,71 @@ class MessageRouter:
 
         return None
 
+    async def _handle_agent_delta(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle a streaming text delta — create or edit a Matrix message."""
+        content = msg.payload.get("content", "")
+        if not content:
+            return
+
+        thread_id = self._thread_events.get(session.id)
+        stream = self._streaming.get(session.id)
+        now = time.monotonic()
+
+        if stream is None:
+            # First delta — send a new message as placeholder
+            event_id = await self.matrix.send_message(
+                session.room_id,
+                content + " ▍",
+                thread_event_id=thread_id,
+            )
+            self._streaming[session.id] = {
+                "event_id": event_id,
+                "last_edit": now,
+                "content": content,
+            }
+        else:
+            stream["content"] = content
+            # Throttle edits
+            if now - stream["last_edit"] >= _EDIT_THROTTLE and stream.get("event_id"):
+                await self.matrix.edit_message(
+                    session.room_id,
+                    stream["event_id"],
+                    content + " ▍",
+                )
+                stream["last_edit"] = now
+
+    async def _handle_agent_thinking(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle an intent/thinking update from the agent."""
+        intent = msg.payload.get("intent", "")
+        if intent:
+            log.debug("Agent %s intent: %s", session.id, intent)
+            # Keep typing indicator active
+            await self.matrix.set_typing(session.room_id, True)
+
+    async def _handle_tool_start(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle tool execution start."""
+        tool_name = msg.payload.get("tool_name", "unknown")
+        log.debug("Agent %s tool start: %s", session.id, tool_name)
+        # Keep typing indicator active
+        await self.matrix.set_typing(session.room_id, True)
+
+    async def _handle_tool_complete(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle tool execution complete."""
+        tool_name = msg.payload.get("tool_name", "unknown")
+        log.debug("Agent %s tool complete: %s", session.id, tool_name)
+
     async def _handle_agent_response(
         self, session: Session, msg: Message
     ) -> None:
-        """Forward an agent response to the Matrix room."""
+        """Forward the final agent response to the Matrix room."""
         content = msg.payload.get("content", "")
         if not content:
             return
@@ -297,12 +373,21 @@ class MessageRouter:
         # Stop typing
         await self.matrix.set_typing(session.room_id, False)
 
-        # Send the response
-        await self.matrix.send_message(
-            session.room_id,
-            content,
-            thread_event_id=thread_id,
-        )
+        # If we have a streaming message, edit it with final content.
+        # Otherwise, send a new message.
+        stream = self._streaming.pop(session.id, None)
+        if stream and stream.get("event_id"):
+            await self.matrix.edit_message(
+                session.room_id,
+                stream["event_id"],
+                content,
+            )
+        else:
+            await self.matrix.send_message(
+                session.room_id,
+                content,
+                thread_event_id=thread_id,
+            )
 
         # Complete the emoji flow: remove 🤔, add ✅
         user_event_id = self._thread_events.pop(
@@ -341,7 +426,6 @@ class MessageRouter:
         self, session: Session, msg: Message
     ) -> None:
         """Handle a permission request from an agent (stub for Phase 2)."""
-        # TODO: Phase 2 — post approval request to Matrix
         log.info(
             "Permission request from %s: %s",
             session.id,
@@ -356,16 +440,13 @@ class MessageRouter:
         self, session: Session, room_id: str, event_id: str | None = None,
     ) -> None:
         """Restore a stopped session — recreate IPC socket and container."""
-        # Notify the user
         await self.matrix.send_message(
             room_id, "🔄 Restoring session... please wait."
         )
 
-        # Create fresh IPC socket
         socket_path = await self.ipc.create_socket(session.id)
         session.socket_path = str(socket_path)
 
-        # Start the container
         started = await self.containers.start_session(session.id)
         if started:
             log.info("Session restored: %s", session.id)
@@ -384,6 +465,9 @@ class MessageRouter:
 
     async def _on_agent_disconnect(self, session_id: str) -> None:
         """Called when an agent disconnects."""
+        # Clean up streaming state
+        self._streaming.pop(session_id, None)
+
         session = self.containers.get_session(session_id)
         if session and session.status == "running":
             await self.matrix.send_message(
@@ -418,7 +502,6 @@ class MessageRouter:
 
         project_name = cmd.args[0]
 
-        # Create a Matrix room for the project
         room_id = await self.matrix.create_room(
             name=f"🏰 {project_name}",
             topic=f"Enclave project: {project_name}",
@@ -433,22 +516,18 @@ class MessageRouter:
             )
             return
 
-        # Create IPC socket
         socket_path = await self.ipc.create_socket(f"pending-{project_name}")
 
-        # Create container session
         session = await self.containers.create_session(
             name=project_name,
             room_id=room_id,
             socket_path=str(socket_path),
         )
 
-        # Rename socket to match session ID
         await self.ipc.remove_socket(f"pending-{project_name}")
         socket_path = await self.ipc.create_socket(session.id)
         session.socket_path = str(socket_path)
 
-        # Start the container
         started = await self.containers.start_session(session.id)
 
         if started:
@@ -488,13 +567,11 @@ class MessageRouter:
 
         session_id = cmd.args[0]
 
-        # Send shutdown to agent
         await self.ipc.send_to(
             session_id,
             Message(type=MessageType.SHUTDOWN, payload={}),
         )
 
-        # Stop container
         removed = await self.containers.remove_session(session_id)
         await self.ipc.remove_socket(session_id)
 

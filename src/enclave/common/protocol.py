@@ -20,6 +20,10 @@ class MessageType(str, Enum):
 
     # Agent → Orchestrator
     AGENT_RESPONSE = "agent_response"
+    AGENT_DELTA = "agent_delta"
+    AGENT_THINKING = "agent_thinking"
+    TOOL_START = "tool_start"
+    TOOL_COMPLETE = "tool_complete"
     PERMISSION_REQUEST = "permission_request"
     PRIVILEGE_REQUEST = "privilege_request"
     SUB_AGENT_REQUEST = "sub_agent_request"
