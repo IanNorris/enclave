@@ -171,19 +171,29 @@ class ContainerManager:
         session.status = "starting"
         socket_dir = str(Path(session.socket_path).parent)
 
+        # Select network mode:
+        # - Copilot SDK containers need network for API access
+        # - Default containers are network-isolated
+        has_copilot = bool(self.config.github_token)
+        network = self.config.copilot_network if has_copilot else self.config.network
+
         cmd = [
             self.config.runtime, "run",
             "--detach",
             "--rm",
             "--name", session_id,
             "--userns", self.config.userns,
-            "--network", self.config.network,
+            "--network", network,
             "-v", f"{session.workspace_path}:/workspace:Z",
             "-v", f"{socket_dir}:/socket:Z",
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
             "-e", f"SESSION_ID={session_id}",
             "-e", f"SESSION_NAME={session.name}",
         ]
+
+        # Custom DNS resolver (restricts what the container can resolve)
+        if self.config.dns and network != "none":
+            cmd.extend(["--dns", self.config.dns])
 
         # Pass GitHub token for Copilot SDK auth
         if self.config.github_token:

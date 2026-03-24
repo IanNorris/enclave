@@ -10,7 +10,9 @@ matrix:
 container:
   image: "enclave-agent:latest"
   runtime: "podman"
-  network: "slirp4netns"  # or "none" to disable network (agent runs in echo mode)
+  network: "none"             # Default network for non-SDK containers (isolated)
+  copilot_network: "slirp4netns"  # Network mode when Copilot SDK is enabled
+  dns: ""                     # Optional custom DNS (e.g. "1.1.1.1" to restrict resolver)
   userns: "keep-id"
   workspace_base: "/home/ian/.local/share/enclave/workspaces"
   session_base: "/home/ian/.local/share/enclave/sessions"

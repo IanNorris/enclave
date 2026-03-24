@@ -120,3 +120,19 @@ class TestUserMapping:
         assert user.max_sessions == 5
         assert user.can_approve_privilege is True
         assert user.allowed_rooms == ["*"]
+
+
+class TestNetworkConfig:
+    """Test network configuration defaults."""
+
+    def test_default_network_is_none(self) -> None:
+        config = EnclaveConfig()
+        assert config.container.network == "none"
+
+    def test_copilot_network_default(self) -> None:
+        config = EnclaveConfig()
+        assert config.container.copilot_network == "slirp4netns"
+
+    def test_dns_default_empty(self) -> None:
+        config = EnclaveConfig()
+        assert config.container.dns == ""

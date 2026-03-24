@@ -41,6 +41,8 @@ class ContainerConfig:
     image: str = "enclave-agent:latest"
     runtime: str = "podman"
     network: str = "none"
+    copilot_network: str = "slirp4netns"
+    dns: str = ""
     userns: str = "keep-id"
     workspace_base: str = str(Path.home() / ".local" / "share" / "enclave" / "workspaces")
     session_base: str = str(Path.home() / ".local" / "share" / "enclave" / "sessions")
@@ -167,6 +169,8 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 image=c.get("image", config.container.image),
                 runtime=c.get("runtime", config.container.runtime),
                 network=c.get("network", config.container.network),
+                copilot_network=c.get("copilot_network", config.container.copilot_network),
+                dns=c.get("dns", config.container.dns),
                 userns=c.get("userns", config.container.userns),
                 workspace_base=c.get("workspace_base", config.container.workspace_base),
                 session_base=c.get("session_base", config.container.session_base),
