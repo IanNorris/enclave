@@ -9,14 +9,19 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from typing import TYPE_CHECKING
 
 from enclave.agent.ipc_client import IPCClient
 from enclave.common.protocol import Message, MessageType
 
+if TYPE_CHECKING:
+    from copilot import CopilotClient as _CopilotClient
+    from copilot.session import CopilotSession as _CopilotSession
+
 
 async def handle_user_message(
     client: IPCClient,
-    sdk_session: object | None,
+    sdk_session: _CopilotSession | None,
     msg: Message,
 ) -> None:
     """Handle a user message forwarded from the orchestrator.
@@ -24,18 +29,15 @@ async def handle_user_message(
     Routes it through the Copilot SDK and sends the response back.
     """
     content = msg.payload.get("content", "")
-    sender = msg.payload.get("sender", "unknown")
 
     if sdk_session is None:
-        # SDK not available — echo mode for testing
         response_text = f"[echo] {content}"
     else:
-        # Route through Copilot SDK
         try:
-            from copilot_sdk import SessionEvent
-
-            event: SessionEvent = await sdk_session.send_and_wait(content, timeout=120.0)
+            event = await sdk_session.send_and_wait(content, timeout=120.0)
             response_text = event.data.content if event and event.data else "[no response]"
+        except TimeoutError:
+            response_text = "[timeout] The agent took too long to respond."
         except Exception as e:
             response_text = f"[error] {e}"
 
@@ -49,23 +51,35 @@ async def handle_user_message(
     ))
 
 
-async def try_init_copilot() -> tuple[object, object] | None:
+async def try_init_copilot(
+    working_directory: str = "/workspace",
+) -> tuple[_CopilotClient, _CopilotSession] | None:
     """Try to initialize the Copilot SDK.
 
     Returns (client, session) tuple or None if SDK unavailable.
     """
     try:
-        from copilot_sdk import CopilotClient, PermissionRequestResult
-        from copilot_sdk.types import SystemMessageAppendConfig
+        from copilot import (
+            CopilotClient,
+            PermissionRequestResult,
+            SubprocessConfig,
+            SystemMessageAppendConfig,
+        )
+    except ImportError:
+        return None
 
-        client = CopilotClient()
+    try:
+        # Use token from env if available
+        github_token = os.environ.get("GITHUB_TOKEN")
+        sdk_config = SubprocessConfig(github_token=github_token) if github_token else None
+
+        client = CopilotClient(sdk_config)
         await client.start()
 
-        async def permission_handler(request: object) -> PermissionRequestResult:
-            return PermissionRequestResult(kind="approved")
-
         session = await client.create_session(
-            on_permission_request=permission_handler,
+            on_permission_request=lambda _req, _meta: PermissionRequestResult(
+                kind="approved"
+            ),
             system_message=SystemMessageAppendConfig(
                 append=(
                     "You are an AI assistant running inside an Enclave sandbox. "
@@ -73,10 +87,9 @@ async def try_init_copilot() -> tuple[object, object] | None:
                     "File operations are limited to the /workspace directory."
                 )
             ),
+            working_directory=working_directory,
         )
         return (client, session)
-    except ImportError:
-        return None
     except Exception as e:
         print(f"[agent] Copilot SDK init failed: {e}", file=sys.stderr)
         return None
@@ -153,7 +166,7 @@ async def main() -> None:
     # Cleanup
     if sdk_session:
         try:
-            await sdk_session.disconnect()
+            sdk_session.disconnect()
         except Exception:
             pass
     if sdk_client:

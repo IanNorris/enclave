@@ -183,8 +183,13 @@ class ContainerManager:
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
             "-e", f"SESSION_ID={session_id}",
             "-e", f"SESSION_NAME={session.name}",
-            self.config.image,
         ]
+
+        # Pass GitHub token for Copilot SDK auth
+        if self.config.github_token:
+            cmd.extend(["-e", f"GITHUB_TOKEN={self.config.github_token}"])
+
+        cmd.append(self.config.image)
 
         try:
             result = await _run_command(cmd)

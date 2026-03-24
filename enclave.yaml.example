@@ -10,11 +10,12 @@ matrix:
 container:
   image: "enclave-agent:latest"
   runtime: "podman"
-  network: "none"
+  network: "slirp4netns"  # or "none" to disable network (agent runs in echo mode)
   userns: "keep-id"
   workspace_base: "/home/ian/.local/share/enclave/workspaces"
   session_base: "/home/ian/.local/share/enclave/sessions"
   socket_dir: "/home/ian/.local/share/enclave/sockets"
+  github_token: ""  # GitHub token for Copilot SDK auth (from `gh auth token`)
 
 users:
   - matrix_id: "@your_user:your.homeserver"

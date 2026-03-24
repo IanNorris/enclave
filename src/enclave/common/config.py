@@ -45,6 +45,7 @@ class ContainerConfig:
     workspace_base: str = str(Path.home() / ".local" / "share" / "enclave" / "workspaces")
     session_base: str = str(Path.home() / ".local" / "share" / "enclave" / "sessions")
     socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
+    github_token: str = ""
 
 
 @dataclass
@@ -97,6 +98,7 @@ def _apply_env_overrides(config: EnclaveConfig) -> None:
         "ENCLAVE_MATRIX_SPACE": ("matrix", "space_id"),
         "ENCLAVE_CONTAINER_IMAGE": ("container", "image"),
         "ENCLAVE_CONTAINER_SOCKET_DIR": ("container", "socket_dir"),
+        "ENCLAVE_GITHUB_TOKEN": ("container", "github_token"),
         "ENCLAVE_LOG_LEVEL": ("log_level",),
         "ENCLAVE_DATA_DIR": ("data_dir",),
     }
@@ -169,6 +171,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 workspace_base=c.get("workspace_base", config.container.workspace_base),
                 session_base=c.get("session_base", config.container.session_base),
                 socket_dir=c.get("socket_dir", config.container.socket_dir),
+                github_token=c.get("github_token", ""),
             )
 
         if "priv_broker" in data:
