@@ -208,7 +208,9 @@ class ContainerManager:
         log.debug("Container cmd: %s", " ".join(cmd[:8]) + " ...")
 
         try:
-            result = await _run_command(cmd)
+            # First container run after image build can take ~35s (overlay setup).
+            # Use generous timeout to avoid killing it and corrupting storage.
+            result = await _run_command(cmd, timeout=120.0)
             log.debug("Container run result: rc=%d stdout=%s stderr=%s",
                        result.returncode, result.stdout[:40], result.stderr[:100])
             if result.returncode == 0:
