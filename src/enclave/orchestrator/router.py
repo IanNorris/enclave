@@ -85,9 +85,14 @@ class MessageRouter:
         # Projects currently being created (prevent double room creation)
         self._creating_projects: set[str] = set()
 
+        # Rooms waiting for a user to join before sending queued messages
+        # room_id → list of message strings to send once the user joins
+        self._awaiting_join: dict[str, list[str]] = {}
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
+        self.matrix.on_user_join(self._on_user_join)
         self.ipc.set_handler(self._on_ipc_message)
         self.ipc.on_connect(self._on_agent_connect)
         self.ipc.on_disconnect(self._on_agent_disconnect)
@@ -594,10 +599,17 @@ class MessageRouter:
 
         if status == "ready":
             mode = "🤖 Copilot" if copilot else "📝 Echo"
-            await self.matrix.send_message(
-                session.room_id,
-                f"✅ Agent ready ({mode} mode). Start chatting!",
-            )
+            ready_msg = f"✅ Agent ready ({mode} mode). Start chatting!"
+
+            # If the room is awaiting a user join, queue the message.
+            # Otherwise send immediately (e.g. session restore where user
+            # is already in the room).
+            if session.room_id in self._awaiting_join:
+                self._awaiting_join[session.room_id].append(ready_msg)
+            else:
+                await self.matrix.send_message(
+                    session.room_id, ready_msg,
+                )
             log.info(
                 "Agent %s ready (copilot=%s)", session.id, copilot
             )
@@ -755,6 +767,15 @@ class MessageRouter:
             )
         log.info("Agent disconnected: %s", session_id)
 
+    async def _on_user_join(self, room_id: str, user_id: str) -> None:
+        """Called when a user joins a room — flush queued messages."""
+        queued = self._awaiting_join.pop(room_id, None)
+        if queued is None:
+            return
+        log.info("User %s joined %s, sending %d queued messages", user_id, room_id, len(queued))
+        for msg in queued:
+            await self.matrix.send_message(room_id, msg)
+
     # ------------------------------------------------------------------
     # Control room commands
     # ------------------------------------------------------------------
@@ -820,6 +841,10 @@ class MessageRouter:
         session.socket_path = str(socket_path)
 
         started = await self.containers.start_session(session.id)
+
+        # Mark room as awaiting user join — messages will be queued
+        # until the user actually joins the room
+        self._awaiting_join[room_id] = []
 
         # Invite the user only after the container is ready
         await self.matrix.invite_user(room_id, sender)

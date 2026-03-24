@@ -83,6 +83,9 @@ class FakeMatrix:
     async def _trust_users(self, user_ids: list[str]) -> None:
         pass
 
+    def on_user_join(self, handler):
+        pass
+
 
 class FakeIPC:
     """Fake IPC server that records calls."""

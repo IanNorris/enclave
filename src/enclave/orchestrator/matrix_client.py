@@ -25,6 +25,7 @@ from nio import (
     MegolmEvent,
     RoomCreateResponse,
     RoomEncryptionEvent,
+    RoomMemberEvent,
     RoomMessageMedia,
     RoomMessageText,
     RoomEncryptedMedia,
@@ -43,6 +44,10 @@ MatrixMessageHandler = Callable[
     Awaitable[None],
 ]
 # (room_id, sender, body, event_source, attachments)
+
+# Type for user-join handler callbacks
+MatrixJoinHandler = Callable[[str, str], Awaitable[None]]
+# (room_id, user_id)
 
 
 class EnclaveMatrixClient:
@@ -91,6 +96,7 @@ class EnclaveMatrixClient:
         )
 
         self._message_handlers: list[MatrixMessageHandler] = []
+        self._join_handlers: list[MatrixJoinHandler] = []
         self._syncing = False
 
         # Deduplication: track recently seen event IDs to prevent
@@ -105,6 +111,7 @@ class EnclaveMatrixClient:
             self._on_media, (RoomMessageMedia, RoomEncryptedMedia)
         )
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
+        self.client.add_event_callback(self._on_room_member, RoomMemberEvent)
         self.client.add_event_callback(self._on_megolm, MegolmEvent)
         self.client.add_event_callback(self._on_encrypted, RoomEncryptionEvent)
         # Catch-all for debugging — see all events
@@ -113,6 +120,10 @@ class EnclaveMatrixClient:
     def on_message(self, handler: MatrixMessageHandler) -> None:
         """Register a handler for incoming room messages."""
         self._message_handlers.append(handler)
+
+    def on_user_join(self, handler: MatrixJoinHandler) -> None:
+        """Register a handler for when a user joins a room."""
+        self._join_handlers.append(handler)
 
     async def login(self) -> bool:
         """Login to the homeserver.
@@ -692,6 +703,24 @@ class EnclaveMatrixClient:
         if event.state_key == self.client.user_id:
             log.info("Invited to %s, joining...", room.room_id)
             await self.client.join(room.room_id)
+
+    async def _on_room_member(self, room: MatrixRoom, event: RoomMemberEvent) -> None:
+        """Detect when a user joins a room."""
+        # Only care about joins (not leaves, bans, etc.)
+        if event.membership != "join":
+            return
+        # Ignore our own joins
+        if event.state_key == self.client.user_id:
+            return
+        # Ignore old events
+        if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+        log.info("User %s joined %s", event.state_key, room.room_id)
+        for handler in self._join_handlers:
+            try:
+                await handler(room.room_id, event.state_key)
+            except Exception as e:
+                log.error("Join handler error: %s", e)
 
     async def _on_megolm(self, room: MatrixRoom, event: MegolmEvent) -> None:
         """Handle undecryptable messages — forward to handlers and notify."""
