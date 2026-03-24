@@ -53,6 +53,7 @@ class ContainerConfig:
     host_mounts: list[str] = field(default_factory=lambda: [
         "/usr/bin",
         "/usr/lib",
+        "/usr/libexec",
         "/usr/include",
         "/usr/share",
         "/usr/games",

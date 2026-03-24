@@ -193,11 +193,8 @@ class ContainerManager:
             "--name", session_id,
             "--userns", self.config.userns,
             "--network", network,
-            # Workspace with slave propagation so host-side mounts appear in container
-            "--mount", (
-                f"type=bind,source={session.workspace_path},"
-                f"destination=/workspace,bind-propagation=rslave"
-            ),
+            # Workspace with rslave propagation so host-side mounts appear in container
+            "-v", f"{session.workspace_path}:/workspace:rslave",
             "-v", f"{socket_dir}:/socket:Z",
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
             "-e", f"SESSION_ID={session_id}",
@@ -212,10 +209,25 @@ class ContainerManager:
 
         # Extend PATH and LD_LIBRARY_PATH to include host mounts
         host_bin_dirs = "/host/usr/bin:/host/usr/games:/host/usr/local/bin"
-        host_lib_dirs = "/host/usr/lib:/host/usr/local/lib"
+        # GCC toolchain: tell gcc where to find cc1, as, ld etc.
+        compiler_path = (
+            "/host/usr/libexec/gcc/x86_64-linux-gnu/13"
+            ":/host/usr/lib/gcc/x86_64-linux-gnu/13"
+            ":/host/usr/bin"
+        )
+        # LIBRARY_PATH is used by the linker at compile/link time (not runtime).
+        # We intentionally do NOT set LD_LIBRARY_PATH to avoid loading the
+        # host's glibc into container processes (version mismatch → crash).
+        link_lib_dirs = (
+            "/host/usr/lib:/host/usr/lib/x86_64-linux-gnu"
+            ":/host/usr/local/lib"
+        )
         cmd.extend([
             "-e", f"PATH=/usr/local/bin:/usr/bin:/bin:{host_bin_dirs}",
-            "-e", f"LD_LIBRARY_PATH={host_lib_dirs}",
+            "-e", f"COMPILER_PATH={compiler_path}",
+            "-e", f"LIBRARY_PATH={link_lib_dirs}",
+            "-e", f"C_INCLUDE_PATH=/host/usr/include",
+            "-e", f"CPLUS_INCLUDE_PATH=/host/usr/include",
         ])
 
         # Custom DNS resolver (restricts what the container can resolve)
