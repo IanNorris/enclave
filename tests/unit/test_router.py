@@ -143,6 +143,12 @@ class FakeContainers:
                 return s
         return None
 
+    def get_any_session_by_room(self, room_id: str) -> Session | None:
+        for s in self.sessions.values():
+            if s.room_id == room_id:
+                return s
+        return None
+
     def list_sessions(self) -> list[Session]:
         return list(self.sessions.values())
 

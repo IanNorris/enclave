@@ -41,19 +41,68 @@ class ContainerManager:
     def __init__(self, config: ContainerConfig):
         self.config = config
         self._sessions: dict[str, Session] = {}
+        self._sessions_file = Path(config.session_base) / "sessions.json"
 
         # Ensure base directories exist
         Path(config.workspace_base).mkdir(parents=True, exist_ok=True)
         Path(config.session_base).mkdir(parents=True, exist_ok=True)
+
+        # Load persisted sessions
+        self._load_sessions()
+
+    def _load_sessions(self) -> None:
+        """Load sessions from disk."""
+        if not self._sessions_file.exists():
+            return
+        try:
+            data = json.loads(self._sessions_file.read_text())
+            for s in data:
+                session = Session(
+                    id=s["id"],
+                    name=s["name"],
+                    room_id=s["room_id"],
+                    workspace_path=s.get("workspace_path", ""),
+                    socket_path=s.get("socket_path", ""),
+                    created_at=s.get("created_at", ""),
+                    status="stopped",  # assume stopped on load
+                )
+                self._sessions[session.id] = session
+            log.info("Loaded %d persisted sessions", len(self._sessions))
+        except Exception as e:
+            log.warning("Failed to load sessions: %s", e)
+
+    def _save_sessions(self) -> None:
+        """Persist sessions to disk."""
+        data = []
+        for s in self._sessions.values():
+            data.append({
+                "id": s.id,
+                "name": s.name,
+                "room_id": s.room_id,
+                "workspace_path": s.workspace_path,
+                "socket_path": s.socket_path,
+                "created_at": s.created_at,
+            })
+        try:
+            self._sessions_file.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            log.warning("Failed to save sessions: %s", e)
 
     def get_session(self, session_id: str) -> Session | None:
         """Get a session by ID."""
         return self._sessions.get(session_id)
 
     def get_session_by_room(self, room_id: str) -> Session | None:
-        """Get a session by its Matrix room ID."""
+        """Get a running session by its Matrix room ID."""
         for session in self._sessions.values():
             if session.room_id == room_id and session.status == "running":
+                return session
+        return None
+
+    def get_any_session_by_room(self, room_id: str) -> Session | None:
+        """Get any session (including stopped) by its Matrix room ID."""
+        for session in self._sessions.values():
+            if session.room_id == room_id:
                 return session
         return None
 
@@ -100,6 +149,7 @@ class ContainerManager:
         )
 
         self._sessions[session_id] = session
+        self._save_sessions()
         log.info("Session created: %s (%s)", session_id, name)
         return session
 
@@ -112,6 +162,11 @@ class ContainerManager:
         if session is None:
             log.error("Session not found: %s", session_id)
             return False
+
+        # Clean up any leftover container with the same name
+        await _run_command(
+            [self.config.runtime, "rm", "-f", session_id], timeout=10.0
+        )
 
         session.status = "starting"
         socket_dir = str(Path(session.socket_path).parent)

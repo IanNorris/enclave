@@ -188,8 +188,15 @@ class MessageRouter:
     ) -> None:
         """Handle a message in a project room — forward to the agent."""
         session = self.containers.get_session_by_room(room_id)
+
         if session is None:
-            log.debug("No active session for room %s", room_id)
+            # Check for a stopped/persisted session to restore
+            session = self.containers.get_any_session_by_room(room_id)
+            if session is not None:
+                log.info("Restoring session %s for room %s", session.id, room_id)
+                await self._restore_session(session, room_id, event_id)
+                return  # Agent will connect; user can re-send
+            log.debug("No session for room %s", room_id)
             return
 
         if not self.ipc.is_connected(session.id):
@@ -340,6 +347,32 @@ class MessageRouter:
             session.id,
             msg.payload,
         )
+
+    # ------------------------------------------------------------------
+    # Session restoration
+    # ------------------------------------------------------------------
+
+    async def _restore_session(
+        self, session: Session, room_id: str, event_id: str | None = None,
+    ) -> None:
+        """Restore a stopped session — recreate IPC socket and container."""
+        # Notify the user
+        await self.matrix.send_message(
+            room_id, "🔄 Restoring session... please wait."
+        )
+
+        # Create fresh IPC socket
+        socket_path = await self.ipc.create_socket(session.id)
+        session.socket_path = str(socket_path)
+
+        # Start the container
+        started = await self.containers.start_session(session.id)
+        if started:
+            log.info("Session restored: %s", session.id)
+        else:
+            await self.matrix.send_message(
+                room_id, "❌ Failed to restore session."
+            )
 
     # ------------------------------------------------------------------
     # Agent connect/disconnect
