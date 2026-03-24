@@ -50,6 +50,15 @@ class FakeMatrix:
     async def send_reaction(self, room_id, event_id, emoji):
         return "$fake-reaction"
 
+    async def set_typing(self, room_id, typing=True, timeout=30000):
+        pass
+
+    async def edit_message(self, room_id, event_id, body, html_body=None):
+        return "$fake-edit"
+
+    async def redact_event(self, room_id, event_id, reason=""):
+        return True
+
     async def create_room(
         self,
         name: str,
@@ -210,6 +219,8 @@ async def started_router(router_parts):
     """Router with start() already called."""
     router, matrix, ipc, containers = router_parts
     await router.start()
+    # Clear startup announcement from sent_messages
+    matrix.sent_messages.clear()
     return router, matrix, ipc, containers
 
 

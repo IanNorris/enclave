@@ -217,6 +217,80 @@ class EnclaveMatrixClient:
             return resp.event_id
         return None
 
+    async def set_typing(
+        self, room_id: str, typing: bool = True, timeout: int = 30000
+    ) -> None:
+        """Set typing indicator for a room."""
+        try:
+            await self.client.room_typing(
+                room_id, typing_state=typing, timeout=timeout
+            )
+        except Exception as e:
+            log.debug("Typing indicator failed for %s: %s", room_id, e)
+
+    async def edit_message(
+        self,
+        room_id: str,
+        event_id: str,
+        body: str,
+        html_body: str | None = None,
+    ) -> str | None:
+        """Edit an existing message using m.replace.
+
+        Args:
+            room_id: Room containing the message.
+            event_id: Event ID of the message to edit.
+            body: New plain text body.
+            html_body: Optional new HTML body.
+
+        Returns:
+            Event ID of the edit event, or None on failure.
+        """
+        await self._ensure_keys_for_room(room_id)
+
+        new_content: dict[str, Any] = {
+            "msgtype": "m.text",
+            "body": body,
+        }
+        if html_body:
+            new_content["format"] = "org.matrix.custom.html"
+            new_content["formatted_body"] = html_body
+
+        content: dict[str, Any] = {
+            "msgtype": "m.text",
+            "body": f"* {body}",
+            "m.new_content": new_content,
+            "m.relates_to": {
+                "rel_type": "m.replace",
+                "event_id": event_id,
+            },
+        }
+
+        resp = await self.client.room_send(
+            room_id=room_id,
+            message_type="m.room.message",
+            content=content,
+        )
+
+        if isinstance(resp, RoomSendResponse):
+            return resp.event_id
+        else:
+            log.error("Failed to edit message %s: %s", event_id, resp)
+            return None
+
+    async def redact_event(
+        self, room_id: str, event_id: str, reason: str = ""
+    ) -> bool:
+        """Redact (delete) an event. Useful for removing reactions."""
+        try:
+            resp = await self.client.room_redact(
+                room_id, event_id, reason=reason
+            )
+            return hasattr(resp, "event_id")
+        except Exception as e:
+            log.debug("Redact failed for %s: %s", event_id, e)
+            return False
+
     async def create_room(
         self,
         name: str,
