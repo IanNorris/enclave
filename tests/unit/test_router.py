@@ -77,6 +77,12 @@ class FakeMatrix:
         self.created_rooms.append(room)
         return "!new-room:test"
 
+    async def invite_user(self, room_id: str, user_id: str) -> bool:
+        return True
+
+    async def _trust_users(self, user_ids: list[str]) -> None:
+        pass
+
 
 class FakeIPC:
     """Fake IPC server that records calls."""
@@ -283,10 +289,9 @@ class TestControlCommands:
         await router._on_matrix_message(
             CONTROL_ROOM, "@ian:test", "project MyApp", {}
         )
-        # Room created
+        # Room created (invite is deferred, so not in create_room call)
         assert len(matrix.created_rooms) == 1
         assert "MyApp" in matrix.created_rooms[0]["name"]
-        assert matrix.created_rooms[0]["invite"] == ["@ian:test"]
         # Session created
         assert len(containers.sessions) == 1
         # Success message

@@ -797,7 +797,6 @@ class MessageRouter:
         room_id = await self.matrix.create_room(
             name=f"🏰 {project_name}",
             topic=f"Enclave project: {project_name}",
-            invite=[sender],
             encrypted=True,
             space_id=self.space_id,
         )
@@ -821,6 +820,10 @@ class MessageRouter:
         session.socket_path = str(socket_path)
 
         started = await self.containers.start_session(session.id)
+
+        # Invite the user only after the container is ready
+        await self.matrix.invite_user(room_id, sender)
+        await self.matrix._trust_users([sender])
 
         if started:
             await self._reply_control(

@@ -295,6 +295,16 @@ class EnclaveMatrixClient:
         except Exception as e:
             log.debug("Typing indicator failed for %s: %s", room_id, e)
 
+    async def invite_user(self, room_id: str, user_id: str) -> bool:
+        """Invite a user to a room. Returns True on success."""
+        resp = await self.client.room_invite(room_id, user_id)
+        if hasattr(resp, "transport_response"):
+            # RoomInviteResponse (success)
+            log.info("Invited %s to %s", user_id, room_id)
+            return True
+        log.error("Failed to invite %s to %s: %s", user_id, room_id, resp)
+        return False
+
     async def edit_message(
         self,
         room_id: str,
@@ -389,7 +399,7 @@ class EnclaveMatrixClient:
         resp = await self.client.room_create(
             name=name,
             topic=topic,
-            invite=invite or [],
+            invite=[],
             is_direct=False,
             initial_state=initial_state,
         )
@@ -401,15 +411,6 @@ class EnclaveMatrixClient:
             # If space_id provided, add room as a child of the space
             if space_id:
                 await self._add_room_to_space(space_id, room_id)
-
-            # Trust invited users' devices directly.  We intentionally do NOT
-            # call sync() here — doing so inside a sync_forever callback
-            # causes nio to re-deliver the triggering event, resulting in
-            # double room creation.  sync_forever will pick up the room on
-            # its next iteration; the first message send will handle E2EE
-            # key sharing via _ensure_keys_for_room().
-            if invite:
-                await self._trust_users(invite)
 
             return room_id
         else:
