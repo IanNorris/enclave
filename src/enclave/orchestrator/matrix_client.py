@@ -89,6 +89,8 @@ class EnclaveMatrixClient:
         self.client.add_event_callback(self._on_invite, InviteMemberEvent)
         self.client.add_event_callback(self._on_megolm, MegolmEvent)
         self.client.add_event_callback(self._on_encrypted, RoomEncryptionEvent)
+        # Catch-all for debugging — see all events
+        self.client.add_event_callback(self._on_any_event, Event)
 
     def on_message(self, handler: MatrixMessageHandler) -> None:
         """Register a handler for incoming room messages."""
@@ -97,13 +99,40 @@ class EnclaveMatrixClient:
     async def login(self) -> bool:
         """Login to the homeserver.
 
+        Tries to restore a previous session first to avoid rate limits.
+        Falls back to password login if no saved session exists.
+
         Returns True on success, False on failure.
         """
+        access_token_file = self._store_path / "access_token"
+
+        # Try restore_login first (no network request → no rate limit)
+        if (
+            self._device_id_file.exists()
+            and access_token_file.exists()
+        ):
+            device_id = self._device_id_file.read_text().strip()
+            access_token = access_token_file.read_text().strip()
+            self.client.restore_login(
+                user_id=self.user_id,
+                device_id=device_id,
+                access_token=access_token,
+            )
+            log.info(
+                "Restored session as %s (device: %s)", self.user_id, device_id
+            )
+            if self.client.should_upload_keys:
+                await self.client.keys_upload()
+                log.info("E2EE keys uploaded")
+            return True
+
+        # Fresh login
         resp = await self.client.login(self.password, device_name=self.device_name)
         if isinstance(resp, LoginResponse):
             log.info("Logged in as %s (device: %s)", resp.user_id, resp.device_id)
-            # Persist device ID for reuse across restarts
+            # Persist for next restart
             self._device_id_file.write_text(resp.device_id)
+            access_token_file.write_text(resp.access_token)
             if self.client.should_upload_keys:
                 await self.client.keys_upload()
                 log.info("E2EE keys uploaded")
@@ -123,13 +152,17 @@ class EnclaveMatrixClient:
         """Start the sync loop. Blocks until stopped."""
         self._syncing = True
         log.info("Starting sync loop")
+        sync_count = 0
         try:
             while self._syncing:
-                await self.client.sync(timeout=timeout)
+                resp = await self.client.sync(timeout=timeout)
+                sync_count += 1
+                if sync_count <= 3 or sync_count % 20 == 0:
+                    log.debug("Sync #%d complete", sync_count)
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.error("Sync error: %s", e)
+            log.error("Sync error: %s", e, exc_info=True)
             raise
 
     def stop_sync(self) -> None:
@@ -181,9 +214,10 @@ class EnclaveMatrixClient:
         )
 
         if isinstance(resp, RoomSendResponse):
+            log.debug("Sent to %s: %s", room_id, resp.event_id)
             return resp.event_id
         else:
-            log.error("Failed to send message to %s: %s", room_id, resp)
+            log.error("Failed to send to %s: %s", room_id, resp)
             return None
 
     async def _ensure_keys_for_room(self, room_id: str) -> None:
@@ -453,3 +487,10 @@ class EnclaveMatrixClient:
             event.sender,
             type(event).__name__,
         )
+
+    async def _on_any_event(self, room: MatrixRoom, event: Event) -> None:
+        """Debug: log all events."""
+        etype = type(event).__name__
+        sender = getattr(event, "sender", "?")
+        if etype not in ("RoomMessageText", "MegolmEvent", "RoomEncryptionEvent"):
+            log.debug("Event [%s] %s in %s from %s", etype, getattr(event, "event_id", ""), room.room_id, sender)
