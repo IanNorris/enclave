@@ -117,32 +117,32 @@ User: "new session for project-foo"
 
 ### 3. Permission Controller (the sandboxing secret sauce)
 
-The key insight: **you don't dynamically add mounts to a running container.**
-Instead, the orchestrator controls a "workspace gateway":
+**Validated approach: Shared mount propagation + bind mounts.**
 
-**Approach A — Workspace Staging (simplest):**
-- Each agent has `/home/aeon/workspaces/<session>/` on the host
-- This is the ONLY directory mounted into the container
-- When agent needs access to `/home/ian/projects/foo`:
-  1. Agent requests access via socket: `{"request": "mount", "path": "/home/ian/projects/foo"}`
-  2. Orchestrator posts to Matrix: "🔒 Agent wants access to `/home/ian/projects/foo` — ✅ to approve"
-  3. User approves
-  4. Orchestrator bind-mounts or symlinks the path INTO the workspace dir
-  5. Agent can now see it at `/workspace/projects-foo`
-- Changes stay in the workspace; orchestrator syncs back on approval
+The workspace directory is mounted into the container with `bind-propagation=shared`.
+The orchestrator can then `mount --bind` paths into the workspace at runtime, and
+`umount` to revoke — all without restarting the container.
 
-**Approach B — FUSE Gateway (more elegant, more complex):**
-- Mount a custom FUSE filesystem into the container
-- Orchestrator controls which paths are visible through the FUSE layer
-- Can grant/revoke access dynamically without container restart
-- More complex to implement but truly dynamic
+**How it works:**
+1. On host: `sudo mount --bind <workspace> <workspace> && sudo mount --make-shared <workspace>`
+2. Container starts with: `--mount type=bind,src=<workspace>,dst=/workspace,bind-propagation=shared`
+3. To grant access: `sudo mount --bind /home/ian/projects/foo <workspace>/foo`
+4. To revoke: `sudo umount <workspace>/foo`
+5. Changes are **instant** — container sees new mounts appear/disappear in real time
 
-**Approach C — Container Recreation (pragmatic):**
-- When permissions change, checkpoint → recreate container with new mounts
-- Copilot SDK session state serialized to disk, restored on restart
-- Brief interruption but clean and simple
+**Flow:**
+- Agent requests access via socket: `{"request": "mount", "path": "/home/ian/projects/foo"}`
+- Orchestrator posts reaction-based approval to Matrix
+- User approves → orchestrator asks **priv broker** to do the bind mount (requires root)
+- Agent can now see it at `/workspace/foo`
+- Revocation: orchestrator asks priv broker to umount — files vanish instantly
 
-**Recommendation:** Start with **Approach A** (workspace staging), it covers 90% of use cases.
+**Why this is better than the original approaches:**
+- No container restart needed (unlike Approach C)
+- No FUSE complexity (unlike Approach B)
+- Real file access, not copies — changes reflect both ways
+- Revocation is instant and complete
+- Uses the priv broker we're already building
 
 **Critical design principle:** All permissions are managed by the **orchestrator**
 (external to the container), never by the agent itself. The orchestrator maintains
