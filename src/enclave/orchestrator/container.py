@@ -182,7 +182,7 @@ class ContainerManager:
             return False
 
         # Clean up any leftover container with the same name
-        log.debug("Removing old container for %s...", session_id)
+        log.info("[start:%s] Cleaning up old container...", session_id)
         # First try to stop any running container, then remove
         stop_result = await _run_command(
             [self.config.runtime, "stop", "-t", "5", session_id], timeout=15.0
@@ -192,6 +192,7 @@ class ContainerManager:
             [self.config.runtime, "rm", "-f", session_id], timeout=10.0
         )
         log.debug("rm result: rc=%d stderr=%s", rm_result.returncode, rm_result.stderr[:100])
+        log.info("[start:%s] Cleanup done, building run command...", session_id)
 
         session.status = "starting"
         socket_dir = str(Path(session.socket_path).parent)
@@ -284,7 +285,7 @@ class ContainerManager:
         cmd.append(image)
 
         log.debug("Container cmd: %s", " ".join(cmd[:8]) + " ...")
-        log.info("Starting session %s with profile=%s image=%s",
+        log.info("[start:%s] Executing podman run (profile=%s image=%s)...",
                  session_id, session.profile, image)
 
         try:
@@ -298,7 +299,7 @@ class ContainerManager:
                 session.container_id = container_id
                 session.status = "running"
                 log.info(
-                    "Container started: %s (id: %s)",
+                    "[start:%s] Container ready (id: %s)",
                     session_id,
                     container_id[:12],
                 )
@@ -306,14 +307,14 @@ class ContainerManager:
             else:
                 session.status = "stopped"
                 log.error(
-                    "Container start failed for %s: %s",
+                    "[start:%s] Container start failed: %s",
                     session_id,
                     result.stderr,
                 )
                 return False
         except Exception as e:
             session.status = "stopped"
-            log.error("Failed to start container %s: %s", session_id, e)
+            log.error("[start:%s] Exception starting container: %s", session_id, e)
             return False
 
     async def stop_session(self, session_id: str) -> bool:

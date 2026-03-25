@@ -1447,6 +1447,7 @@ class MessageRouter:
         resolved_profile = profile or self.containers.config.default_profile
         profile_obj = self.containers.config.get_profile(resolved_profile)
 
+        log.info("[project:%s] Creating room (profile=%s)...", project_name, resolved_profile)
         room_id = await self.matrix.create_room(
             name=f"🏰 {project_name}",
             topic=f"Enclave project: {project_name} [{resolved_profile}]",
@@ -1460,6 +1461,9 @@ class MessageRouter:
             )
             return
 
+        log.info("[project:%s] Room created: %s", project_name, room_id)
+
+        log.info("[project:%s] Creating IPC socket...", project_name)
         socket_path = await self.ipc.create_socket(f"pending-{project_name}")
 
         session = await self.containers.create_session(
@@ -1468,23 +1472,30 @@ class MessageRouter:
             socket_path=str(socket_path),
             profile=resolved_profile,
         )
+        log.info("[project:%s] Session created: %s", project_name, session.id)
 
         await self.ipc.remove_socket(f"pending-{project_name}")
         socket_path = await self.ipc.create_socket(session.id)
         session.socket_path = str(socket_path)
 
         # Set up shared propagation before starting container
+        log.info("[project:%s] Setting up mount propagation...", project_name)
         await self._ensure_propagation(session)
+        log.info("[project:%s] Mount propagation done", project_name)
 
+        log.info("[project:%s] Starting container...", project_name)
         started = await self.containers.start_session(session.id)
+        log.info("[project:%s] Container start result: %s", project_name, started)
 
         # Mark room as awaiting user join — messages will be queued
         # until the user actually joins the room
         self._awaiting_join[room_id] = []
 
         # Invite the user only after the container is ready
+        log.info("[project:%s] Inviting user %s...", project_name, sender)
         await self.matrix.invite_user(room_id, sender)
         await self.matrix._trust_users([sender])
+        log.info("[project:%s] Setup complete", project_name)
 
         if started:
             await self._reply_control(
