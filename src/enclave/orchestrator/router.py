@@ -1314,14 +1314,32 @@ class MessageRouter:
         await self._reply_control(format_help())
 
     async def _cmd_project(self, sender: str, cmd: ParsedCommand) -> None:
-        """Handle the project command — create a new project session."""
+        """Handle the project command — create a new project session.
+
+        Syntax: project <name> [profile]
+        If the last word matches a known profile, it's used as the profile.
+        Otherwise the entire string is the project name with the default profile.
+        """
         if not cmd.has_args:
+            profiles = self.containers.config.profile_names()
+            default = self.containers.config.default_profile
             await self._reply_control(
-                "Usage: `project <name>` — creates a new project session."
+                f"Usage: `project <name> [profile]`\n"
+                f"Profiles: {', '.join(f'**{p}**' if p == default else f'`{p}`' for p in profiles)}"
             )
             return
 
-        project_name = cmd.args[0]
+        raw = cmd.args[0]  # single-arg: full string like "myapp light"
+        profile_name = ""
+        project_name = raw
+
+        # Check if the last word is a known profile name
+        parts = raw.rsplit(None, 1)
+        if len(parts) == 2:
+            maybe_name, maybe_profile = parts
+            if maybe_profile in self.containers.config.profiles:
+                project_name = maybe_name
+                profile_name = maybe_profile
 
         # Guard against duplicate creation (e.g. from event re-delivery)
         if project_name in self._creating_projects:
@@ -1330,15 +1348,20 @@ class MessageRouter:
         self._creating_projects.add(project_name)
 
         try:
-            await self._cmd_project_inner(sender, project_name)
+            await self._cmd_project_inner(sender, project_name, profile_name)
         finally:
             self._creating_projects.discard(project_name)
 
-    async def _cmd_project_inner(self, sender: str, project_name: str) -> None:
+    async def _cmd_project_inner(
+        self, sender: str, project_name: str, profile: str = ""
+    ) -> None:
         """Inner implementation of project creation."""
+        resolved_profile = profile or self.containers.config.default_profile
+        profile_obj = self.containers.config.get_profile(resolved_profile)
+
         room_id = await self.matrix.create_room(
             name=f"🏰 {project_name}",
-            topic=f"Enclave project: {project_name}",
+            topic=f"Enclave project: {project_name} [{resolved_profile}]",
             encrypted=True,
             space_id=self.space_id,
         )
@@ -1355,6 +1378,7 @@ class MessageRouter:
             name=project_name,
             room_id=room_id,
             socket_path=str(socket_path),
+            profile=resolved_profile,
         )
 
         await self.ipc.remove_socket(f"pending-{project_name}")
@@ -1377,7 +1401,7 @@ class MessageRouter:
         if started:
             await self._reply_control(
                 f"✅ Project **{project_name}** created!\n"
-                f"Room created and agent starting...\n"
+                f"Profile: `{resolved_profile}` → `{profile_obj.image}`\n"
                 f"Session ID: `{session.id}`"
             )
         else:
@@ -1396,8 +1420,9 @@ class MessageRouter:
         lines = ["**Active Sessions:**\n"]
         for s in sessions:
             connected = "🟢" if self.ipc.is_connected(s.id) else "🔴"
+            profile_tag = f" `[{s.profile}]`" if s.profile else ""
             lines.append(
-                f"  {connected} **{s.name}** — `{s.id}` ({s.status})"
+                f"  {connected} **{s.name}**{profile_tag} — `{s.id}` ({s.status})"
             )
         await self._reply_control("\n".join(lines))
 

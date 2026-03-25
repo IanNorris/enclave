@@ -1,0 +1,25 @@
+# Enclave Light Agent Container
+#
+# Minimal Python image — no Nix, no host mounts.
+# ~200MB vs ~420MB for the full image. Starts instantly.
+# Use for lightweight tasks, quick questions, or when you don't need
+# system toolchains.
+
+FROM python:3.12-slim
+
+# Install minimal tools and create the runtime user (uid 1000)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git curl jq && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd -m -u 1000 -s /bin/bash agent
+
+# Install enclave package
+COPY pyproject.toml /build/
+COPY src/ /build/src/
+RUN pip install --no-cache-dir /build && rm -rf /build
+
+WORKDIR /workspace
+
+# Agent entry point
+CMD ["python3", "-m", "enclave.agent.main"]

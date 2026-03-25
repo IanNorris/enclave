@@ -8,7 +8,7 @@ matrix:
   space_id: ""
 
 container:
-  image: "enclave-agent:latest"
+  image: "enclave-agent:latest"       # Default image (used if no profile matches)
   runtime: "podman"
   network: "none"             # Default network for non-SDK containers (isolated)
   copilot_network: "slirp4netns"  # Network mode when Copilot SDK is enabled
@@ -18,6 +18,16 @@ container:
   session_base: "/home/ian/.local/share/enclave/sessions"
   socket_dir: "/home/ian/.local/share/enclave/sockets"
   github_token: ""  # GitHub token for Copilot SDK auth (from `gh auth token`)
+  default_profile: "dev"
+  profiles:
+    dev:
+      image: "enclave-agent:latest"   # Full image with nix + host tool access
+      nix_store: true
+      host_mounts: true
+    light:
+      image: "enclave-light:latest"   # Minimal (~200MB), no nix, no host mounts
+      nix_store: false
+      host_mounts: false
 
 users:
   - matrix_id: "@your_user:your.homeserver"

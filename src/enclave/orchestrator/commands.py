@@ -44,7 +44,7 @@ _SINGLE_ARG_COMMANDS = {CommandType.PROJECT, CommandType.KILL, CommandType.REVOK
 # Help text for each command
 COMMAND_HELP: dict[CommandType, str] = {
     CommandType.HELP: "Show this help message",
-    CommandType.PROJECT: "Create a new project session — `project <name>`",
+    CommandType.PROJECT: "Create a new project session — `project <name> [profile]`",
     CommandType.SESSIONS: "List active sessions",
     CommandType.KILL: "Stop a session — `kill <session-id>`",
     CommandType.STATUS: "Show system status",

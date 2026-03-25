@@ -35,6 +35,15 @@ class MatrixConfig:
 
 
 @dataclass
+class ContainerProfile:
+    """A named container profile defining image and runtime options."""
+
+    image: str = "enclave-agent:latest"
+    nix_store: bool = True
+    host_mounts: bool = True
+
+
+@dataclass
 class ContainerConfig:
     """Podman container settings."""
 
@@ -49,6 +58,20 @@ class ContainerConfig:
     socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
     nix_store: str = str(Path.home() / ".local" / "share" / "enclave" / "nix")
     github_token: str = ""
+    # Named container profiles (e.g., "dev", "light")
+    profiles: dict[str, ContainerProfile] = field(default_factory=lambda: {
+        "dev": ContainerProfile(
+            image="enclave-agent:latest",
+            nix_store=True,
+            host_mounts=True,
+        ),
+        "light": ContainerProfile(
+            image="enclave-light:latest",
+            nix_store=False,
+            host_mounts=False,
+        ),
+    })
+    default_profile: str = "dev"
     # Read-only host paths to bind-mount into containers.
     # Mapped as /host/<path> inside the container (e.g., /usr → /host/usr).
     host_mounts: list[str] = field(default_factory=lambda: [
@@ -62,6 +85,15 @@ class ContainerConfig:
         "/usr/local/lib",
         "/usr/local/include",
     ])
+
+    def get_profile(self, name: str | None = None) -> ContainerProfile:
+        """Get a container profile by name, falling back to default."""
+        profile_name = name or self.default_profile
+        return self.profiles.get(profile_name, self.profiles[self.default_profile])
+
+    def profile_names(self) -> list[str]:
+        """Return list of available profile names."""
+        return list(self.profiles.keys())
 
 
 @dataclass
@@ -179,6 +211,17 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
 
         if "container" in data:
             c = data["container"]
+
+            # Parse profiles if present
+            profiles: dict[str, ContainerProfile] = {}
+            if "profiles" in c:
+                for pname, pdata in c["profiles"].items():
+                    profiles[pname] = ContainerProfile(
+                        image=pdata.get("image", "enclave-agent:latest"),
+                        nix_store=pdata.get("nix_store", True),
+                        host_mounts=pdata.get("host_mounts", True),
+                    )
+
             config.container = ContainerConfig(
                 image=c.get("image", config.container.image),
                 runtime=c.get("runtime", config.container.runtime),
@@ -191,6 +234,8 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 socket_dir=c.get("socket_dir", config.container.socket_dir),
                 nix_store=c.get("nix_store", config.container.nix_store),
                 github_token=c.get("github_token", ""),
+                default_profile=c.get("default_profile", config.container.default_profile),
+                **({"profiles": profiles} if profiles else {}),
             )
 
         if "priv_broker" in data:

@@ -35,6 +35,8 @@ class Session:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     status: str = "created"  # created, starting, running, stopping, stopped
+    profile: str = ""  # container profile name (e.g., "dev", "light")
+    image: str = ""  # resolved container image for this session
 
 
 class ContainerManager:
@@ -67,6 +69,8 @@ class ContainerManager:
                     socket_path=s.get("socket_path", ""),
                     created_at=s.get("created_at", ""),
                     status="stopped",  # assume stopped on load
+                    profile=s.get("profile", ""),
+                    image=s.get("image", ""),
                 )
                 self._sessions[session.id] = session
             log.info("Loaded %d persisted sessions", len(self._sessions))
@@ -84,6 +88,8 @@ class ContainerManager:
                 "workspace_path": s.workspace_path,
                 "socket_path": s.socket_path,
                 "created_at": s.created_at,
+                "profile": s.profile,
+                "image": s.image,
             })
         try:
             self._sessions_file.write_text(json.dumps(data, indent=2))
@@ -121,6 +127,7 @@ class ContainerManager:
         name: str,
         room_id: str,
         socket_path: str,
+        profile: str = "",
     ) -> Session:
         """Create a new agent session with workspace and container.
 
@@ -128,11 +135,17 @@ class ContainerManager:
             name: Human-readable session name.
             room_id: Matrix room ID for this session.
             socket_path: Path to the IPC socket for this session.
+            profile: Container profile name (e.g., "dev", "light").
+                     Empty string uses the default profile.
 
         Returns:
             The created Session object.
         """
         session_id = f"{_slugify(name)}-{uuid.uuid4().hex[:8]}"
+
+        # Resolve profile and image
+        resolved_profile = profile or self.config.default_profile
+        profile_obj = self.config.get_profile(resolved_profile)
 
         # Create workspace directory
         workspace = Path(self.config.workspace_base) / session_id
@@ -148,11 +161,14 @@ class ContainerManager:
             room_id=room_id,
             workspace_path=str(workspace),
             socket_path=socket_path,
+            profile=resolved_profile,
+            image=profile_obj.image,
         )
 
         self._sessions[session_id] = session
         self._save_sessions()
-        log.info("Session created: %s (%s)", session_id, name)
+        log.info("Session created: %s (%s) profile=%s image=%s",
+                 session_id, name, resolved_profile, profile_obj.image)
         return session
 
     async def start_session(self, session_id: str) -> bool:
@@ -180,15 +196,17 @@ class ContainerManager:
         session.status = "starting"
         socket_dir = str(Path(session.socket_path).parent)
 
-        # Ensure persistent nix store directory exists
-        nix_store = Path(self.config.nix_store)
-        nix_store.mkdir(parents=True, exist_ok=True)
+        # Resolve profile settings for this session
+        profile = self.config.get_profile(session.profile)
 
         # Select network mode:
         # - Copilot SDK containers need network for API access
         # - Default containers are network-isolated
         has_copilot = bool(self.config.github_token)
         network = self.config.copilot_network if has_copilot else self.config.network
+
+        # Use session-specific image, falling back to profile → global default
+        image = session.image or profile.image or self.config.image
 
         cmd = [
             self.config.runtime, "run",
@@ -200,42 +218,53 @@ class ContainerManager:
             # Workspace with rslave propagation so host-side mounts appear in container
             "-v", f"{session.workspace_path}:/workspace:rslave",
             "-v", f"{socket_dir}:/socket:Z",
-            # Persistent nix store shared across sessions
-            "-v", f"{nix_store}:/nix",
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
             "-e", f"SESSION_ID={session_id}",
             "-e", f"SESSION_NAME={session.name}",
         ]
 
-        # Bind-mount host paths read-only at /host/<path>
-        for host_path in self.config.host_mounts:
-            if Path(host_path).exists():
-                container_path = f"/host{host_path}"
-                cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
+        # Nix store mount (only for profiles that use nix)
+        if profile.nix_store:
+            nix_store = Path(self.config.nix_store)
+            nix_store.mkdir(parents=True, exist_ok=True)
+            cmd.extend(["-v", f"{nix_store}:/nix"])
 
-        # Extend PATH and LD_LIBRARY_PATH to include host mounts
-        host_bin_dirs = "/host/usr/bin:/host/usr/games:/host/usr/local/bin"
-        # GCC toolchain: tell gcc where to find cc1, as, ld etc.
-        compiler_path = (
-            "/host/usr/libexec/gcc/x86_64-linux-gnu/13"
-            ":/host/usr/lib/gcc/x86_64-linux-gnu/13"
-            ":/host/usr/bin"
-        )
-        # LIBRARY_PATH is used by the linker at compile/link time (not runtime).
-        # We intentionally do NOT set LD_LIBRARY_PATH to avoid loading the
-        # host's glibc into container processes (version mismatch → crash).
-        link_lib_dirs = (
-            "/host/usr/lib:/host/usr/lib/x86_64-linux-gnu"
-            ":/host/usr/local/lib"
-        )
-        cmd.extend([
-            "-e", f"PATH=/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin:{host_bin_dirs}",
-            "-e", "NIX_PATH=nixpkgs=channel:nixpkgs-unstable",
-            "-e", f"COMPILER_PATH={compiler_path}",
-            "-e", f"LIBRARY_PATH={link_lib_dirs}",
-            "-e", f"C_INCLUDE_PATH=/host/usr/include",
-            "-e", f"CPLUS_INCLUDE_PATH=/host/usr/include",
-        ])
+        # Bind-mount host paths read-only at /host/<path> (only for profiles that use host mounts)
+        if profile.host_mounts:
+            for host_path in self.config.host_mounts:
+                if Path(host_path).exists():
+                    container_path = f"/host{host_path}"
+                    cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
+
+        # Build PATH — include nix and host dirs only when enabled
+        path_parts = ["/usr/local/bin", "/usr/bin", "/bin"]
+        if profile.nix_store:
+            path_parts.insert(0, "/nix/var/nix/profiles/default/bin")
+            cmd.extend(["-e", "NIX_PATH=nixpkgs=channel:nixpkgs-unstable"])
+        if profile.host_mounts:
+            host_bin_dirs = ["/host/usr/bin", "/host/usr/games", "/host/usr/local/bin"]
+            path_parts.extend(host_bin_dirs)
+            # GCC toolchain: tell gcc where to find cc1, as, ld etc.
+            compiler_path = (
+                "/host/usr/libexec/gcc/x86_64-linux-gnu/13"
+                ":/host/usr/lib/gcc/x86_64-linux-gnu/13"
+                ":/host/usr/bin"
+            )
+            # LIBRARY_PATH is used by the linker at compile/link time (not runtime).
+            # We intentionally do NOT set LD_LIBRARY_PATH to avoid loading the
+            # host's glibc into container processes (version mismatch → crash).
+            link_lib_dirs = (
+                "/host/usr/lib:/host/usr/lib/x86_64-linux-gnu"
+                ":/host/usr/local/lib"
+            )
+            cmd.extend([
+                "-e", f"COMPILER_PATH={compiler_path}",
+                "-e", f"LIBRARY_PATH={link_lib_dirs}",
+                "-e", f"C_INCLUDE_PATH=/host/usr/include",
+                "-e", f"CPLUS_INCLUDE_PATH=/host/usr/include",
+            ])
+
+        cmd.extend(["-e", f"PATH={':'.join(path_parts)}"])
 
         # Custom DNS resolver (restricts what the container can resolve)
         if self.config.dns and network != "none":
@@ -245,9 +274,11 @@ class ContainerManager:
         if self.config.github_token:
             cmd.extend(["-e", f"GITHUB_TOKEN={self.config.github_token}"])
 
-        cmd.append(self.config.image)
+        cmd.append(image)
 
         log.debug("Container cmd: %s", " ".join(cmd[:8]) + " ...")
+        log.info("Starting session %s with profile=%s image=%s",
+                 session_id, session.profile, image)
 
         try:
             # First container run after image build can take ~35s (overlay setup).

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from enclave.common.config import ContainerConfig
 from enclave.common.protocol import Message, MessageType
 from enclave.orchestrator.commands import CommandType
 from enclave.orchestrator.container import ContainerManager, Session
@@ -154,6 +155,7 @@ class FakeContainers:
     def __init__(self) -> None:
         self.sessions: dict[str, Session] = {}
         self._start_result = True
+        self.config = ContainerConfig()
 
     def get_session(self, session_id: str) -> Session | None:
         return self.sessions.get(session_id)
@@ -177,13 +179,17 @@ class FakeContainers:
         return [s for s in self.sessions.values() if s.status == "running"]
 
     async def create_session(
-        self, name: str, room_id: str, socket_path: str
+        self, name: str, room_id: str, socket_path: str, profile: str = ""
     ) -> Session:
+        resolved_profile = profile or self.config.default_profile
+        profile_obj = self.config.get_profile(resolved_profile)
         session = Session(
             id=f"{name.lower()}-abc12345",
             name=name,
             room_id=room_id,
             socket_path=socket_path,
+            profile=resolved_profile,
+            image=profile_obj.image,
         )
         self.sessions[session.id] = session
         return session

@@ -497,6 +497,18 @@ they survive container restarts (via the packages volume). Best of both worlds.
 
 ---
 
+## UX: Container Selection on Project Start
+
+When a user starts a new project/session, the orchestrator presents a **poll in Matrix**
+letting them choose which container image to use:
+- Base image (default, fastest)
+- Per-project image (if a `Containerfile` exists in the project root)
+- Custom image (user specifies)
+
+This keeps the user in control of the environment without needing to configure files manually.
+
+---
+
 ## Open Questions (Remaining)
 
 1. **MCP integration detail:** How to expose host MCP servers securely into containers?
