@@ -1,15 +1,71 @@
 # Enclave Agent Container
 #
 # Minimal Python image with the enclave agent package.
+# Nix is installed at runtime into a persistent volume (/nix), not baked into the
+# image. This keeps layers small so --userns keep-id doesn't choke on ID-mapped copies.
 # Copilot SDK is optional — agent runs in echo mode without it.
 
 FROM python:3.12-slim
 
-# Install useful tools for the agent
+# Install useful tools and create the runtime user (uid 1000)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    git curl jq && \
-    rm -rf /var/lib/apt/lists/*
+    git curl jq xz-utils && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd -m -u 1000 -s /bin/bash agent
+
+# Nix config (read at install time and runtime)
+RUN mkdir -p /etc/nix && printf '%s\n' \
+    'build-users-group =' \
+    'sandbox = false' \
+    'filter-syscalls = false' \
+    'experimental-features = nix-command flakes' \
+    'always-allow-substitutes = true' \
+    'use-xdg-base-directories = true' \
+    > /etc/nix/nix.conf
+
+# Pre-create /nix so the runtime install script can write to it.
+# Owned by uid 1000 (the runtime user via --userns keep-id).
+RUN mkdir -m 0755 /nix && chown 1000:1000 /nix
+
+# Cache the nix installer tarball so first-run install is fast even without network
+RUN curl -L -o /opt/nix-install.sh https://nixos.org/nix/install && \
+    chmod +x /opt/nix-install.sh
+
+# Setup script that installs nix on first run (idempotent)
+RUN printf '#!/bin/bash\n\
+PROFILE_DIR="/nix/var/nix/profiles/per-user/$(whoami)"\n\
+\n\
+# Find nix binary in store\n\
+find_nix() { find /nix/store -maxdepth 3 -name nix-env -path "*/bin/*" 2>/dev/null | head -1; }\n\
+NIX_ENV=$(find_nix)\n\
+\n\
+if [ ! -e "$PROFILE_DIR/profile" ]; then\n\
+  mkdir -p /nix/var/nix/profiles/per-user 2>/dev/null\n\
+  chmod 1777 /nix/var/nix/profiles/per-user 2>/dev/null\n\
+  mkdir -p "$PROFILE_DIR" 2>/dev/null\n\
+\n\
+  if [ -z "$NIX_ENV" ]; then\n\
+    echo "Installing Nix (first run)..." >&2\n\
+    bash /opt/nix-install.sh --no-daemon 2>&1 | tail -3 >&2\n\
+    NIX_ENV=$(find_nix)\n\
+  fi\n\
+\n\
+  if [ -n "$NIX_ENV" ]; then\n\
+    NIX_STORE_PATH=$(dirname "$(dirname "$NIX_ENV")")\n\
+    "$NIX_ENV" -p "$PROFILE_DIR/profile" -i "$NIX_STORE_PATH" 2>/dev/null\n\
+  fi\n\
+fi\n\
+\n\
+# Create ~/.nix-profile symlink if missing\n\
+[ ! -e "$HOME/.nix-profile" ] && [ -e "$PROFILE_DIR/profile" ] && \\\n\
+  ln -sf "$PROFILE_DIR/profile" "$HOME/.nix-profile"\n\
+\n\
+# Source nix profile and export PATH\n\
+[ -f "$HOME/.nix-profile/etc/profile.d/nix.sh" ] && . "$HOME/.nix-profile/etc/profile.d/nix.sh"\n\
+export PATH="$HOME/.nix-profile/bin:$PATH"\n\
+export NIX_PATH="nixpkgs=channel:nixpkgs-unstable"\n\
+' > /usr/local/bin/nix-env-setup.sh && chmod +x /usr/local/bin/nix-env-setup.sh
 
 # Install enclave package
 COPY pyproject.toml /build/

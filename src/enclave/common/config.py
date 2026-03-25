@@ -47,6 +47,7 @@ class ContainerConfig:
     workspace_base: str = str(Path.home() / ".local" / "share" / "enclave" / "workspaces")
     session_base: str = str(Path.home() / ".local" / "share" / "enclave" / "sessions")
     socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
+    nix_store: str = str(Path.home() / ".local" / "share" / "enclave" / "nix")
     github_token: str = ""
     # Read-only host paths to bind-mount into containers.
     # Mapped as /host/<path> inside the container (e.g., /usr → /host/usr).
@@ -188,6 +189,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 workspace_base=c.get("workspace_base", config.container.workspace_base),
                 session_base=c.get("session_base", config.container.session_base),
                 socket_dir=c.get("socket_dir", config.container.socket_dir),
+                nix_store=c.get("nix_store", config.container.nix_store),
                 github_token=c.get("github_token", ""),
             )
 

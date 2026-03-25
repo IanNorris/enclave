@@ -180,6 +180,10 @@ class ContainerManager:
         session.status = "starting"
         socket_dir = str(Path(session.socket_path).parent)
 
+        # Ensure persistent nix store directory exists
+        nix_store = Path(self.config.nix_store)
+        nix_store.mkdir(parents=True, exist_ok=True)
+
         # Select network mode:
         # - Copilot SDK containers need network for API access
         # - Default containers are network-isolated
@@ -196,6 +200,8 @@ class ContainerManager:
             # Workspace with rslave propagation so host-side mounts appear in container
             "-v", f"{session.workspace_path}:/workspace:rslave",
             "-v", f"{socket_dir}:/socket:Z",
+            # Persistent nix store shared across sessions
+            "-v", f"{nix_store}:/nix",
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
             "-e", f"SESSION_ID={session_id}",
             "-e", f"SESSION_NAME={session.name}",
@@ -223,7 +229,8 @@ class ContainerManager:
             ":/host/usr/local/lib"
         )
         cmd.extend([
-            "-e", f"PATH=/usr/local/bin:/usr/bin:/bin:{host_bin_dirs}",
+            "-e", f"PATH=/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin:{host_bin_dirs}",
+            "-e", "NIX_PATH=nixpkgs=channel:nixpkgs-unstable",
             "-e", f"COMPILER_PATH={compiler_path}",
             "-e", f"LIBRARY_PATH={link_lib_dirs}",
             "-e", f"C_INCLUDE_PATH=/host/usr/include",
