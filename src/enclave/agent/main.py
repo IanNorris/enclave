@@ -204,6 +204,35 @@ def setup_session_listener(
                 reply_to=reply_to,
             )))
 
+        elif etype == SessionEventType.SESSION_COMPACTION_START:
+            print("[agent] Compaction started", file=sys.stderr)
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.STATUS_UPDATE,
+                payload={"status": "compacting", "detail": "Context compaction in progress"},
+                reply_to=reply_to,
+            )))
+
+        elif etype == SessionEventType.SESSION_COMPACTION_COMPLETE:
+            msgs_removed = getattr(data, "messages_removed", "?")
+            tokens_removed = getattr(data, "tokens_removed", "?")
+            print(
+                f"[agent] Compaction complete: {msgs_removed} msgs, "
+                f"{tokens_removed} tokens removed",
+                file=sys.stderr,
+            )
+            _fire_and_forget(ipc.send(Message(
+                type=MessageType.STATUS_UPDATE,
+                payload={
+                    "status": "compaction_complete",
+                    "messages_removed": str(msgs_removed),
+                    "tokens_removed": str(tokens_removed),
+                },
+                reply_to=reply_to,
+            )))
+
+        elif etype == SessionEventType.SESSION_TRUNCATION:
+            print(f"[agent] Session truncation: {data}", file=sys.stderr)
+
         else:
             # Log unhandled events for diagnostics
             if etype_str not in ("assistant.usage", "session.idle"):
@@ -574,6 +603,12 @@ async def try_init_copilot(
         custom_tools.append(mount_tool)
 
         # Try to resume the most recent session (preserves conversation history)
+        infinite_sessions_config = {
+            "enabled": True,
+            "background_compaction_threshold": 0.8,
+            "buffer_exhaustion_threshold": 0.95,
+        }
+
         try:
             last_id = await client.get_last_session_id()
             if last_id:
@@ -584,6 +619,7 @@ async def try_init_copilot(
                     system_message=sys_msg,
                     working_directory=working_directory,
                     tools=custom_tools,
+                    infinite_sessions=infinite_sessions_config,
                 )
                 print(f"[agent] Session resumed: {last_id}", file=sys.stderr)
                 return (client, session)
@@ -596,6 +632,7 @@ async def try_init_copilot(
             system_message=sys_msg,
             working_directory=working_directory,
             tools=custom_tools,
+            infinite_sessions=infinite_sessions_config,
         )
         return (client, session)
     except Exception as e:
