@@ -38,14 +38,23 @@ def setup_session_listener(
 
     def _fire_and_forget(coro: object) -> None:
         future = asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
-        future.add_done_callback(
-            lambda f: f.exception() if not f.cancelled() else None
-        )
+        def _on_done(f: object) -> None:
+            try:
+                exc = f.exception() if not f.cancelled() else None  # type: ignore[union-attr]
+                if exc:
+                    print(f"[agent] IPC send error: {exc}", file=sys.stderr)
+            except Exception:
+                pass
+        future.add_done_callback(_on_done)
 
     def on_event(event: object) -> None:
         etype = getattr(event, "type", None)
         data = getattr(event, "data", None)
         reply_to = current_msg_id
+
+        # Log all events for diagnostics
+        etype_str = getattr(etype, "value", str(etype)) if etype else "None"
+        print(f"[agent] Event: {etype_str}", file=sys.stderr)
 
         if etype == SessionEventType.ASSISTANT_MESSAGE_DELTA:
             delta = getattr(data, "delta_content", None) or getattr(data, "content", None) or ""
@@ -188,11 +197,17 @@ def setup_session_listener(
 
         elif etype == SessionEventType.SESSION_ERROR:
             err = getattr(data, "message", str(data))
+            print(f"[agent] SESSION_ERROR: {err}", file=sys.stderr)
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.AGENT_RESPONSE,
                 payload={"content": f"[error] {err}", "in_reply_to": reply_to},
                 reply_to=reply_to,
             )))
+
+        else:
+            # Log unhandled events for diagnostics
+            if etype_str not in ("assistant.usage", "session.idle"):
+                print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
 
     def set_current_msg(msg_id: str | None) -> None:
         nonlocal current_msg_id
@@ -228,10 +243,13 @@ async def handle_user_message(
         listener_ctl.set_current_msg(msg.id)
 
     try:
+        print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
         await sdk_session.send(content)
+        print(f"[agent] SDK send() returned", file=sys.stderr)
         # Don't wait for SESSION_IDLE here — the persistent listener handles
         # all responses including those from background sub-agents.
     except Exception as e:
+        print(f"[agent] SDK send() error: {e}", file=sys.stderr)
         await ipc.send(Message(
             type=MessageType.AGENT_RESPONSE,
             payload={"content": f"[error] {e}", "in_reply_to": msg.id},

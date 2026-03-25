@@ -100,6 +100,9 @@ class MessageRouter:
         # room_id → list of message strings to send once the user joins
         self._awaiting_join: dict[str, list[str]] = {}
 
+        # Turn timing — detect stalled turns
+        self._turn_start_time: dict[str, float] = {}
+
         # ── Privilege & permission system ──
         import os
         db_path = os.path.join(
@@ -166,9 +169,10 @@ class MessageRouter:
     # ------------------------------------------------------------------
 
     _HEALTH_INTERVAL = 60  # seconds
+    _STALL_THRESHOLD = 300  # seconds — warn if a turn takes longer than this
 
     async def _health_check_loop(self) -> None:
-        """Periodically check container health and notify on crashes."""
+        """Periodically check container health and notify on crashes/stalls."""
         while True:
             try:
                 await asyncio.sleep(self._HEALTH_INTERVAL)
@@ -178,6 +182,24 @@ class MessageRouter:
                         session.room_id,
                         "💀 Agent container crashed. Send a message to auto-restore.",
                     )
+
+                # Check for stalled turns
+                now = time.monotonic()
+                for sid, start in list(self._turn_start_time.items()):
+                    elapsed = now - start
+                    if elapsed > self._STALL_THRESHOLD:
+                        session = self.containers.get_session(sid)
+                        if session:
+                            log.warning(
+                                "Agent %s turn stalled (%.0fs)", sid, elapsed
+                            )
+                            await self.matrix.send_message(
+                                session.room_id,
+                                f"⚠️ Agent appears stalled ({int(elapsed)}s with no response). "
+                                "Try sending another message to nudge it.",
+                            )
+                        # Remove so we don't spam the warning
+                        self._turn_start_time.pop(sid, None)
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -431,9 +453,11 @@ class MessageRouter:
         elif msg.type == MessageType.SUBAGENT_COMPLETED:
             await self._handle_subagent_completed(session, msg)
         elif msg.type == MessageType.TURN_START:
-            pass  # Tracked implicitly via other events
+            log.info("Agent %s turn started", session.id)
+            self._turn_start_time[session.id] = time.monotonic()
         elif msg.type == MessageType.TURN_END:
-            pass  # Tracked implicitly via other events
+            elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
+            log.info("Agent %s turn ended (%.1fs)", session.id, elapsed)
         elif msg.type == MessageType.STATUS_UPDATE:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
