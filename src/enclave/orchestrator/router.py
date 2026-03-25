@@ -749,6 +749,31 @@ class MessageRouter:
                         "Failed to send queued message to %s", session.id
                     )
 
+        elif status == "compacting":
+            log.info("Agent %s: context compaction started", session.id)
+            thread_id = self._thread_events.get(session.id)
+            await self._update_activity(
+                session, "🗜️ Compacting context…", thread_id,
+            )
+
+        elif status == "compaction_complete":
+            msgs = msg.payload.get("messages_removed", "?")
+            tokens = msg.payload.get("tokens_removed", "?")
+            pre = msg.payload.get("pre_compaction_tokens")
+            post = msg.payload.get("post_compaction_tokens")
+            log.info(
+                "Agent %s: compaction complete (%s msgs, %s tokens removed, %s → %s)",
+                session.id, msgs, tokens, pre, post,
+            )
+            thread_id = self._thread_events.get(session.id)
+            if pre and post:
+                detail = f"{int(pre):,} → {int(post):,} tokens ({msgs} messages removed)"
+            else:
+                detail = f"{msgs} messages, {tokens} tokens freed"
+            await self._update_activity(
+                session, f"🗜️ Compacted: {detail}", thread_id,
+            )
+
     async def _handle_file_send(
         self, session: Session, msg: Message
     ) -> Message | None:

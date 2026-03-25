@@ -213,19 +213,24 @@ def setup_session_listener(
             )))
 
         elif etype == SessionEventType.SESSION_COMPACTION_COMPLETE:
-            msgs_removed = getattr(data, "messages_removed", "?")
-            tokens_removed = getattr(data, "tokens_removed", "?")
+            msgs_removed = getattr(data, "messages_removed", None)
+            tokens_removed = getattr(data, "tokens_removed", None)
+            pre_tokens = getattr(data, "pre_compaction_tokens", None)
+            post_tokens = getattr(data, "post_compaction_tokens", None)
             print(
-                f"[agent] Compaction complete: {msgs_removed} msgs, "
-                f"{tokens_removed} tokens removed",
+                f"[agent] Compaction complete: {msgs_removed} msgs removed, "
+                f"{tokens_removed} tokens removed, "
+                f"{pre_tokens} → {post_tokens} tokens",
                 file=sys.stderr,
             )
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.STATUS_UPDATE,
                 payload={
                     "status": "compaction_complete",
-                    "messages_removed": str(msgs_removed),
-                    "tokens_removed": str(tokens_removed),
+                    "messages_removed": msgs_removed,
+                    "tokens_removed": tokens_removed,
+                    "pre_compaction_tokens": pre_tokens,
+                    "post_compaction_tokens": post_tokens,
                 },
                 reply_to=reply_to,
             )))
