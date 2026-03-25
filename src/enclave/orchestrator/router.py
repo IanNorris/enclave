@@ -302,7 +302,12 @@ class MessageRouter:
             if cmd.command == CommandType.HELP:
                 await self._cmd_help()
             elif cmd.command == CommandType.PROJECT:
-                await self._cmd_project(sender, cmd)
+                # Project creation needs poll responses from future syncs,
+                # so run as a background task to avoid blocking the sync loop.
+                asyncio.create_task(self._cmd_project_with_cleanup(
+                    sender, cmd, event_id, thinking_eid,
+                ))
+                return  # cleanup handled by the task
             elif cmd.command == CommandType.SESSIONS:
                 await self._cmd_sessions()
             elif cmd.command == CommandType.KILL:
@@ -1333,6 +1338,27 @@ class MessageRouter:
     async def _cmd_help(self) -> None:
         """Handle the help command."""
         await self._reply_control(format_help())
+
+    async def _cmd_project_with_cleanup(
+        self, sender: str, cmd: ParsedCommand,
+        event_id: str | None, thinking_eid: str | None,
+    ) -> None:
+        """Run _cmd_project as a background task with its own UI cleanup."""
+        try:
+            await self._cmd_project(sender, cmd)
+        except Exception as e:
+            log.error("Project command failed: %s", e)
+            await self._reply_control(f"❌ Project creation failed: {e}")
+        finally:
+            await self.matrix.set_typing(self.control_room_id, False)
+            if thinking_eid:
+                await self.matrix.redact_event(
+                    self.control_room_id, thinking_eid
+                )
+            if event_id:
+                await self.matrix.send_reaction(
+                    self.control_room_id, event_id, "✅"
+                )
 
     async def _cmd_project(self, sender: str, cmd: ParsedCommand) -> None:
         """Handle the project command — create a new project session.
