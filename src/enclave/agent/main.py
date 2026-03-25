@@ -333,37 +333,70 @@ async def try_init_copilot(
             return None
 
         perm_handler = lambda _req, _meta: PermissionRequestResult(kind="approved")
-        sys_msg = SystemMessageAppendConfig(
-            append=(
-                "You are an AI assistant running inside an Enclave sandbox container. "
-                "You can help the user with coding, research, and system tasks. "
-                "File operations are limited to the /workspace directory.\n\n"
-                "IMPORTANT: When you create images or files that the user should see, "
-                "use the `send_file` tool to send them to the chat. The `view` tool "
-                "only lets YOU see the file — the user cannot see it unless you send it.\n\n"
-                "PACKAGE MANAGEMENT (NIX): You have Nix available for installing packages. "
+
+        # Build profile-aware system prompt
+        has_nix = os.environ.get("ENCLAVE_NIX_STORE", "1") == "1"
+        has_host_mounts = os.environ.get("ENCLAVE_HOST_MOUNTS", "1") == "1"
+        profile_name = os.environ.get("ENCLAVE_PROFILE", "dev")
+
+        prompt_parts = [
+            "You are an AI assistant running inside an Enclave sandbox container. "
+            "You can help the user with coding, research, and system tasks. "
+            "File operations are limited to the /workspace directory.\n\n"
+            "IMPORTANT: When you create images or files that the user should see, "
+            "use the `send_file` tool to send them to the chat. The `view` tool "
+            "only lets YOU see the file — the user cannot see it unless you send it.\n",
+        ]
+
+        if has_nix:
+            prompt_parts.append(
+                "\nPACKAGE MANAGEMENT (NIX): You have Nix available for installing packages. "
                 "To use any package, run: `source /usr/local/bin/nix-env-setup.sh && "
                 "nix-shell -p <package> --run '<command>'`. For example: "
                 "`source /usr/local/bin/nix-env-setup.sh && nix-shell -p gcc --run 'gcc -o hello hello.c'`. "
                 "For an interactive shell with multiple packages: "
                 "`source /usr/local/bin/nix-env-setup.sh && nix-shell -p gcc python3 nodejs`. "
                 "The Nix store is shared across sessions — packages are cached after first download. "
-                "PREFER nix-shell over sudo apt for installing software.\n\n"
-                "HOST BINARIES: The host system's /usr/bin, /usr/lib, /usr/include, etc. "
+                "ALWAYS use nix-shell for installing software. Do NOT use apt-get or apt — "
+                "you do not have root access inside the container and apt will fail.\n"
+            )
+        else:
+            prompt_parts.append(
+                "\nPACKAGE MANAGEMENT: This is a lightweight container without Nix. "
+                "You can request package installation on the host via the `sudo` tool "
+                "(e.g., `sudo apt-get install -y <package>`). The user must approve "
+                "each request. For Python packages, use `pip install --user`.\n"
+            )
+
+        if has_host_mounts:
+            prompt_parts.append(
+                "\nHOST BINARIES: The host system's /usr/bin, /usr/lib, /usr/include, etc. "
                 "are mounted read-only at /host/usr/... and are in your PATH. After packages "
                 "are installed on the host via sudo, you can run them directly in your shell "
-                "(e.g., `figlet Hello` just works). You can also compile against host libraries.\n\n"
-                "PRIVILEGE ESCALATION: You have a `sudo` tool that executes commands as root "
-                "on the HOST system. The user must approve each request via a poll in the chat. "
-                "Use it for package installation (apt), service management (systemctl), "
-                "system configuration, etc. Always provide a clear 'reason' so the user "
-                "knows why root is needed. Suggest a regex pattern via suggested_pattern "
-                "when the command category might be repeated.\n\n"
-                "DYNAMIC MOUNTS: You have a `request_mount` tool to mount host directories "
-                "into your container. Approved mounts appear at /workspace/<mount-name> "
-                "instantly. Use for accessing project code, data, or config on the host.\n\n"
-                "You have internet access via slirp4netns networking."
+                "(e.g., `figlet Hello` just works). You can also compile against host libraries.\n"
             )
+
+        prompt_parts.append(
+            "\nPRIVILEGE ESCALATION: You have a `sudo` tool that executes commands as root "
+            "on the HOST system. The user must approve each request via a poll in the chat. "
+            "Use it for package installation (apt), service management (systemctl), "
+            "system configuration, etc. Always provide a clear 'reason' so the user "
+            "knows why root is needed. Suggest a regex pattern via suggested_pattern "
+            "when the command category might be repeated.\n"
+        )
+
+        prompt_parts.append(
+            "\nDYNAMIC MOUNTS: You have a `request_mount` tool to mount host directories "
+            "into your container. Approved mounts appear at /workspace/<mount-name> "
+            "instantly. Use for accessing project code, data, or config on the host.\n"
+        )
+
+        prompt_parts.append(
+            "\nYou have internet access via slirp4netns networking."
+        )
+
+        sys_msg = SystemMessageAppendConfig(
+            append="".join(prompt_parts)
         )
 
         # Custom tool: send_file — sends a file to the user via Matrix

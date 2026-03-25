@@ -24,10 +24,12 @@ container:
       image: "enclave-agent:latest"   # Full image with nix + host tool access
       nix_store: true
       host_mounts: true
+      description: "🛠️ Native App Development"
     light:
       image: "enclave-light:latest"   # Minimal (~200MB), no nix, no host mounts
       nix_store: false
       host_mounts: false
+      description: "💬 General"
 
 users:
   - matrix_id: "@your_user:your.homeserver"

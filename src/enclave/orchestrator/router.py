@@ -96,6 +96,10 @@ class MessageRouter:
         # Projects currently being created (prevent double room creation)
         self._creating_projects: set[str] = set()
 
+        # Generic poll awaits: poll_event_id → (asyncio.Event, result list)
+        # Used for profile selection polls (and potentially other non-approval polls)
+        self._generic_polls: dict[str, tuple[asyncio.Event, list[str]]] = {}
+
         # Rooms waiting for a user to join before sending queued messages
         # room_id → list of message strings to send once the user joins
         self._awaiting_join: dict[str, list[str]] = {}
@@ -1130,7 +1134,16 @@ class MessageRouter:
     async def _on_poll_response(
         self, room_id: str, sender: str, poll_event_id: str, answer_ids: list[str]
     ) -> None:
-        """Handle a poll response — check if it resolves an approval."""
+        """Handle a poll response — check generic polls, then approval."""
+        # Check generic polls first (e.g., profile selection)
+        generic = self._generic_polls.get(poll_event_id)
+        if generic is not None:
+            event, result = generic
+            if answer_ids:
+                result.append(answer_ids[0])
+            event.set()
+            return
+
         request_id, scope, needs_pattern = self._approval.handle_poll_response(
             poll_event_id=poll_event_id,
             answer_ids=answer_ids,
@@ -1318,15 +1331,17 @@ class MessageRouter:
 
         Syntax: project <name> [profile]
         If the last word matches a known profile, it's used as the profile.
-        Otherwise the entire string is the project name with the default profile.
+        Otherwise the user is asked to pick a profile via a poll.
         """
         if not cmd.has_args:
-            profiles = self.containers.config.profile_names()
+            profiles = self.containers.config.profiles
             default = self.containers.config.default_profile
-            await self._reply_control(
-                f"Usage: `project <name> [profile]`\n"
-                f"Profiles: {', '.join(f'**{p}**' if p == default else f'`{p}`' for p in profiles)}"
-            )
+            lines = ["Usage: `project <name> [profile]`\n**Profiles:**"]
+            for name, prof in profiles.items():
+                label = prof.description or name
+                marker = " *(default)*" if name == default else ""
+                lines.append(f"- `{name}` — {label}{marker}")
+            await self._reply_control("\n".join(lines))
             return
 
         raw = cmd.args[0]  # single-arg: full string like "myapp light"
@@ -1348,9 +1363,74 @@ class MessageRouter:
         self._creating_projects.add(project_name)
 
         try:
+            # If no profile specified, ask the user via poll
+            if not profile_name:
+                profile_name = await self._ask_profile(project_name)
+                if not profile_name:
+                    await self._reply_control(
+                        f"⏱️ Profile selection timed out for **{project_name}**."
+                    )
+                    return
+
             await self._cmd_project_inner(sender, project_name, profile_name)
         finally:
             self._creating_projects.discard(project_name)
+
+    async def _ask_profile(self, project_name: str) -> str | None:
+        """Send a profile selection poll and wait for the user's choice.
+
+        Returns the selected profile name, or None on timeout.
+        """
+        profiles = self.containers.config.profiles
+
+        # Skip poll if only one profile exists
+        if len(profiles) == 1:
+            return next(iter(profiles))
+
+        default = self.containers.config.default_profile
+
+        # Build poll answers — default first, using description as label
+        answers: list[tuple[str, str]] = []
+        # Put default first
+        if default in profiles:
+            prof = profiles[default]
+            label = prof.description or default
+            answers.append((default, label))
+        for name, prof in profiles.items():
+            if name == default:
+                continue
+            label = prof.description or name
+            answers.append((name, label))
+
+        question = f"🏰 Choose a profile for **{project_name}**:"
+
+        poll_event_id = await self.matrix.send_poll(
+            self.control_room_id, question, answers
+        )
+        if poll_event_id is None:
+            # Fall back to default if poll send fails
+            return default
+
+        # Register and wait for response
+        wait_event = asyncio.Event()
+        result: list[str] = []
+        self._generic_polls[poll_event_id] = (wait_event, result)
+
+        try:
+            await asyncio.wait_for(wait_event.wait(), timeout=120.0)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._generic_polls.pop(poll_event_id, None)
+            # Close the poll
+            try:
+                await self.matrix.end_poll(self.control_room_id, poll_event_id)
+            except Exception:
+                pass
+
+        if result and result[0] in profiles:
+            return result[0]
+        return default
 
     async def _cmd_project_inner(
         self, sender: str, project_name: str, profile: str = ""

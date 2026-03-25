@@ -274,6 +274,13 @@ class ContainerManager:
         if self.config.github_token:
             cmd.extend(["-e", f"GITHUB_TOKEN={self.config.github_token}"])
 
+        # Pass profile info so the agent can adapt its behaviour
+        cmd.extend([
+            "-e", f"ENCLAVE_PROFILE={session.profile}",
+            "-e", f"ENCLAVE_NIX_STORE={'1' if profile.nix_store else '0'}",
+            "-e", f"ENCLAVE_HOST_MOUNTS={'1' if profile.host_mounts else '0'}",
+        ])
+
         cmd.append(image)
 
         log.debug("Container cmd: %s", " ".join(cmd[:8]) + " ...")

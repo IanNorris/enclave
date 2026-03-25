@@ -26,9 +26,12 @@ class FakeMatrix:
     def __init__(self) -> None:
         self.sent_messages: list[dict] = []
         self.created_rooms: list[dict] = []
+        self.sent_polls: list[dict] = []
         self._message_handlers: list = []
+        self._poll_response_handler = None
         self.client = MagicMock()
         self.client.logged_in = True
+        self._poll_counter = 0
 
     def on_message(self, handler):
         self._message_handlers.append(handler)
@@ -91,10 +94,18 @@ class FakeMatrix:
         pass
 
     def on_poll_response(self, handler):
-        pass
+        self._poll_response_handler = handler
 
     async def send_poll(self, room_id, question, answers, thread_event_id=None):
-        return "$fake-poll-id"
+        self._poll_counter += 1
+        event_id = f"$fake-poll-{self._poll_counter}"
+        self.sent_polls.append({
+            "room_id": room_id,
+            "question": question,
+            "answers": answers,
+            "event_id": event_id,
+        })
+        return event_id
 
     async def end_poll(self, room_id, poll_event_id):
         return "$fake-end-poll"
@@ -307,16 +318,50 @@ class TestControlCommands:
     @pytest.mark.asyncio
     async def test_project_creates_room_and_session(self, started_router):
         router, matrix, ipc, containers = started_router
-        await router._on_matrix_message(
-            CONTROL_ROOM, "@ian:test", "project MyApp", {}
+
+        async def respond_to_poll():
+            """Wait for the poll to be sent, then simulate a response."""
+            for _ in range(50):
+                if matrix.sent_polls:
+                    poll = matrix.sent_polls[-1]
+                    # Pick the first answer (default profile)
+                    answer_id = poll["answers"][0][0]
+                    await router._on_poll_response(
+                        CONTROL_ROOM, "@ian:test", poll["event_id"], [answer_id]
+                    )
+                    return
+                await asyncio.sleep(0.01)
+
+        # Run project creation and poll response concurrently
+        await asyncio.gather(
+            router._on_matrix_message(
+                CONTROL_ROOM, "@ian:test", "project MyApp", {}
+            ),
+            respond_to_poll(),
         )
         # Room created (invite is deferred, so not in create_room call)
         assert len(matrix.created_rooms) == 1
         assert "MyApp" in matrix.created_rooms[0]["name"]
+        # Profile poll was sent
+        assert len(matrix.sent_polls) == 1
+        assert "MyApp" in matrix.sent_polls[0]["question"]
         # Session created
         assert len(containers.sessions) == 1
         # Success message
         assert any("MyApp" in m["body"] for m in matrix.sent_messages)
+
+    @pytest.mark.asyncio
+    async def test_project_with_explicit_profile_skips_poll(self, started_router):
+        """When a profile is specified in the command, no poll is sent."""
+        router, matrix, ipc, containers = started_router
+        await router._on_matrix_message(
+            CONTROL_ROOM, "@ian:test", "project MyApp dev", {}
+        )
+        # No poll sent — profile was explicit
+        assert len(matrix.sent_polls) == 0
+        # Room and session created
+        assert len(matrix.created_rooms) == 1
+        assert len(containers.sessions) == 1
 
     @pytest.mark.asyncio
     async def test_sessions_empty(self, started_router):

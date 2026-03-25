@@ -41,6 +41,7 @@ class ContainerProfile:
     image: str = "enclave-agent:latest"
     nix_store: bool = True
     host_mounts: bool = True
+    description: str = ""
 
 
 @dataclass
@@ -64,11 +65,13 @@ class ContainerConfig:
             image="enclave-agent:latest",
             nix_store=True,
             host_mounts=True,
+            description="🛠️ Native App Development",
         ),
         "light": ContainerProfile(
             image="enclave-light:latest",
             nix_store=False,
             host_mounts=False,
+            description="💬 General",
         ),
     })
     default_profile: str = "dev"
@@ -220,6 +223,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                         image=pdata.get("image", "enclave-agent:latest"),
                         nix_store=pdata.get("nix_store", True),
                         host_mounts=pdata.get("host_mounts", True),
+                        description=pdata.get("description", ""),
                     )
 
             config.container = ContainerConfig(
