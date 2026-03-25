@@ -180,6 +180,14 @@ class MessageRouter:
         while True:
             try:
                 await asyncio.sleep(self._HEALTH_INTERVAL)
+
+                # Notify systemd watchdog that the event loop is alive
+                try:
+                    from systemd.daemon import notify
+                    notify("WATCHDOG=1")
+                except Exception:
+                    pass
+
                 crashed = await self.containers.check_health()
                 for session in crashed:
                     await self.matrix.send_message(

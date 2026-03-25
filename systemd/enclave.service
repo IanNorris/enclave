@@ -21,7 +21,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=%h/.local/bin/enclave %h/.config/enclave/enclave.yaml
 Restart=on-failure
 RestartSec=5

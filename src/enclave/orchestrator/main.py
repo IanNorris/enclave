@@ -66,6 +66,14 @@ async def run() -> None:
 
     log.info("Enclave orchestrator running")
 
+    # Notify systemd that we're ready and send initial watchdog ping
+    try:
+        from systemd.daemon import notify
+        notify("READY=1")
+        notify("WATCHDOG=1")
+    except Exception:
+        pass
+
     # Handle graceful shutdown
     stop_event = asyncio.Event()
 
