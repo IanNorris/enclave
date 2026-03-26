@@ -1,37 +1,25 @@
 # Enclave Roadmap
 
+## Implemented
+
+### Landlock Kernel Sandboxing ✅
+
+Kernel-level filesystem restrictions for host-mode agents using Linux
+Landlock LSM. Defence-in-depth against prompt injection — even compiled
+binaries can't escape the sandbox.
+
+- Module: `src/enclave/orchestrator/landlock.py`
+- `apply_sandbox(scratch_dir, readonly_paths)` — one call to lock down
+- `classify_path()` — pure-Python path classification for UI hints
+- `is_supported()` / `get_abi_version()` — runtime detection
+- Scratch dir: full RW, system paths: read-only, everything else: denied
+- 23 tests including live subprocess sandbox verification
+
+**Integration:** Call `apply_sandbox()` before exec'ing host-mode agent
+subprocess. The permission handler in the agent provides the UX layer
+(explains why access is denied), Landlock provides the enforcement layer.
+
 ## Backlog
-
-### Host Mode — Landlock Kernel Sandboxing
-
-**Priority:** Medium | **Effort:** Medium
-
-Enforce filesystem access restrictions at the kernel level for host-mode
-agents using Linux Landlock LSM. This provides defence-in-depth against
-prompt injection attacks — even if an agent compiles and runs a malicious
-binary, the kernel prevents access outside the approved paths.
-
-**Architecture:**
-- Orchestrator applies `landlock_restrict_self()` before exec'ing the agent
-- Scratch directory gets full RW access
-- `/usr`, `/nix`, system libs get read-only access
-- All other paths denied (including `~/`)
-- Dynamic mounts: orchestrator bind-mounts approved paths into scratch
-  (agent already has access to scratch, so new mounts "just work")
-
-**Why Landlock over SELinux/AppArmor:**
-- No root required — process self-restricts
-- No system-wide configuration or policy files
-- Inherited by all child processes (compiled binaries can't escape)
-- Available since Linux 5.13
-
-**Implementation notes:**
-- Python bindings via `ctypes` or `landlock` PyPI package
-- One-way ratchet: can only tighten, never loosen after `restrict_self()`
-- SDK permission handler becomes the UX layer (explains restrictions)
-- Landlock becomes the enforcement layer (actually prevents access)
-- Option A (recommended): proxy bind-mounts into scratch for dynamic access
-- Option B (simpler): pre-authorize broad read-only access, gate writes
 
 ### Host Mode — Agent Execution
 
