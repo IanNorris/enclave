@@ -37,6 +37,7 @@ from enclave.orchestrator.priv_client import PrivBrokerClient
 from enclave.orchestrator.scheduler import Scheduler, ScheduleEntry, TimerEntry
 from enclave.orchestrator.display import DisplayManager
 from enclave.orchestrator.memory import MemoryStore
+from enclave.orchestrator.watcher import WorkspaceWatcher
 
 log = get_logger("router")
 
@@ -106,6 +107,9 @@ class MessageRouter:
 
         # Sessions currently being restored (prevent double-restore)
         self._restoring: set[str] = set()
+
+        # File watchers for workspace change notifications
+        self._watchers: dict[str, WorkspaceWatcher] = {}  # session_id → watcher
 
         # Projects currently being created (prevent double room creation)
         self._creating_projects: set[str] = set()
@@ -1690,11 +1694,16 @@ class MessageRouter:
     async def _on_agent_connect(self, session_id: str) -> None:
         """Called when an agent connects via IPC."""
         log.info("Agent connected: %s", session_id)
+        # Start file watcher for workspace changes
+        await self._start_watcher(session_id)
 
     async def _on_agent_disconnect(self, session_id: str) -> None:
         """Called when an agent disconnects."""
         # Clean up streaming state
         self._streaming.pop(session_id, None)
+
+        # Stop file watcher
+        await self._stop_watcher(session_id)
 
         session = self.containers.get_session(session_id)
         if session and session.status == "running":
@@ -1703,6 +1712,43 @@ class MessageRouter:
                 "⚠️ Agent disconnected.",
             )
         log.info("Agent disconnected: %s", session_id)
+
+    async def _start_watcher(self, session_id: str) -> None:
+        """Start a file watcher for a session's workspace."""
+        if session_id in self._watchers:
+            return
+
+        session = self.containers.get_session(session_id)
+        if not session or not session.workspace_path:
+            return
+
+        async def on_changes(changes: list[dict]) -> None:
+            """Deliver file change notifications to the agent."""
+            if not self.ipc.is_connected(session_id):
+                return
+            self._touch_activity(session_id)
+            await self.ipc.send_to(session_id, Message(
+                type=MessageType.FILE_CHANGE,
+                payload={
+                    "changes": changes,
+                    "count": len(changes),
+                },
+            ))
+
+        watcher = WorkspaceWatcher(
+            workspace_path=session.workspace_path,
+            on_changes=on_changes,
+        )
+        await watcher.start()
+        self._watchers[session_id] = watcher
+        log.info("Started file watcher for %s", session_id)
+
+    async def _stop_watcher(self, session_id: str) -> None:
+        """Stop a file watcher for a session."""
+        watcher = self._watchers.pop(session_id, None)
+        if watcher:
+            await watcher.stop()
+            log.info("Stopped file watcher for %s", session_id)
 
     async def _on_user_join(self, room_id: str, user_id: str) -> None:
         """Called when a user joins a room — flush queued messages."""

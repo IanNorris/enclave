@@ -1369,6 +1369,460 @@ async def try_init_copilot(
         )
         custom_tools.append(spawn_sub_agent_tool)
 
+        # ------------------------------------------------------------------
+        # Git workstream tools — for local dev collaboration
+        # ------------------------------------------------------------------
+
+        async def _run_git(args_list: list[str], cwd: str = "/workspace") -> tuple[int, str, str]:
+            """Run a git command and return (returncode, stdout, stderr)."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", *args_list,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
+            except asyncio.TimeoutError:
+                return -1, "", "Git command timed out"
+            except FileNotFoundError:
+                return -1, "", "git not found in container"
+
+        async def _git_status_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            cwd = args.get("path", "/workspace")
+
+            rc, branch_out, _ = await _run_git(["branch", "--show-current"], cwd)
+            branch = branch_out or "(detached HEAD)"
+
+            rc2, status_out, _ = await _run_git(["status", "--short"], cwd)
+            rc3, log_out, _ = await _run_git(
+                ["log", "--oneline", "-5", "--no-decorate"], cwd,
+            )
+
+            result = f"Branch: {branch}\n"
+            if status_out:
+                result += f"\nChanges:\n{status_out}\n"
+            else:
+                result += "\nWorking tree clean.\n"
+            if log_out:
+                result += f"\nRecent commits:\n{log_out}"
+
+            return ToolResult(text_result_for_llm=result)
+
+        git_status_tool = Tool(
+            name="git_status",
+            description=(
+                "Show git status: current branch, uncommitted changes, and recent "
+                "commit history. Use to understand the current state of the repo."
+            ),
+            handler=_git_status_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repository path (default: /workspace)",
+                    },
+                },
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(git_status_tool)
+
+        async def _git_branch_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            action = args.get("action", "list")
+            name = args.get("name", "")
+            cwd = args.get("path", "/workspace")
+
+            if action == "list":
+                rc, out, err = await _run_git(["branch", "-a"], cwd)
+                return ToolResult(text_result_for_llm=out or err or "No branches found")
+
+            elif action == "create":
+                if not name:
+                    return ToolResult(
+                        text_result_for_llm="Error: branch name required",
+                        result_type="error",
+                    )
+                rc, out, err = await _run_git(["checkout", "-b", name], cwd)
+                if rc == 0:
+                    return ToolResult(text_result_for_llm=f"Created and switched to branch: {name}")
+                return ToolResult(text_result_for_llm=f"Error: {err}", result_type="error")
+
+            elif action == "switch":
+                if not name:
+                    return ToolResult(
+                        text_result_for_llm="Error: branch name required",
+                        result_type="error",
+                    )
+                rc, out, err = await _run_git(["checkout", name], cwd)
+                if rc == 0:
+                    return ToolResult(text_result_for_llm=f"Switched to branch: {name}")
+                return ToolResult(text_result_for_llm=f"Error: {err}", result_type="error")
+
+            elif action == "delete":
+                if not name:
+                    return ToolResult(
+                        text_result_for_llm="Error: branch name required",
+                        result_type="error",
+                    )
+                rc, out, err = await _run_git(["branch", "-d", name], cwd)
+                if rc == 0:
+                    return ToolResult(text_result_for_llm=f"Deleted branch: {name}")
+                return ToolResult(text_result_for_llm=f"Error: {err}", result_type="error")
+
+            return ToolResult(
+                text_result_for_llm=f"Unknown action: {action}",
+                result_type="error",
+            )
+
+        git_branch_tool = Tool(
+            name="git_branch",
+            description=(
+                "Manage git branches: list all branches, create a new feature "
+                "branch, switch branches, or delete a merged branch."
+            ),
+            handler=_git_branch_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "create", "switch", "delete"],
+                        "description": "Branch operation to perform",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Branch name (for create/switch/delete)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Repository path (default: /workspace)",
+                    },
+                },
+                "required": ["action"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(git_branch_tool)
+
+        async def _git_commit_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            message = args.get("message", "")
+            files = args.get("files", [])
+            all_changes = args.get("all", False)
+            cwd = args.get("path", "/workspace")
+
+            if not message:
+                return ToolResult(
+                    text_result_for_llm="Error: commit message required",
+                    result_type="error",
+                )
+
+            # Stage files
+            if all_changes:
+                rc, _, err = await _run_git(["add", "-A"], cwd)
+            elif files:
+                rc, _, err = await _run_git(["add", "--"] + files, cwd)
+            else:
+                # Stage all tracked changes by default
+                rc, _, err = await _run_git(["add", "-u"], cwd)
+
+            if rc != 0:
+                return ToolResult(
+                    text_result_for_llm=f"Failed to stage: {err}",
+                    result_type="error",
+                )
+
+            # Check there are staged changes
+            rc, diff_out, _ = await _run_git(["diff", "--cached", "--stat"], cwd)
+            if not diff_out:
+                return ToolResult(
+                    text_result_for_llm="Nothing to commit — no staged changes.",
+                )
+
+            # Commit
+            rc, out, err = await _run_git(["commit", "-m", message], cwd)
+            if rc == 0:
+                # Get the short hash
+                rc2, hash_out, _ = await _run_git(["rev-parse", "--short", "HEAD"], cwd)
+                return ToolResult(
+                    text_result_for_llm=f"Committed: {hash_out} {message}\n\n{diff_out}",
+                )
+            return ToolResult(text_result_for_llm=f"Commit failed: {err}", result_type="error")
+
+        git_commit_tool = Tool(
+            name="git_commit",
+            description=(
+                "Stage and commit changes. By default stages all tracked file "
+                "changes. Use 'files' to stage specific files, or 'all' to "
+                "include untracked files."
+            ),
+            handler=_git_commit_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Commit message",
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Specific files to stage (optional)",
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Stage all changes including untracked (default: false)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Repository path (default: /workspace)",
+                    },
+                },
+                "required": ["message"],
+            },
+        )
+        custom_tools.append(git_commit_tool)
+
+        async def _git_push_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            remote = args.get("remote", "origin")
+            branch = args.get("branch", "")
+            set_upstream = args.get("set_upstream", False)
+            cwd = args.get("path", "/workspace")
+
+            cmd = ["push"]
+            if set_upstream:
+                cmd.append("--set-upstream")
+            cmd.append(remote)
+            if branch:
+                cmd.append(branch)
+
+            rc, out, err = await _run_git(cmd, cwd)
+            combined = (out + "\n" + err).strip()
+            if rc == 0:
+                return ToolResult(text_result_for_llm=f"Push successful.\n{combined}")
+            return ToolResult(
+                text_result_for_llm=f"Push failed:\n{combined}",
+                result_type="error",
+            )
+
+        git_push_tool = Tool(
+            name="git_push",
+            description="Push commits to remote repository.",
+            handler=_git_push_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name (default: origin)",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch to push (default: current branch)",
+                    },
+                    "set_upstream": {
+                        "type": "boolean",
+                        "description": "Set upstream tracking (for new branches)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Repository path (default: /workspace)",
+                    },
+                },
+            },
+        )
+        custom_tools.append(git_push_tool)
+
+        async def _git_diff_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            staged = args.get("staged", False)
+            target = args.get("target", "")
+            stat_only = args.get("stat_only", False)
+            cwd = args.get("path", "/workspace")
+
+            cmd = ["diff"]
+            if staged:
+                cmd.append("--cached")
+            if stat_only:
+                cmd.append("--stat")
+            if target:
+                cmd.append(target)
+
+            rc, out, err = await _run_git(cmd, cwd)
+            if not out and not err:
+                return ToolResult(text_result_for_llm="No differences found.")
+            # Truncate large diffs
+            if len(out) > 8000:
+                out = out[:8000] + f"\n\n... (truncated, {len(out)} chars total)"
+            return ToolResult(text_result_for_llm=out or err)
+
+        git_diff_tool = Tool(
+            name="git_diff",
+            description=(
+                "Show git diff — unstaged changes by default, or staged changes, "
+                "or diff against a branch/commit."
+            ),
+            handler=_git_diff_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "staged": {
+                        "type": "boolean",
+                        "description": "Show staged (cached) changes",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Compare against branch, tag, or commit SHA",
+                    },
+                    "stat_only": {
+                        "type": "boolean",
+                        "description": "Show only file change statistics",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Repository path (default: /workspace)",
+                    },
+                },
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(git_diff_tool)
+
+        async def _git_pr_handler(invocation: object) -> ToolResult:
+            """Create a GitHub PR using the GitHub API."""
+            args = getattr(invocation, "arguments", {}) or {}
+            title = args.get("title", "")
+            body = args.get("body", "")
+            base = args.get("base", "main")
+            head = args.get("head", "")
+            cwd = args.get("path", "/workspace")
+
+            if not title:
+                return ToolResult(
+                    text_result_for_llm="Error: PR title required",
+                    result_type="error",
+                )
+
+            # Get current branch as head if not specified
+            if not head:
+                rc, head, _ = await _run_git(["branch", "--show-current"], cwd)
+                if not head:
+                    return ToolResult(
+                        text_result_for_llm="Error: not on a branch",
+                        result_type="error",
+                    )
+
+            # Get remote URL to extract owner/repo
+            rc, remote_url, _ = await _run_git(
+                ["config", "--get", "remote.origin.url"], cwd,
+            )
+            if not remote_url:
+                return ToolResult(
+                    text_result_for_llm="Error: no remote origin configured",
+                    result_type="error",
+                )
+
+            # Parse owner/repo from URL (handles both HTTPS and SSH)
+            import re
+            match = re.search(r"[:/]([^/]+)/([^/.]+?)(?:\.git)?$", remote_url)
+            if not match:
+                return ToolResult(
+                    text_result_for_llm=f"Error: cannot parse remote URL: {remote_url}",
+                    result_type="error",
+                )
+            owner, repo = match.group(1), match.group(2)
+
+            token = os.environ.get("GITHUB_TOKEN", "")
+            if not token:
+                return ToolResult(
+                    text_result_for_llm="Error: GITHUB_TOKEN not available",
+                    result_type="error",
+                )
+
+            # Create PR via GitHub API
+            import json as _json
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "curl", "-s", "-X", "POST",
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                    "-H", f"Authorization: token {token}",
+                    "-H", "Accept: application/vnd.github.v3+json",
+                    "-d", _json.dumps({
+                        "title": title,
+                        "body": body,
+                        "head": head,
+                        "base": base,
+                    }),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                resp = _json.loads(stdout.decode())
+
+                if "html_url" in resp:
+                    return ToolResult(
+                        text_result_for_llm=(
+                            f"PR created: {resp['html_url']}\n"
+                            f"#{resp['number']} — {resp['title']}"
+                        ),
+                    )
+                elif "message" in resp:
+                    return ToolResult(
+                        text_result_for_llm=f"GitHub API error: {resp['message']}",
+                        result_type="error",
+                    )
+                return ToolResult(
+                    text_result_for_llm=f"Unexpected response: {stdout.decode()[:500]}",
+                    result_type="error",
+                )
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"PR creation failed: {e}",
+                    result_type="error",
+                )
+
+        git_pr_tool = Tool(
+            name="git_pr",
+            description=(
+                "Create a GitHub Pull Request from the current branch. "
+                "Pushes first if needed. Uses the GITHUB_TOKEN for authentication."
+            ),
+            handler=_git_pr_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "PR title",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "PR description/body (markdown)",
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Base branch to merge into (default: main)",
+                    },
+                    "head": {
+                        "type": "string",
+                        "description": "Head branch (default: current branch)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Repository path (default: /workspace)",
+                    },
+                },
+                "required": ["title"],
+            },
+        )
+        custom_tools.append(git_pr_tool)
+
         # Try to resume the most recent session (preserves conversation history)
         infinite_sessions_config = {
             "enabled": True,
@@ -1546,11 +2000,46 @@ async def main() -> None:
 
         return None
 
+    async def on_file_change(msg: Message) -> Message | None:
+        """Handle file change notifications from workspace watcher."""
+        if not session:
+            return None
+        changes = msg.payload.get("changes", [])
+        count = msg.payload.get("count", 0)
+        if not changes:
+            return None
+
+        # Format the notification as a brief user-facing message
+        summary_lines = []
+        for c in changes[:10]:
+            icon = {"created": "➕", "modified": "✏️", "deleted": "🗑️"}.get(c["type"], "?")
+            summary_lines.append(f"{icon} {c['path']}")
+        if count > 10:
+            summary_lines.append(f"... and {count - 10} more")
+
+        notification = (
+            f"📁 **Workspace files changed externally** ({count} files):\n"
+            + "\n".join(summary_lines)
+        )
+
+        # Send as a system-level notification to the session
+        print(f"[agent] File changes detected: {count} files", file=sys.stderr)
+        try:
+            await session.send_user_message(
+                notification,
+                reply_to=None,
+            )
+        except Exception as e:
+            print(f"[agent] Failed to notify about file changes: {e}", file=sys.stderr)
+
+        return None
+
     ipc.on_message(MessageType.USER_MESSAGE, on_user_message)
     ipc.on_message(MessageType.SCHEDULE_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.TIMER_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.SHUTDOWN, on_shutdown)
     ipc.on_message(MessageType.DREAM_REQUEST, on_dream_request)
+    ipc.on_message(MessageType.FILE_CHANGE, on_file_change)
 
     print("[agent] Ready and listening", file=sys.stderr)
 
