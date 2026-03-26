@@ -557,6 +557,65 @@ class EnclaveMatrixClient:
         resp = await self.client.join(room_id)
         return hasattr(resp, "room_id")
 
+    async def kick_user(
+        self, room_id: str, user_id: str, reason: str = ""
+    ) -> bool:
+        """Kick a user from a room."""
+        try:
+            resp = await self.client.room_kick(room_id, user_id, reason=reason)
+            ok = hasattr(resp, "transport_response") or "RoomKickResponse" in type(resp).__name__
+            log.info("Kicked %s from %s: %s", user_id, room_id, type(resp).__name__)
+            return ok
+        except Exception as e:
+            log.error("Failed to kick %s from %s: %s", user_id, room_id, e)
+            return False
+
+    async def leave_room(self, room_id: str) -> bool:
+        """Leave a room."""
+        try:
+            resp = await self.client.room_leave(room_id)
+            ok = hasattr(resp, "room_id") or "RoomLeaveResponse" in type(resp).__name__
+            log.info("Left room %s: %s", room_id, type(resp).__name__)
+            return ok
+        except Exception as e:
+            log.error("Failed to leave room %s: %s", room_id, e)
+            return False
+
+    async def forget_room(self, room_id: str) -> bool:
+        """Forget a room (remove from room list after leaving)."""
+        try:
+            resp = await self.client.room_forget(room_id)
+            ok = hasattr(resp, "room_id") or "RoomForgetResponse" in type(resp).__name__
+            log.info("Forgot room %s: %s", room_id, type(resp).__name__)
+            return ok
+        except Exception as e:
+            log.error("Failed to forget room %s: %s", room_id, e)
+            return False
+
+    async def cleanup_room(
+        self, room_id: str, user_ids: list[str] | None = None, reason: str = ""
+    ) -> bool:
+        """Full room cleanup: kick users, leave, and forget.
+
+        Args:
+            room_id: Room to clean up.
+            user_ids: Users to kick before leaving. If None, no kicks.
+            reason: Kick/leave reason shown to users.
+
+        Returns:
+            True if all operations succeeded.
+        """
+        ok = True
+        if user_ids:
+            for uid in user_ids:
+                if not await self.kick_user(room_id, uid, reason=reason):
+                    ok = False
+        if not await self.leave_room(room_id):
+            ok = False
+        else:
+            await self.forget_room(room_id)
+        return ok
+
     async def close(self) -> None:
         """Close the Matrix client."""
         self.stop_sync()

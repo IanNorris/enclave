@@ -21,6 +21,7 @@ class CommandType(str, Enum):
     PERMS = "perms"
     REVOKE = "revoke"
     RULES = "rules"
+    CLEANUP = "cleanup"
     UNKNOWN = "unknown"
 
 
@@ -51,6 +52,7 @@ COMMAND_HELP: dict[CommandType, str] = {
     CommandType.PERMS: "List permissions — `perms [project]`",
     CommandType.REVOKE: "Revoke a permission — `revoke <permission-id>`",
     CommandType.RULES: "Manage permission rules — `rules [add|rm] [args]`",
+    CommandType.CLEANUP: "Clean up stopped session rooms — `cleanup [all|<session-id>]`",
 }
 
 

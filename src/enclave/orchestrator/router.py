@@ -473,6 +473,8 @@ class MessageRouter:
                 await self._cmd_perms(cmd)
             elif cmd.command == CommandType.REVOKE:
                 await self._cmd_revoke(cmd)
+            elif cmd.command == CommandType.CLEANUP:
+                await self._cmd_cleanup(cmd)
             elif cmd.command == CommandType.UNKNOWN:
                 await self._reply_control(
                     f"Unknown command: `{cmd.args[0] if cmd.args else '?'}`. "
@@ -2280,3 +2282,69 @@ class MessageRouter:
             f"  IPC: {connected} agents connected\n"
             f"  Matrix: {'connected' if self.matrix.client.logged_in else 'disconnected'}"
         )
+
+    async def _cmd_cleanup(self, cmd: ParsedCommand) -> None:
+        """Clean up Matrix rooms for stopped sessions.
+
+        Usage:
+            cleanup           — list stopped sessions eligible for cleanup
+            cleanup all       — clean up all stopped sessions
+            cleanup <id>      — clean up a specific stopped session
+        """
+        sessions = self.containers.list_sessions()
+        stopped = [s for s in sessions if s.status == "stopped"]
+
+        if not cmd.has_args:
+            if not stopped:
+                await self._reply_control("No stopped sessions to clean up.")
+                return
+            lines = [f"**Stopped sessions ({len(stopped)}):**\n"]
+            for s in stopped:
+                lines.append(f"  `{s.id}` — {s.name} (room: `{s.room_id}`)")
+            lines.append(f"\nUse `cleanup all` or `cleanup <session-id>` to remove.")
+            await self._reply_control("\n".join(lines))
+            return
+
+        target = cmd.args[0]
+
+        if target == "all":
+            cleaned = 0
+            for s in stopped:
+                ok = await self._cleanup_session_room(s)
+                if ok:
+                    cleaned += 1
+            await self._reply_control(
+                f"🧹 Cleaned up {cleaned}/{len(stopped)} stopped sessions."
+            )
+        else:
+            session = self.containers.get_session(target)
+            if session is None:
+                await self._reply_control(f"❌ Session `{target}` not found.")
+                return
+            if session.status == "running":
+                await self._reply_control(
+                    f"⚠️ Session `{target}` is still running. Stop it first with `kill {target}`."
+                )
+                return
+            ok = await self._cleanup_session_room(session)
+            if ok:
+                await self._reply_control(f"🧹 Cleaned up session `{target}`.")
+            else:
+                await self._reply_control(f"❌ Failed to clean up session `{target}`.")
+
+    async def _cleanup_session_room(self, session: Session) -> bool:
+        """Clean up a single stopped session: kick users, leave room, remove session."""
+        # Find which users are in this room
+        room_id = session.room_id
+        reason = f"Session '{session.name}' archived by Enclave"
+
+        # Kick all users we know about
+        user_ids = list(self._user_mappings.keys())
+        ok = await self.matrix.cleanup_room(room_id, user_ids=user_ids, reason=reason)
+
+        # Remove session from container manager
+        await self.containers.remove_session(session.id)
+        await self.ipc.remove_socket(session.id)
+
+        log.info("Cleaned up session %s (room: %s)", session.id, room_id)
+        return ok
