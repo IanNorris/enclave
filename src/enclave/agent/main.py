@@ -264,6 +264,11 @@ async def handle_user_message(
 ) -> None:
     """Handle a user message — stream events back via IPC."""
     content = msg.payload.get("content", "")
+    timestamp = msg.payload.get("timestamp", "")
+
+    # Prepend current time context so the agent knows when the message was sent
+    if timestamp:
+        content = f"<current_datetime>{timestamp}</current_datetime>\n\n{content}"
 
     if sdk_session is None:
         await ipc.send(Message(
