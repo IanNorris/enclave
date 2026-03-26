@@ -1406,6 +1406,11 @@ class MessageRouter:
                     )
                     return
 
+            log.info("[project:%s] Profile selected: %s — starting setup...", project_name, profile_name)
+            await self._reply_control(
+                f"⚙️ Setting up **{project_name}** with profile `{profile_name}`..."
+            )
+
             await self._cmd_project_inner(sender, project_name, profile_name)
         finally:
             self._creating_projects.discard(project_name)
