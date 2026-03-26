@@ -30,6 +30,10 @@ sessions/
 workspaces/
 bot_store/
 
+# Nix
+result
+.direnv/
+
 # Secrets
 .env
 *.pem
