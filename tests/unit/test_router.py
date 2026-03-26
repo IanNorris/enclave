@@ -706,3 +706,155 @@ class TestHealthCheck:
             "crash" in m["body"].lower() and m["room_id"] == "!crash-room:test"
             for m in matrix.sent_messages
         )
+
+
+# ------------------------------------------------------------------
+# Tests: Display/UI IPC handlers
+# ------------------------------------------------------------------
+
+
+class TestDisplayHandlers:
+    """Test GUI launch and screenshot IPC handlers."""
+
+    @pytest.mark.asyncio
+    async def test_gui_launch_no_display(self, started_router):
+        """GUI launch fails when no display session is active."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        msg = Message(
+            type=MessageType.GUI_LAUNCH_REQUEST,
+            payload={"command": "firefox", "reason": "test"},
+        )
+
+        response = await ipc.simulate_agent_message("s1", msg)
+
+        # Should send an error reply
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.GUI_LAUNCH_REQUEST]
+        assert len(sent) == 1
+        assert "No desktop session available" in sent[0][1].payload.get("error", "")
+
+    @pytest.mark.asyncio
+    async def test_screenshot_no_display(self, started_router):
+        """Screenshot fails when no display session is active."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        msg = Message(
+            type=MessageType.SCREENSHOT_REQUEST,
+            payload={},
+        )
+
+        response = await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.SCREENSHOT_REQUEST]
+        assert len(sent) == 1
+        assert "No desktop session available" in sent[0][1].payload.get("error", "")
+
+    @pytest.mark.asyncio
+    async def test_gui_launch_approved(self, started_router):
+        """GUI launch succeeds when display active and approved."""
+        from enclave.orchestrator.permissions import RequestStatus
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        # Enable display
+        router._display._display_available = True
+        router._display._hyprland_socket = "/tmp/hypr/test/.socket.sock"
+
+        # Auto-approve the permission request
+        router._approval.request_permission = AsyncMock(
+            return_value=(RequestStatus.APPROVED, None, None)
+        )
+
+        # Mock the display launch
+        router._display.launch_app = AsyncMock(return_value=True)
+
+        msg = Message(
+            type=MessageType.GUI_LAUNCH_REQUEST,
+            payload={"command": "firefox", "reason": "Open browser"},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.GUI_LAUNCH_REQUEST]
+        assert len(sent) == 1
+        assert sent[0][1].payload.get("ok") is True
+        router._display.launch_app.assert_called_once_with("firefox")
+
+    @pytest.mark.asyncio
+    async def test_gui_launch_denied(self, started_router):
+        """GUI launch denied when user rejects approval."""
+        from enclave.orchestrator.permissions import RequestStatus
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        router._display._display_available = True
+        router._display._hyprland_socket = "/tmp/hypr/test/.socket.sock"
+
+        # Deny the permission request
+        router._approval.request_permission = AsyncMock(
+            return_value=(RequestStatus.DENIED, None, None)
+        )
+
+        msg = Message(
+            type=MessageType.GUI_LAUNCH_REQUEST,
+            payload={"command": "rm -rf /", "reason": "malicious"},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.GUI_LAUNCH_REQUEST]
+        assert len(sent) == 1
+        assert "denied" in sent[0][1].payload.get("error", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_success(self, started_router):
+        """Screenshot succeeds when display is active."""
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        s.workspace_path = "/tmp/test-workspace"
+        ipc.mark_connected("s1")
+
+        router._display._display_available = True
+
+        # Mock successful screenshot
+        router._display.take_screenshot = AsyncMock(return_value=True)
+
+        msg = Message(
+            type=MessageType.SCREENSHOT_REQUEST,
+            payload={},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.SCREENSHOT_REQUEST]
+        assert len(sent) == 1
+        assert sent[0][1].payload.get("ok") is True
+        assert "screenshot" in sent[0][1].payload.get("path", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_failure(self, started_router):
+        """Screenshot returns error when grim fails."""
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        s.workspace_path = "/tmp/test-workspace"
+        ipc.mark_connected("s1")
+
+        router._display._display_available = True
+        router._display.take_screenshot = AsyncMock(return_value=False)
+
+        msg = Message(
+            type=MessageType.SCREENSHOT_REQUEST,
+            payload={},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.SCREENSHOT_REQUEST]
+        assert len(sent) == 1
+        assert "failed" in sent[0][1].payload.get("error", "").lower()

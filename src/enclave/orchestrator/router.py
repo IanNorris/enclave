@@ -10,6 +10,7 @@ import asyncio
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from enclave.common.config import UserMapping
@@ -33,6 +34,7 @@ from enclave.orchestrator.permissions import (
 )
 from enclave.orchestrator.priv_client import PrivBrokerClient
 from enclave.orchestrator.scheduler import Scheduler, ScheduleEntry, TimerEntry
+from enclave.orchestrator.display import DisplayManager
 
 log = get_logger("router")
 
@@ -144,6 +146,10 @@ class MessageRouter:
 
         # Track workspaces that have shared mount propagation set up
         self._propagation_ready: set[str] = set()
+
+        # Display manager for desktop interaction
+        self._display = DisplayManager()
+        self._display.detect_session()
 
     async def start(self) -> None:
         """Wire up all the event handlers."""
@@ -516,6 +522,10 @@ class MessageRouter:
             await self._handle_timer_set(session, msg)
         elif msg.type == MessageType.TIMER_CANCEL:
             await self._handle_timer_cancel(session, msg)
+        elif msg.type == MessageType.GUI_LAUNCH_REQUEST:
+            await self._handle_gui_launch(session, msg)
+        elif msg.type == MessageType.SCREENSHOT_REQUEST:
+            await self._handle_screenshot(session, msg)
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -1736,6 +1746,78 @@ class MessageRouter:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         ))
+
+    # ------------------------------------------------------------------
+    # Display/UI IPC handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_gui_launch(self, session: Session, msg: Message) -> None:
+        """Handle a GUI launch request — requires approval."""
+        command = msg.payload.get("command", "")
+        reason = msg.payload.get("reason", "")
+
+        if not self._display.is_available:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.GUI_LAUNCH_REQUEST,
+                payload={"error": "No desktop session available"},
+                reply_to=msg.id,
+            ))
+            return
+
+        # Require approval like sudo
+        status, scope, pattern = await self._approval.request_permission(
+            session_id=session.id,
+            session_name=session.name,
+            project_name=session.name,
+            perm_type=PermissionType.PRIVILEGE,
+            target=f"GUI: {command}",
+            reason=reason or f"Launch GUI application: {command}",
+            room_id=session.room_id,
+        )
+
+        if status != RequestStatus.APPROVED:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.GUI_LAUNCH_REQUEST,
+                payload={"error": f"GUI launch denied: {status.value}", "command": command},
+                reply_to=msg.id,
+            ))
+            return
+
+        success = await self._display.launch_app(command)
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.GUI_LAUNCH_REQUEST,
+            payload={"ok": success, "command": command},
+            reply_to=msg.id,
+        ))
+
+    async def _handle_screenshot(self, session: Session, msg: Message) -> None:
+        """Handle a screenshot request — auto-approved (read-only)."""
+        if not self._display.is_available:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.SCREENSHOT_REQUEST,
+                payload={"error": "No desktop session available"},
+                reply_to=msg.id,
+            ))
+            return
+
+        # Save to session workspace
+        output_path = str(
+            Path(session.workspace_path) / f"screenshot-{int(time.time())}.png"
+        )
+        success = await self._display.take_screenshot(output_path)
+
+        if success:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.SCREENSHOT_REQUEST,
+                payload={"ok": True, "path": output_path},
+                reply_to=msg.id,
+            ))
+        else:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.SCREENSHOT_REQUEST,
+                payload={"error": "Screenshot failed"},
+                reply_to=msg.id,
+            ))
 
     async def _cmd_sessions(self) -> None:
         """Handle the sessions command — list active sessions."""

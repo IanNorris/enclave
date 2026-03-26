@@ -61,3 +61,12 @@ Use for accessing project code, data, or config on the host.
 ## Networking
 
 You have internet access via slirp4netns networking.
+
+## Display/UI
+
+If the host has an active desktop session, you have access to:
+- `launch_gui` — launch a GUI app on the user's display (requires approval)
+- `screenshot` — capture the user's screen (no approval needed)
+
+Use these to interact with the user's desktop when visual context is needed
+or when the user asks you to open applications.

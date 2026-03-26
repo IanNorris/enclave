@@ -965,6 +965,117 @@ async def try_init_copilot(
         )
         custom_tools.append(timer_tool)
 
+        # Custom tool: launch_gui — launch a GUI app on the user's desktop
+        async def _gui_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            command = args.get("command", "")
+            reason = args.get("reason", "")
+            if not command:
+                return ToolResult(
+                    text_result_for_llm="Error: 'command' parameter is required",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                response = await ipc.request(
+                    Message(
+                        type=MessageType.GUI_LAUNCH_REQUEST,
+                        payload={"command": command, "reason": reason},
+                    ),
+                    timeout=360.0,
+                )
+                rp = response.payload
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"GUI launch failed: {rp['error']}",
+                        result_type="error",
+                    )
+                return ToolResult(
+                    text_result_for_llm=f"GUI app launched: {command}",
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="GUI launch request timed out",
+                    result_type="error",
+                )
+
+        gui_tool = Tool(
+            name="launch_gui",
+            description=(
+                "Launch a GUI application on the user's desktop (Wayland/Hyprland). "
+                "Requires user approval. Use for browsers, editors, media players, etc. "
+                "Example: launch_gui(command='firefox https://example.com', reason='Open docs')"
+            ),
+            handler=_gui_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The command to launch (e.g., 'firefox', 'code .')",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this GUI app needs to be launched",
+                    },
+                },
+                "required": ["command"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(gui_tool)
+
+        # Custom tool: screenshot — capture the user's screen
+        async def _screenshot_handler(invocation: object) -> ToolResult:
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                response = await ipc.request(
+                    Message(
+                        type=MessageType.SCREENSHOT_REQUEST,
+                        payload={},
+                    ),
+                    timeout=30.0,
+                )
+                rp = response.payload
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"Screenshot failed: {rp['error']}",
+                        result_type="error",
+                    )
+                path = rp.get("path", "")
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Screenshot saved to: {path}\n"
+                        "Use send_file to show it to the user."
+                    ),
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Screenshot request timed out",
+                    result_type="error",
+                )
+
+        screenshot_tool = Tool(
+            name="screenshot",
+            description=(
+                "Take a screenshot of the user's desktop. The image is saved "
+                "to your workspace. Use send_file to share it with the user. "
+                "No approval needed (read-only operation)."
+            ),
+            handler=_screenshot_handler,
+            parameters={"type": "object", "properties": {}},
+            skip_permission=True,
+        )
+        custom_tools.append(screenshot_tool)
+
         # Try to resume the most recent session (preserves conversation history)
         infinite_sessions_config = {
             "enabled": True,
