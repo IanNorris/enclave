@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,9 @@ class MessageRouter:
         # Sub-agent thread tracking
         # session_id → event_id of the message that starts the sub-agent thread
         self._subagent_threads: dict[str, str] = {}
+
+        # Sub-agent parent tracking: sub_session_id → parent_session_id
+        self._subagent_parents: dict[str, str] = {}
 
         # Pending messages queued during session restore (sent once agent is ready)
         self._pending_messages: dict[str, list[dict[str, Any]]] = {}
@@ -665,6 +669,8 @@ class MessageRouter:
             await self._handle_memory_delete(session, msg)
         elif msg.type == MessageType.DREAM_COMPLETE:
             await self._handle_dream_complete(session, msg)
+        elif msg.type == MessageType.SUB_AGENT_REQUEST:
+            return await self._handle_sub_agent_request(session, msg)
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -806,6 +812,120 @@ class MessageRouter:
         # Clear any lingering activity message reference
         self._activity_msg.pop(session.id, None)
         self._activity_lines.pop(session.id, None)
+
+    async def _handle_sub_agent_request(
+        self, session: Session, msg: Message
+    ) -> Message:
+        """Handle request from agent to spawn a sub-agent.
+
+        Creates a lightweight container with a Matrix thread for the
+        sub-agent's activity.  The sub-agent gets its own IPC socket and
+        container but shares the parent's Matrix room.
+        """
+        name = msg.payload.get("name", "sub-agent")
+        purpose = msg.payload.get("purpose", "")
+        has_network = msg.payload.get("has_network", False)
+        has_workspace = msg.payload.get("has_workspace", False)
+        profile = msg.payload.get("profile", "light")
+
+        if not purpose:
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"error": "purpose is required"},
+                reply_to=msg.id,
+            )
+
+        # Limit concurrent sub-agents per session
+        max_sub = 3
+        active = sum(
+            1 for sid, parent in self._subagent_parents.items()
+            if parent == session.id
+            and self.containers.get_session(sid)
+            and self.containers.get_session(sid).status == "running"
+        )
+        if active >= max_sub:
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"error": f"Max {max_sub} concurrent sub-agents reached"},
+                reply_to=msg.id,
+            )
+
+        log.info(
+            "Spawning sub-agent '%s' for %s: %s",
+            name, session.id, purpose[:100],
+        )
+
+        # Create a thread in the parent room for the sub-agent
+        thread_id = self._thread_events.get(session.id)
+        thread_root = await self.matrix.send_message(
+            session.room_id,
+            f"🤖 **Sub-agent: {name}**\n_{purpose[:200]}_",
+            thread_event_id=thread_id,
+        )
+
+        # Create IPC socket for sub-agent
+        sub_tag = f"sub-{name}-{uuid.uuid4().hex[:6]}"
+        socket_path = await self.ipc.create_socket(sub_tag)
+
+        # Resolve profile
+        profile_obj = self.containers.config.get_profile(profile)
+
+        # Create a sub-agent session
+        sub_session = await self.containers.create_session(
+            name=f"sub-{name}",
+            room_id=session.room_id,
+            socket_path=str(socket_path),
+            profile=profile,
+            user_display_name=session.user_display_name,
+            user_pronouns=session.user_pronouns,
+        )
+
+        # Track parent → sub-agent relationship
+        self._subagent_parents[sub_session.id] = session.id
+        if thread_root:
+            self._subagent_threads[sub_session.id] = thread_root
+
+        # Start the container
+        started, error = await self.containers.start_session(sub_session.id)
+        if not started:
+            log.error("Sub-agent container failed to start: %s", error)
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={
+                    "error": f"Failed to start sub-agent container: {error}",
+                    "sub_agent_id": sub_session.id,
+                },
+                reply_to=msg.id,
+            )
+
+        # Send the initial purpose as the first user message to the sub-agent
+        await self.ipc.send_to(
+            sub_session.id,
+            Message(
+                type=MessageType.USER_MESSAGE,
+                payload={
+                    "content": purpose,
+                    "sender": "parent-agent",
+                    "room_id": session.room_id,
+                },
+            ),
+        )
+
+        log.info(
+            "Sub-agent '%s' started: session=%s parent=%s",
+            name, sub_session.id, session.id,
+        )
+
+        return Message(
+            type=MessageType.AGENT_RESPONSE,
+            payload={
+                "sub_agent_id": sub_session.id,
+                "name": name,
+                "status": "running",
+                "thread_id": thread_root or "",
+            },
+            reply_to=msg.id,
+        )
 
     async def _update_activity(
         self, session: Session, text: str, thread_id: str | None

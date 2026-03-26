@@ -1276,6 +1276,99 @@ async def try_init_copilot(
         )
         custom_tools.append(forget_tool)
 
+        # Custom tool: spawn_sub_agent — request the orchestrator to spawn a sub-agent
+        async def _spawn_sub_agent_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            name = args.get("name", "sub-agent")
+            purpose = args.get("purpose", "")
+            has_network = args.get("has_network", False)
+            has_workspace = args.get("has_workspace", False)
+            profile = args.get("profile", "light")
+
+            if not purpose:
+                return ToolResult(
+                    text_result_for_llm="Error: purpose is required",
+                    result_type="error",
+                )
+
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+
+            try:
+                response = await ipc.request(
+                    Message(
+                        type=MessageType.SUB_AGENT_REQUEST,
+                        payload={
+                            "name": name,
+                            "purpose": purpose,
+                            "has_network": has_network,
+                            "has_workspace": has_workspace,
+                            "profile": profile,
+                        },
+                    ),
+                    timeout=60.0,
+                )
+                rp = response.payload
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"Sub-agent spawn failed: {rp['error']}",
+                        result_type="error",
+                    )
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Sub-agent '{rp.get('name', name)}' spawned successfully.\n"
+                        f"Session: {rp.get('sub_agent_id', 'unknown')}\n"
+                        f"Status: {rp.get('status', 'running')}\n"
+                        f"The sub-agent is working on: {purpose[:200]}"
+                    ),
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Sub-agent spawn timed out (60s)",
+                    result_type="error",
+                )
+
+        spawn_sub_agent_tool = Tool(
+            name="spawn_sub_agent",
+            description=(
+                "Spawn a sub-agent to work on a task in parallel. The sub-agent "
+                "runs in its own container and communicates results via a Matrix "
+                "thread. Use for delegating research, code review, or independent "
+                "tasks. Max 3 concurrent sub-agents."
+            ),
+            handler=_spawn_sub_agent_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short name for the sub-agent (e.g., 'researcher', 'reviewer')",
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "What the sub-agent should do — this becomes its initial prompt",
+                    },
+                    "has_network": {
+                        "type": "boolean",
+                        "description": "Whether the sub-agent gets network access (default: false)",
+                    },
+                    "has_workspace": {
+                        "type": "boolean",
+                        "description": "Whether the sub-agent gets access to the project workspace (default: false)",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "Container profile to use (default: 'light')",
+                    },
+                },
+                "required": ["name", "purpose"],
+            },
+        )
+        custom_tools.append(spawn_sub_agent_tool)
+
         # Try to resume the most recent session (preserves conversation history)
         infinite_sessions_config = {
             "enabled": True,
