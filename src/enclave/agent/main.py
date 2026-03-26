@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from enclave.agent.ipc_client import IPCClient
@@ -344,74 +345,20 @@ async def try_init_copilot(
 
         perm_handler = lambda _req, _meta: PermissionRequestResult(kind="approved")
 
-        # Build profile-aware system prompt
-        has_nix = os.environ.get("ENCLAVE_NIX_STORE", "1") == "1"
-        has_host_mounts = os.environ.get("ENCLAVE_HOST_MOUNTS", "1") == "1"
+        # Build profile-aware system prompt from external files
         profile_name = os.environ.get("ENCLAVE_PROFILE", "dev")
 
-        prompt_parts = [
-            "You are an AI assistant running inside an Enclave sandbox container. "
-            "You can help the user with coding, research, and system tasks. "
-            "File operations are limited to the /workspace directory.\n\n"
-            "IMPORTANT: When you create images or files that the user should see, "
-            "use the `send_file` tool to send them to the chat. The `view` tool "
-            "only lets YOU see the file — the user cannot see it unless you send it.\n",
-        ]
-
-        if has_nix:
-            prompt_parts.append(
-                "\nPACKAGE MANAGEMENT (NIX — MANDATORY): Nix is pre-installed in this container. "
-                "To use any package, run: `source /usr/local/bin/nix-env-setup.sh && "
-                "nix-shell -p <package> --run '<command>'`. For example: "
-                "`source /usr/local/bin/nix-env-setup.sh && nix-shell -p gcc --run 'gcc -o hello hello.c'`. "
-                "For an interactive shell with multiple packages: "
-                "`source /usr/local/bin/nix-env-setup.sh && nix-shell -p gcc python3 nodejs`. "
-                "The Nix store is shared across sessions — packages are cached after first download.\n"
-                "\n⚠️ CRITICAL RULES:\n"
-                "- ALWAYS use nix-shell for installing software. NEVER use apt, apt-get, or sudo apt.\n"
-                "- Do NOT request privilege escalation to install packages — use nix-shell instead.\n"
-                "- Host binaries at /host/usr/bin may have shared library mismatches and can fail. "
-                "If a host binary fails with missing .so errors, use nix-shell to get a working copy.\n"
-            )
-        else:
-            prompt_parts.append(
-                "\nPACKAGE MANAGEMENT: This is a lightweight container without Nix. "
-                "You can request package installation on the host via the `sudo` tool "
-                "(e.g., `sudo apt-get install -y <package>`). The user must approve "
-                "each request. For Python packages, use `pip install --user`.\n"
-            )
-
-        if has_host_mounts:
-            prompt_parts.append(
-                "\nHOST BINARIES: The host system's /usr/bin, /usr/lib, /usr/include, etc. "
-                "are mounted read-only at /host/usr/... and are in your PATH. Simple tools "
-                "(e.g., `figlet Hello`) usually work. However, complex binaries like compilers "
-                "may fail with missing shared library errors (e.g., libisl.so) due to glibc "
-                "version mismatches between host and container. If a host binary fails, "
-                "use `nix-shell -p <package>` to get a container-native version instead.\n"
-            )
-
-        prompt_parts.append(
-            "\nPRIVILEGE ESCALATION: You have a `sudo` tool that executes commands as root "
-            "on the HOST system. The user must approve each request via a poll in the chat. "
-            "Use it for package installation (apt), service management (systemctl), "
-            "system configuration, etc. Always provide a clear 'reason' so the user "
-            "knows why root is needed. Suggest a regex pattern via suggested_pattern "
-            "when the command category might be repeated.\n"
-        )
-
-        prompt_parts.append(
-            "\nDYNAMIC MOUNTS: You have a `request_mount` tool to mount host directories "
-            "into your container. Approved mounts appear at /workspace/<mount-name> "
-            "instantly. Use for accessing project code, data, or config on the host.\n"
-        )
-
-        prompt_parts.append(
-            "\nYou have internet access via slirp4netns networking."
-        )
+        prompt_dir = Path(__file__).parent / "prompts"
+        prompt_parts = []
+        for filename in ("base.md", f"{profile_name}.md"):
+            prompt_file = prompt_dir / filename
+            if prompt_file.exists():
+                prompt_parts.append(prompt_file.read_text())
+            else:
+                print(f"[agent] Warning: prompt file not found: {prompt_file}", file=sys.stderr)
 
         sys_msg = SystemMessageAppendConfig(
-            append="".join(prompt_parts)
+            append="\n\n".join(prompt_parts)
         )
 
         # Custom tool: send_file — sends a file to the user via Matrix

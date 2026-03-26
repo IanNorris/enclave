@@ -28,6 +28,7 @@ enclave = "enclave.orchestrator.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/enclave"]
+artifacts = ["src/enclave/agent/prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

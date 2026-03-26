@@ -59,7 +59,7 @@ class ContainerConfig:
     socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
     nix_store: str = str(Path.home() / ".local" / "share" / "enclave" / "nix")
     github_token: str = ""
-    # Named container profiles (e.g., "dev", "light")
+    # Named container profiles (e.g., "dev", "light", "host")
     profiles: dict[str, ContainerProfile] = field(default_factory=lambda: {
         "dev": ContainerProfile(
             image="enclave-agent:latest",
@@ -72,6 +72,12 @@ class ContainerConfig:
             nix_store=False,
             host_mounts=False,
             description="💬 General",
+        ),
+        "host": ContainerProfile(
+            image="",
+            nix_store=False,
+            host_mounts=False,
+            description="🖥️ Host (no container)",
         ),
     })
     default_profile: str = "dev"
