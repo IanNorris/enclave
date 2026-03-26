@@ -32,6 +32,7 @@ from enclave.orchestrator.permissions import (
     RequestStatus,
 )
 from enclave.orchestrator.priv_client import PrivBrokerClient
+from enclave.orchestrator.scheduler import Scheduler, ScheduleEntry, TimerEntry
 
 log = get_logger("router")
 
@@ -130,6 +131,17 @@ class MessageRouter:
 
         self._priv_client = PrivBrokerClient(socket_path=priv_broker_socket)
 
+        # Scheduler for cron jobs and timers
+        scheduler_dir = os.path.join(
+            data_dir or os.path.expanduser("~/.local/share/enclave"),
+            "scheduler",
+        )
+        self._scheduler = Scheduler(
+            data_dir=scheduler_dir,
+            on_schedule_fire=self._on_schedule_fire,
+            on_timer_fire=self._on_timer_fire,
+        )
+
         # Track workspaces that have shared mount propagation set up
         self._propagation_ready: set[str] = set()
 
@@ -158,6 +170,9 @@ class MessageRouter:
         # Start periodic health check
         self._health_task = asyncio.create_task(self._health_check_loop())
 
+        # Start scheduler
+        await self._scheduler.start()
+
         log.info("Router started")
 
     async def stop(self) -> None:
@@ -168,6 +183,7 @@ class MessageRouter:
                 await self._health_task
             except asyncio.CancelledError:
                 pass
+        await self._scheduler.stop()
         await self._priv_client.disconnect()
         self._perm_db.close()
         log.info("Router stopped")
@@ -492,6 +508,14 @@ class MessageRouter:
             return await self._handle_file_send(session, msg)
         elif msg.type == MessageType.DOWNLOAD_REQUEST:
             return await self._handle_download_request(session, msg)
+        elif msg.type == MessageType.SCHEDULE_SET:
+            await self._handle_schedule_set(session, msg)
+        elif msg.type == MessageType.SCHEDULE_CANCEL:
+            await self._handle_schedule_cancel(session, msg)
+        elif msg.type == MessageType.TIMER_SET:
+            await self._handle_timer_set(session, msg)
+        elif msg.type == MessageType.TIMER_CANCEL:
+            await self._handle_timer_cancel(session, msg)
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -1573,6 +1597,145 @@ class MessageRouter:
                 f"failed to start: {error}\n"
                 f"Session ID: `{session.id}`"
             )
+
+    # ------------------------------------------------------------------
+    # Scheduler IPC handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_schedule_set(self, session: Session, msg: Message) -> None:
+        """Handle a SCHEDULE_SET request from an agent."""
+        interval = msg.payload.get("interval_seconds", 0)
+        reason = msg.payload.get("reason", "")
+        schedule_id = msg.payload.get("id", f"sched-{session.id}-{int(time.time())}")
+
+        result = self._scheduler.add_schedule(
+            schedule_id=schedule_id,
+            session_id=session.id,
+            interval_seconds=interval,
+            reason=reason,
+        )
+
+        if isinstance(result, str):
+            # Error
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.SCHEDULE_TRIGGER,
+                payload={"error": result, "id": schedule_id},
+                reply_to=msg.id,
+            ))
+        else:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.SCHEDULE_TRIGGER,
+                payload={
+                    "ok": True,
+                    "id": schedule_id,
+                    "next_fire": result.next_fire,
+                },
+                reply_to=msg.id,
+            ))
+
+    async def _handle_schedule_cancel(self, session: Session, msg: Message) -> None:
+        """Handle a SCHEDULE_CANCEL request from an agent."""
+        schedule_id = msg.payload.get("id", "")
+        found = self._scheduler.cancel_schedule(schedule_id)
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.SCHEDULE_TRIGGER,
+            payload={"ok": found, "id": schedule_id, "cancelled": True},
+            reply_to=msg.id,
+        ))
+
+    async def _handle_timer_set(self, session: Session, msg: Message) -> None:
+        """Handle a TIMER_SET request from an agent."""
+        fire_at = msg.payload.get("fire_at", 0)
+        delay_seconds = msg.payload.get("delay_seconds", 0)
+        reason = msg.payload.get("reason", "")
+        timer_id = msg.payload.get("id", f"timer-{session.id}-{int(time.time())}")
+
+        # Support both absolute time and relative delay
+        if delay_seconds > 0 and not fire_at:
+            fire_at = time.time() + delay_seconds
+
+        result = self._scheduler.add_timer(
+            timer_id=timer_id,
+            session_id=session.id,
+            fire_at=fire_at,
+            reason=reason,
+        )
+
+        if isinstance(result, str):
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.TIMER_TRIGGER,
+                payload={"error": result, "id": timer_id},
+                reply_to=msg.id,
+            ))
+        else:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.TIMER_TRIGGER,
+                payload={
+                    "ok": True,
+                    "id": timer_id,
+                    "fire_at": result.fire_at,
+                },
+                reply_to=msg.id,
+            ))
+
+    async def _handle_timer_cancel(self, session: Session, msg: Message) -> None:
+        """Handle a TIMER_CANCEL request from an agent."""
+        timer_id = msg.payload.get("id", "")
+        found = self._scheduler.cancel_timer(timer_id)
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.TIMER_TRIGGER,
+            payload={"ok": found, "id": timer_id, "cancelled": True},
+            reply_to=msg.id,
+        ))
+
+    async def _on_schedule_fire(
+        self, session_id: str, entry: ScheduleEntry,
+    ) -> None:
+        """Called when a recurring schedule fires — send message to agent."""
+        if not self.ipc.is_connected(session_id):
+            log.info("Schedule %s: session %s not connected, skipping", entry.id, session_id)
+            return
+        await self.ipc.send_to(session_id, Message(
+            type=MessageType.SCHEDULE_TRIGGER,
+            payload={
+                "id": entry.id,
+                "reason": entry.reason,
+                "fired": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        ))
+
+    async def _on_timer_fire(
+        self, session_id: str, entry: TimerEntry,
+    ) -> None:
+        """Called when a one-shot timer fires — send message to agent."""
+        session = self.containers.get_session(session_id)
+        if not session:
+            log.info("Timer %s: session %s gone, skipping", entry.id, session_id)
+            return
+
+        # If agent not connected, try to restore the session first
+        if not self.ipc.is_connected(session_id):
+            log.info("Timer %s: session %s not connected, restoring...", entry.id, session_id)
+            await self._restore_session(session, session.room_id)
+            # Wait a bit for the agent to connect
+            for _ in range(30):
+                await asyncio.sleep(1)
+                if self.ipc.is_connected(session_id):
+                    break
+            else:
+                log.warning("Timer %s: session %s failed to restore", entry.id, session_id)
+                return
+
+        await self.ipc.send_to(session_id, Message(
+            type=MessageType.TIMER_TRIGGER,
+            payload={
+                "id": entry.id,
+                "reason": entry.reason,
+                "fired": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        ))
 
     async def _cmd_sessions(self) -> None:
         """Handle the sessions command — list active sessions."""

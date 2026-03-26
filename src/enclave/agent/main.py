@@ -792,6 +792,179 @@ async def try_init_copilot(
         )
         custom_tools.append(mount_tool)
 
+        # Custom tool: schedule_cron — register a recurring callback
+        async def _schedule_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            interval_hours = args.get("interval_hours", 0)
+            reason = args.get("reason", "")
+            schedule_id = args.get("id", "")
+            if not reason:
+                return ToolResult(
+                    text_result_for_llm="Error: 'reason' parameter is required",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                payload: dict[str, Any] = {
+                    "interval_seconds": int(interval_hours * 3600),
+                    "reason": reason,
+                }
+                if schedule_id:
+                    payload["id"] = schedule_id
+                response = await ipc.request(
+                    Message(type=MessageType.SCHEDULE_SET, payload=payload),
+                    timeout=10.0,
+                )
+                rp = response.payload
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"Schedule error: {rp['error']}",
+                        result_type="error",
+                    )
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Schedule registered: {rp.get('id')}\n"
+                        f"Next fire: {rp.get('next_fire')}"
+                    ),
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Schedule request timed out",
+                    result_type="error",
+                )
+
+        schedule_tool = Tool(
+            name="schedule_cron",
+            description=(
+                "Register a recurring callback. You will receive a message at each interval. "
+                "Minimum interval is 1 hour. Use for periodic checks, monitoring, or reminders. "
+                "Example: schedule_cron(interval_hours=2, reason='Check build status')"
+            ),
+            handler=_schedule_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "interval_hours": {
+                        "type": "number",
+                        "description": "Interval between callbacks in hours (minimum 1)",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "What to do when the schedule fires (you'll see this as a message)",
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Optional ID for the schedule (for cancellation)",
+                    },
+                },
+                "required": ["interval_hours", "reason"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(schedule_tool)
+
+        # Custom tool: set_timer — one-shot wake-up
+        async def _timer_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            delay_hours = args.get("delay_hours", 0)
+            at_time = args.get("at_time", "")
+            reason = args.get("reason", "")
+            timer_id = args.get("id", "")
+            if not reason:
+                return ToolResult(
+                    text_result_for_llm="Error: 'reason' parameter is required",
+                    result_type="error",
+                )
+            if not delay_hours and not at_time:
+                return ToolResult(
+                    text_result_for_llm="Error: provide either 'delay_hours' or 'at_time'",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                payload: dict[str, Any] = {"reason": reason}
+                if timer_id:
+                    payload["id"] = timer_id
+                if delay_hours:
+                    payload["delay_seconds"] = int(delay_hours * 3600)
+                elif at_time:
+                    # Parse ISO 8601 timestamp
+                    from datetime import datetime as _dt, timezone as _tz
+                    try:
+                        dt = _dt.fromisoformat(at_time)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=_tz.utc)
+                        payload["fire_at"] = dt.timestamp()
+                    except ValueError:
+                        return ToolResult(
+                            text_result_for_llm=f"Invalid time format: {at_time}. Use ISO 8601.",
+                            result_type="error",
+                        )
+                response = await ipc.request(
+                    Message(type=MessageType.TIMER_SET, payload=payload),
+                    timeout=10.0,
+                )
+                rp = response.payload
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"Timer error: {rp['error']}",
+                        result_type="error",
+                    )
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Timer set: {rp.get('id')}\n"
+                        f"Will fire at: {rp.get('fire_at')}"
+                    ),
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Timer request timed out",
+                    result_type="error",
+                )
+
+        timer_tool = Tool(
+            name="set_timer",
+            description=(
+                "Set a one-shot timer to wake you up. The container will be restarted if needed. "
+                "Specify either delay_hours (relative) or at_time (absolute ISO 8601 UTC). "
+                "Example: set_timer(delay_hours=1, reason='Check if deploy completed') "
+                "Example: set_timer(at_time='2025-01-15T14:00:00Z', reason='Send daily summary')"
+            ),
+            handler=_timer_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "delay_hours": {
+                        "type": "number",
+                        "description": "Hours from now to fire (e.g., 1.5 for 90 minutes)",
+                    },
+                    "at_time": {
+                        "type": "string",
+                        "description": "Absolute UTC time in ISO 8601 format",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "What to do when the timer fires (you'll see this as a message)",
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Optional ID for the timer (for cancellation)",
+                    },
+                },
+                "required": ["reason"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(timer_tool)
+
         # Try to resume the most recent session (preserves conversation history)
         infinite_sessions_config = {
             "enabled": True,
@@ -891,12 +1064,30 @@ async def main() -> None:
         await handle_user_message(ipc, sdk_session, msg, loop, listener_ctl)
         return None
 
+    async def on_scheduled_trigger(msg: Message) -> Message | None:
+        """Handle scheduled callback — forward to SDK as a system message."""
+        reason = msg.payload.get("reason", "Scheduled callback")
+        sched_id = msg.payload.get("id", "unknown")
+        ts = msg.payload.get("timestamp", "")
+        content = (
+            f"<current_datetime>{ts}</current_datetime>\n\n"
+            f"[Scheduled callback: {sched_id}] {reason}"
+        )
+        synth = Message(
+            type=MessageType.USER_MESSAGE,
+            payload={"content": content, "sender": "scheduler", "timestamp": ts},
+        )
+        await handle_user_message(ipc, sdk_session, synth, loop, listener_ctl)
+        return None
+
     async def on_shutdown(msg: Message) -> Message | None:
         print("[agent] Shutdown requested", file=sys.stderr)
         await ipc.disconnect()
         return None
 
     ipc.on_message(MessageType.USER_MESSAGE, on_user_message)
+    ipc.on_message(MessageType.SCHEDULE_TRIGGER, on_scheduled_trigger)
+    ipc.on_message(MessageType.TIMER_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.SHUTDOWN, on_shutdown)
 
     print("[agent] Ready and listening", file=sys.stderr)
