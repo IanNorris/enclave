@@ -110,6 +110,18 @@ class FakeMatrix:
     async def end_poll(self, room_id, poll_event_id):
         return "$fake-end-poll"
 
+    async def kick_user(self, room_id, user_id, reason=""):
+        return True
+
+    async def leave_room(self, room_id):
+        return True
+
+    async def forget_room(self, room_id):
+        return True
+
+    async def cleanup_room(self, room_id, user_ids=None, reason=""):
+        return True
+
 
 class FakeIPC:
     """Fake IPC server that records calls."""
@@ -1197,3 +1209,71 @@ class TestSubAgentRequest:
         ]
         assert len(user_msgs) == 1
         assert "Fix the login bug" in user_msgs[0][1].payload.get("content", "")
+
+
+# ------------------------------------------------------------------
+# Tests: Cleanup command
+# ------------------------------------------------------------------
+
+
+class TestCleanupCommand:
+    """Test the cleanup command for room management."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_no_stopped_sessions(self, started_router):
+        """Cleanup with no stopped sessions reports nothing."""
+        router, matrix, ipc, containers = started_router
+        await router._on_matrix_message(
+            CONTROL_ROOM, "@ian:test", "cleanup", {}, [],
+        )
+        msgs = [m for m in matrix.sent_messages if "No stopped" in m.get("body", "")]
+        assert len(msgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_cleanup_lists_stopped(self, started_router):
+        """Cleanup without args lists stopped sessions."""
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "MyProject", "!room:test", status="stopped")
+        await router._on_matrix_message(
+            CONTROL_ROOM, "@ian:test", "cleanup", {}, [],
+        )
+        msgs = [m for m in matrix.sent_messages if "s1" in m.get("body", "")]
+        assert len(msgs) >= 1
+
+    @pytest.mark.asyncio
+    async def test_cleanup_specific_session(self, started_router):
+        """Cleanup a specific stopped session."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "MyProject", "!room:test", status="stopped")
+        await router._on_matrix_message(
+            CONTROL_ROOM, "@ian:test", "cleanup s1", {}, [],
+        )
+        msgs = [m for m in matrix.sent_messages if "Cleaned up" in m.get("body", "")]
+        assert len(msgs) == 1
+        assert containers.get_session("s1") is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_rejects_running(self, started_router):
+        """Cannot cleanup a running session."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "MyProject", "!room:test", status="running")
+        await router._on_matrix_message(
+            CONTROL_ROOM, "@ian:test", "cleanup s1", {}, [],
+        )
+        msgs = [m for m in matrix.sent_messages if "still running" in m.get("body", "")]
+        assert len(msgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_cleanup_all(self, started_router):
+        """Cleanup all stopped sessions."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Project1", "!room1:test", status="stopped")
+        containers.add_test_session("s2", "Project2", "!room2:test", status="stopped")
+        containers.add_test_session("s3", "Running", "!room3:test", status="running")
+        await router._on_matrix_message(
+            CONTROL_ROOM, "@ian:test", "cleanup all", {}, [],
+        )
+        msgs = [m for m in matrix.sent_messages if "Cleaned up 2/2" in m.get("body", "")]
+        assert len(msgs) == 1
+        # Running session should still exist
+        assert containers.get_session("s3") is not None
