@@ -179,15 +179,15 @@ class ContainerManager:
                  session_id, name, resolved_profile, profile_obj.image)
         return session
 
-    async def start_session(self, session_id: str) -> bool:
+    async def start_session(self, session_id: str) -> tuple[bool, str]:
         """Start the podman container for a session.
 
-        Returns True on success, False on failure.
+        Returns (success, error_detail) tuple.
         """
         session = self._sessions.get(session_id)
         if session is None:
             log.error("Session not found: %s", session_id)
-            return False
+            return False, "Session not found"
 
         # Clean up any leftover container with the same name
         log.info("[start:%s] Cleaning up old container...", session_id)
@@ -318,19 +318,20 @@ class ContainerManager:
                     session_id,
                     container_id[:12],
                 )
-                return True
+                return True, ""
             else:
                 session.status = "stopped"
+                stderr = result.stderr.strip()
                 log.error(
                     "[start:%s] Container start failed: %s",
                     session_id,
-                    result.stderr,
+                    stderr,
                 )
-                return False
+                return False, _classify_container_error(stderr, image)
         except Exception as e:
             session.status = "stopped"
             log.error("[start:%s] Exception starting container: %s", session_id, e)
-            return False
+            return False, f"Exception: {e}"
 
     async def stop_session(self, session_id: str) -> bool:
         """Stop and remove a session's container.
@@ -447,3 +448,20 @@ def _slugify(name: str) -> str:
         .replace(".", "-")
         .strip("-")[:32]
     )
+
+
+def _classify_container_error(stderr: str, image: str) -> str:
+    """Turn raw podman stderr into a human-friendly error message."""
+    lower = stderr.lower()
+    if "did not resolve to an alias" in lower or "image not known" in lower:
+        return f"Container image `{image}` not found. Has it been built?"
+    if "address already in use" in lower:
+        return "Port conflict — another container may already be using it."
+    if "no space left on device" in lower:
+        return "Disk full — not enough space to start the container."
+    if "permission denied" in lower:
+        return "Permission denied — check podman rootless setup."
+    if "timeout" in lower:
+        return "Container start timed out."
+    # Fall back to the raw error, trimmed
+    return stderr[:200]

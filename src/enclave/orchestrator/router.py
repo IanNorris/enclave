@@ -1306,12 +1306,12 @@ class MessageRouter:
             # Set up shared propagation before starting container
             await self._ensure_propagation(session)
 
-            started = await self.containers.start_session(session.id)
+            started, error = await self.containers.start_session(session.id)
             if started:
                 log.info("Session restored: %s", session.id)
             else:
                 await self.matrix.send_message(
-                    room_id, "❌ Failed to restore session."
+                    room_id, f"❌ Failed to start container: {error}"
                 )
         finally:
             self._restoring.discard(session.id)
@@ -1545,7 +1545,7 @@ class MessageRouter:
         log.info("[project:%s] Mount propagation done", project_name)
 
         log.info("[project:%s] Starting container...", project_name)
-        started = await self.containers.start_session(session.id)
+        started, error = await self.containers.start_session(session.id)
         log.info("[project:%s] Container start result: %s", project_name, started)
 
         # Mark room as awaiting user join — messages will be queued
@@ -1567,7 +1567,8 @@ class MessageRouter:
         else:
             await self._reply_control(
                 f"⚠️ Room created for **{project_name}** but container "
-                f"failed to start.\nSession ID: `{session.id}`"
+                f"failed to start: {error}\n"
+                f"Session ID: `{session.id}`"
             )
 
     async def _cmd_sessions(self) -> None:
