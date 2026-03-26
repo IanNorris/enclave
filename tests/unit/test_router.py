@@ -256,6 +256,14 @@ class FakeContainers:
         """Fake health check — returns empty (no crashes)."""
         return []
 
+    def sessions_needing_restore(self) -> list[Session]:
+        """List sessions that need auto-restore."""
+        return [s for s in self.sessions.values() if s.status == "was_running"]
+
+    def _save_sessions(self) -> None:
+        """Fake save — no-op."""
+        pass
+
 
 CONTROL_ROOM = "!control:test"
 
@@ -1277,3 +1285,81 @@ class TestCleanupCommand:
         assert len(msgs) == 1
         # Running session should still exist
         assert containers.get_session("s3") is not None
+
+
+# ------------------------------------------------------------------
+# Tests: Auto-restore on startup
+# ------------------------------------------------------------------
+
+
+class TestAutoRestore:
+    """Test session auto-restore on startup/reboot."""
+
+    @pytest.mark.asyncio
+    async def test_no_sessions_to_restore(self, router_parts):
+        """Start with no was_running sessions does nothing."""
+        router, matrix, ipc, containers = router_parts
+        await router.start()
+        # Should see "online" message but no restore messages
+        msgs = [m for m in matrix.sent_messages if "Restoring" in m.get("body", "")]
+        assert len(msgs) == 0
+
+    @pytest.mark.asyncio
+    async def test_auto_restore_was_running(self, router_parts):
+        """Sessions marked 'was_running' are auto-restored on startup."""
+        router, matrix, ipc, containers = router_parts
+        containers.add_test_session("s1", "MyProject", "!room:test", status="was_running")
+        containers.add_test_session("s2", "Stopped", "!room2:test", status="stopped")
+
+        await router.start()
+
+        # s1 should be restored (started)
+        s1 = containers.get_session("s1")
+        assert s1.status == "running"
+
+        # s2 should remain stopped
+        s2 = containers.get_session("s2")
+        assert s2.status == "stopped"
+
+        # Should see restore message in s1's room
+        restore_msgs = [
+            m for m in matrix.sent_messages
+            if m.get("room_id") == "!room:test" and "restored" in m.get("body", "").lower()
+        ]
+        assert len(restore_msgs) >= 1
+
+    @pytest.mark.asyncio
+    async def test_auto_restore_multiple(self, router_parts):
+        """Multiple was_running sessions all get restored."""
+        router, matrix, ipc, containers = router_parts
+        containers.add_test_session("s1", "P1", "!r1:test", status="was_running")
+        containers.add_test_session("s2", "P2", "!r2:test", status="was_running")
+        containers.add_test_session("s3", "P3", "!r3:test", status="was_running")
+
+        await router.start()
+
+        for sid in ("s1", "s2", "s3"):
+            assert containers.get_session(sid).status == "running"
+
+        # Control room should get summary
+        summary_msgs = [
+            m for m in matrix.sent_messages
+            if "Restored 3/3" in m.get("body", "")
+        ]
+        assert len(summary_msgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_auto_restore_failure(self, router_parts):
+        """Failed restores are counted and reported."""
+        router, matrix, ipc, containers = router_parts
+        containers.add_test_session("s1", "P1", "!r1:test", status="was_running")
+        containers._start_result = False
+
+        await router.start()
+
+        # Should report failure
+        fail_msgs = [
+            m for m in matrix.sent_messages
+            if "1 failed" in m.get("body", "")
+        ]
+        assert len(fail_msgs) == 1
