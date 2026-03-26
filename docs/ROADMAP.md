@@ -354,6 +354,104 @@ the dashboard is for operations.
 inotify-based watcher that alerts agents when files in mounted
 directories change. Enables reactive workflows.
 
+### Specialized Sub-Agent Containers
+
+**Priority:** High | **Effort:** High
+
+Enable agents to spawn isolated child containers for specific tasks.
+Infrastructure exists (SubAgentManager, thread tracking, SDK events)
+but the agent-facing request mechanism isn't wired up.
+
+**What exists:**
+- `SubAgentManager` class in `sub_agents.py` — spawns containers,
+  tracks parent-child relationships, manages threads
+- SDK `SUBAGENT_STARTED`/`COMPLETED` events flow through IPC
+- Thread routing: sub-agent activity posts to its own Matrix thread
+- `_subagent_threads` tracking in router
+
+**What's missing:**
+- `SUB_AGENT_REQUEST` handler in router (defined, not dispatched)
+- Agent tool to request sub-agent spawn with parameters
+- Specialized container profiles (network-only, workspace-isolated)
+
+**First use case: Web Research Agent**
+- Network access, no workspace mount
+- Can only produce a single markdown file as output
+- Parent agent consumes the result after completion
+- Result is scanned for prompt injection by a second specialized
+  agent before being passed to the parent
+- Container profile: `research` with `has_network=true`,
+  `has_workspace=false`, restricted output
+
+**Prompt injection scanner:**
+- Separate lightweight container or inline LLM call
+- Scans sub-agent output for hidden instructions, encoded payloads,
+  social engineering attempts
+- Flags suspicious content for human review before passing to parent
+- Defence-in-depth: even if the research agent is compromised by a
+  malicious website, the injection can't reach the parent agent
+
+**Architecture:**
+```
+Parent Agent
+    │
+    ├──► Research Agent (network, no workspace)
+    │         │
+    │         └── markdown result
+    │                │
+    │         Injection Scanner
+    │                │
+    │         ◄── clean result
+    │
+    └── continues with verified data
+```
+
+### Nix Packaging
+
+**Priority:** High | **Effort:** Medium
+
+Package Enclave for Nix users. Enables declarative installation,
+reproducible builds, and integration with NixOS/home-manager.
+
+**Phase 1: Personal flake (dev)**
+- `flake.nix` at repo root
+- `buildPythonApplication` for the orchestrator
+- Dev shell with all dependencies (`nix develop`)
+- Overlay for easy pinning from external flakes
+- Install: `nix profile install github:IanNorris/enclave`
+
+**Phase 2: NixOS module**
+- Declarative systemd service (`services.enclave.enable = true`)
+- Configuration via Nix attributes → generates enclave.yaml
+- Automatic user/group creation, state directory setup
+- Podman integration (ensures podman is available)
+- Example:
+  ```nix
+  services.enclave = {
+    enable = true;
+    matrix.homeserver = "https://matrix.example.com";
+    matrix.userId = "@bot:example.com";
+    memory.autoMemory = true;
+    idleTimeout = 7200;
+  };
+  ```
+
+**Phase 3: Container images via Nix**
+- Build agent container images with `pkgs.dockerTools.buildImage`
+- Reproducible, layered, minimal images
+- No Dockerfile needed — Nix handles dependency resolution
+- Publish to a container registry or build locally
+
+**Phase 4: Home-manager module**
+- User-level installation without root
+- `systemd.user.services.enclave` integration
+- Personal config in `~/.config/enclave/`
+
+**Approach for now:**
+Start with Phase 1 — a `flake.nix` that you can reference from
+your system config. The orchestrator, container images, and systemd
+unit are all buildable from the flake.
+
 ### Audit Log
 
 **Priority:** Medium | **Effort:** Low
