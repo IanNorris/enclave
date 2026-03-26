@@ -40,7 +40,7 @@ class ContainerProfile:
 
     image: str = "enclave-agent:latest"
     nix_store: bool = True
-    host_mounts: bool = True
+    host_mounts: bool = False
     description: str = ""
 
 
@@ -64,7 +64,7 @@ class ContainerConfig:
         "dev": ContainerProfile(
             image="enclave-agent:latest",
             nix_store=True,
-            host_mounts=True,
+            host_mounts=False,
             description="🛠️ Native App Development",
         ),
         "light": ContainerProfile(
