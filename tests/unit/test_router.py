@@ -190,7 +190,8 @@ class FakeContainers:
         return [s for s in self.sessions.values() if s.status == "running"]
 
     async def create_session(
-        self, name: str, room_id: str, socket_path: str, profile: str = ""
+        self, name: str, room_id: str, socket_path: str, profile: str = "",
+        user_display_name: str = "", user_pronouns: str = "",
     ) -> Session:
         resolved_profile = profile or self.config.default_profile
         profile_obj = self.config.get_profile(resolved_profile)
@@ -201,15 +202,17 @@ class FakeContainers:
             socket_path=socket_path,
             profile=resolved_profile,
             image=profile_obj.image,
+            user_display_name=user_display_name,
+            user_pronouns=user_pronouns,
         )
         self.sessions[session.id] = session
         return session
 
-    async def start_session(self, session_id: str) -> bool:
+    async def start_session(self, session_id: str) -> tuple[bool, str]:
         s = self.sessions.get(session_id)
         if s and self._start_result:
             s.status = "running"
-        return self._start_result
+        return self._start_result, "" if self._start_result else "test error"
 
     async def stop_session(self, session_id: str) -> bool:
         s = self.sessions.get(session_id)
@@ -449,6 +452,10 @@ class TestProjectRouting:
         assert sid == "s1"
         assert msg.type == MessageType.USER_MESSAGE
         assert msg.payload["content"] == "Hello agent"
+        assert "timestamp" in msg.payload
+        # Timestamp should be a valid ISO 8601 UTC string
+        ts = msg.payload["timestamp"]
+        assert ts.endswith("+00:00") or ts.endswith("Z") or "T" in ts
 
     @pytest.mark.asyncio
     async def test_message_no_session_ignored(self, started_router):

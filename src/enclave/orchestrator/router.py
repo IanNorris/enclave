@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from enclave.common.config import UserMapping
@@ -431,6 +432,7 @@ class MessageRouter:
                 "room_id": room_id,
                 "thread_id": thread_id,
                 "attachments": attachments or [],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
 
@@ -761,6 +763,7 @@ class MessageRouter:
                         "room_id": queued["room_id"],
                         "thread_id": queued.get("thread_id"),
                         "attachments": queued.get("attachments") or [],
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
                 )
                 sent = await self.ipc.send_to(session.id, flush_msg)
