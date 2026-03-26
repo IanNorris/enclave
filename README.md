@@ -1,8 +1,14 @@
-# Enclave
+<p align="center">
+  <img src="assets/logo.png" alt="Enclave" width="200">
+</p>
 
+<h1 align="center">Enclave</h1>
+
+<p align="center">
 AI agent instances running on Linux, controlled via Matrix/Element, powered by
 the GitHub Copilot SDK. Each agent is sandboxed in a podman container with
 explicitly approved permissions.
+</p>
 
 ## Architecture
 
@@ -51,6 +57,21 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 - **Rust** — privilege broker
 - **Conduit** — Matrix homeserver
 - **systemd** — service management
+- **Nix** — reproducible builds and dev environment
+
+## Quick Start (Nix)
+
+```bash
+# Development shell with all dependencies
+nix develop github:icstatic/enclave
+
+# Or clone and develop locally
+git clone https://github.com/icstatic/enclave.git
+cd enclave
+nix develop
+pip install --user github-copilot-sdk 'matrix-nio[e2ee]'
+python3 -m pytest tests/unit/
+```
 
 ## License
 
