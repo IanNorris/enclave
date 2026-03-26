@@ -195,10 +195,17 @@ class MessageRouter:
         # Start scheduler
         await self._scheduler.start()
 
+        # Auto-restore sessions that were running before last shutdown
+        await self._auto_restore_sessions()
+
         log.info("Router started")
 
     async def stop(self) -> None:
-        """Clean up."""
+        """Clean up — save session state for restore on next start."""
+        # Save current session state so we know what was running
+        self.containers._save_sessions()
+        log.info("Session state saved for restore")
+
         if hasattr(self, "_health_task") and not self._health_task.done():
             self._health_task.cancel()
             try:
@@ -209,6 +216,65 @@ class MessageRouter:
         await self._priv_client.disconnect()
         self._perm_db.close()
         log.info("Router stopped")
+
+    async def _auto_restore_sessions(self) -> None:
+        """Restore sessions that were running before last shutdown/reboot.
+
+        Called during startup. Walks through all sessions marked
+        "was_running" and restarts their containers.
+        """
+        to_restore = self.containers.sessions_needing_restore()
+        if not to_restore:
+            log.info("No sessions to auto-restore")
+            return
+
+        log.info("Auto-restoring %d sessions from previous run", len(to_restore))
+        await self._reply_control(
+            f"🔄 Restoring {len(to_restore)} sessions from before shutdown..."
+        )
+
+        restored = 0
+        failed = 0
+        for session in to_restore:
+            try:
+                log.info("Auto-restoring session %s (%s)", session.id, session.name)
+
+                # Mark as stopped first so _restore_session can work
+                session.status = "stopped"
+
+                # Create IPC socket
+                socket_path = await self.ipc.create_socket(session.id)
+                session.socket_path = str(socket_path)
+
+                # Set up shared propagation
+                await self._ensure_propagation(session)
+
+                # Start the container
+                started, error = await self.containers.start_session(session.id)
+                if started:
+                    restored += 1
+                    log.info("Auto-restored session %s", session.id)
+                    await self.matrix.send_message(
+                        session.room_id,
+                        "🔄 Session restored after system restart.",
+                    )
+                else:
+                    failed += 1
+                    session.status = "stopped"
+                    log.warning(
+                        "Failed to auto-restore session %s: %s",
+                        session.id, error,
+                    )
+            except Exception as e:
+                failed += 1
+                session.status = "stopped"
+                log.error("Exception restoring session %s: %s", session.id, e)
+
+        summary = f"✅ Restored {restored}/{len(to_restore)} sessions"
+        if failed:
+            summary += f" ({failed} failed)"
+        await self._reply_control(summary)
+        log.info(summary)
 
     # ------------------------------------------------------------------
     # Periodic health monitoring
@@ -258,6 +324,9 @@ class MessageRouter:
                 # Check for idle sessions (no activity within timeout)
                 if self._idle_timeout > 0:
                     await self._check_idle_sessions()
+
+                # Periodically persist session state (crash recovery)
+                self.containers._save_sessions()
             except asyncio.CancelledError:
                 return
             except Exception as e:

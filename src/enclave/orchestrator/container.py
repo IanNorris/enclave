@@ -63,6 +63,9 @@ class ContainerManager:
         try:
             data = json.loads(self._sessions_file.read_text())
             for s in data:
+                # Preserve the status that was saved — "was_running" means
+                # it was running when we last saved state (e.g., before reboot)
+                saved_status = s.get("status", "stopped")
                 session = Session(
                     id=s["id"],
                     name=s["name"],
@@ -70,9 +73,11 @@ class ContainerManager:
                     workspace_path=s.get("workspace_path", ""),
                     socket_path=s.get("socket_path", ""),
                     created_at=s.get("created_at", ""),
-                    status="stopped",  # assume stopped on load
+                    status="was_running" if saved_status == "running" else "stopped",
                     profile=s.get("profile", ""),
                     image=s.get("image", ""),
+                    user_display_name=s.get("user_display_name", ""),
+                    user_pronouns=s.get("user_pronouns", ""),
                 )
                 self._sessions[session.id] = session
             log.info("Loaded %d persisted sessions", len(self._sessions))
@@ -90,8 +95,11 @@ class ContainerManager:
                 "workspace_path": s.workspace_path,
                 "socket_path": s.socket_path,
                 "created_at": s.created_at,
+                "status": s.status,
                 "profile": s.profile,
                 "image": s.image,
+                "user_display_name": s.user_display_name,
+                "user_pronouns": s.user_pronouns,
             })
         try:
             self._sessions_file.write_text(json.dumps(data, indent=2))
@@ -123,6 +131,10 @@ class ContainerManager:
     def active_sessions(self) -> list[Session]:
         """List running sessions."""
         return [s for s in self._sessions.values() if s.status == "running"]
+
+    def sessions_needing_restore(self) -> list[Session]:
+        """List sessions that were running before last shutdown."""
+        return [s for s in self._sessions.values() if s.status == "was_running"]
 
     async def create_session(
         self,

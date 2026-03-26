@@ -1,5 +1,6 @@
 """Tests for container manager."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -171,3 +172,101 @@ class TestCheckHealth:
         assert len(crashed) == 1
         assert crashed[0].id == "s1"
         assert manager._sessions["s1"].status == "stopped"
+
+
+class TestSessionPersistence:
+    """Test session save/load with status preservation."""
+
+    @pytest.fixture
+    def manager_with_dir(self, tmp_path):
+        """Container manager with writable session dir."""
+        config = ContainerConfig()
+        config.session_base = str(tmp_path / "sessions")
+        config.workspace_base = str(tmp_path / "workspaces")
+        Path(config.session_base).mkdir(parents=True)
+        Path(config.workspace_base).mkdir(parents=True)
+        return ContainerManager(config=config)
+
+    @pytest.mark.asyncio
+    async def test_save_preserves_status(self, manager_with_dir):
+        """Running sessions save their status."""
+        mgr = manager_with_dir
+        s = await mgr.create_session("test", "!room:test", "/tmp/sock")
+        s.status = "running"
+        mgr._save_sessions()
+
+        data = json.loads(Path(mgr._sessions_file).read_text())
+        assert data[0]["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_save_preserves_user_identity(self, manager_with_dir):
+        """User display name and pronouns are persisted."""
+        mgr = manager_with_dir
+        s = await mgr.create_session(
+            "test", "!room:test", "/tmp/sock",
+            user_display_name="Ian",
+            user_pronouns="he/him",
+        )
+        mgr._save_sessions()
+
+        data = json.loads(Path(mgr._sessions_file).read_text())
+        assert data[0]["user_display_name"] == "Ian"
+        assert data[0]["user_pronouns"] == "he/him"
+
+    @pytest.mark.asyncio
+    async def test_load_running_becomes_was_running(self, manager_with_dir):
+        """Saved 'running' sessions load as 'was_running'."""
+        mgr = manager_with_dir
+        s = await mgr.create_session("test", "!room:test", "/tmp/sock")
+        s.status = "running"
+        mgr._save_sessions()
+
+        # Create new manager to reload
+        mgr2 = ContainerManager(config=mgr.config)
+        sessions = mgr2.list_sessions()
+        assert len(sessions) == 1
+        assert sessions[0].status == "was_running"
+
+    @pytest.mark.asyncio
+    async def test_load_stopped_stays_stopped(self, manager_with_dir):
+        """Saved 'stopped' sessions load as 'stopped'."""
+        mgr = manager_with_dir
+        s = await mgr.create_session("test", "!room:test", "/tmp/sock")
+        s.status = "stopped"
+        mgr._save_sessions()
+
+        mgr2 = ContainerManager(config=mgr.config)
+        sessions = mgr2.list_sessions()
+        assert len(sessions) == 1
+        assert sessions[0].status == "stopped"
+
+    @pytest.mark.asyncio
+    async def test_sessions_needing_restore(self, manager_with_dir):
+        """sessions_needing_restore returns only was_running sessions."""
+        mgr = manager_with_dir
+        s1 = await mgr.create_session("p1", "!r1:test", "/tmp/sock1")
+        s1.status = "running"
+        s2 = await mgr.create_session("p2", "!r2:test", "/tmp/sock2")
+        s2.status = "stopped"
+        mgr._save_sessions()
+
+        mgr2 = ContainerManager(config=mgr.config)
+        need_restore = mgr2.sessions_needing_restore()
+        assert len(need_restore) == 1
+        assert "p1" in need_restore[0].id
+
+    @pytest.mark.asyncio
+    async def test_load_preserves_user_identity(self, manager_with_dir):
+        """User identity survives save/load cycle."""
+        mgr = manager_with_dir
+        s = await mgr.create_session(
+            "test", "!room:test", "/tmp/sock",
+            user_display_name="Ian",
+            user_pronouns="he/him",
+        )
+        mgr._save_sessions()
+
+        mgr2 = ContainerManager(config=mgr.config)
+        loaded = mgr2.list_sessions()[0]
+        assert loaded.user_display_name == "Ian"
+        assert loaded.user_pronouns == "he/him"
