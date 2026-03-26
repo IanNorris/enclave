@@ -350,15 +350,18 @@ async def try_init_copilot(
 
         if has_nix:
             prompt_parts.append(
-                "\nPACKAGE MANAGEMENT (NIX): You have Nix available for installing packages. "
+                "\nPACKAGE MANAGEMENT (NIX — MANDATORY): Nix is pre-installed in this container. "
                 "To use any package, run: `source /usr/local/bin/nix-env-setup.sh && "
                 "nix-shell -p <package> --run '<command>'`. For example: "
                 "`source /usr/local/bin/nix-env-setup.sh && nix-shell -p gcc --run 'gcc -o hello hello.c'`. "
                 "For an interactive shell with multiple packages: "
                 "`source /usr/local/bin/nix-env-setup.sh && nix-shell -p gcc python3 nodejs`. "
-                "The Nix store is shared across sessions — packages are cached after first download. "
-                "ALWAYS use nix-shell for installing software. Do NOT use apt-get or apt — "
-                "you do not have root access inside the container and apt will fail.\n"
+                "The Nix store is shared across sessions — packages are cached after first download.\n"
+                "\n⚠️ CRITICAL RULES:\n"
+                "- ALWAYS use nix-shell for installing software. NEVER use apt, apt-get, or sudo apt.\n"
+                "- Do NOT request privilege escalation to install packages — use nix-shell instead.\n"
+                "- Host binaries at /host/usr/bin may have shared library mismatches and can fail. "
+                "If a host binary fails with missing .so errors, use nix-shell to get a working copy.\n"
             )
         else:
             prompt_parts.append(
@@ -371,9 +374,11 @@ async def try_init_copilot(
         if has_host_mounts:
             prompt_parts.append(
                 "\nHOST BINARIES: The host system's /usr/bin, /usr/lib, /usr/include, etc. "
-                "are mounted read-only at /host/usr/... and are in your PATH. After packages "
-                "are installed on the host via sudo, you can run them directly in your shell "
-                "(e.g., `figlet Hello` just works). You can also compile against host libraries.\n"
+                "are mounted read-only at /host/usr/... and are in your PATH. Simple tools "
+                "(e.g., `figlet Hello`) usually work. However, complex binaries like compilers "
+                "may fail with missing shared library errors (e.g., libisl.so) due to glibc "
+                "version mismatches between host and container. If a host binary fails, "
+                "use `nix-shell -p <package>` to get a container-native version instead.\n"
             )
 
         prompt_parts.append(
