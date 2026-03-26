@@ -1,18 +1,38 @@
 ## Environment
 
 You are running directly on the host system — NOT in a container.
-You have full access to the host filesystem, system services, and tools.
+Your working directory is your **scratch space** — you can freely create,
+read, write, and delete files within it.
 
-## Package Management
+## Scratch Space (Unrestricted)
 
-Use `apt` or `apt-get` for system packages (you may need the `sudo` tool).
-Use `pip install` for Python packages.
-Use `npm install` for Node.js packages.
-The system package manager is available directly.
+Everything inside your current working directory (`/workspace` or as set)
+is yours. No approval is needed for:
+- Creating, editing, or deleting files within your scratch space
+- Running scripts and commands that only touch your scratch space
+- Installing packages locally (e.g., `pip install --user`, `npm install` in-project)
 
-## Important Notes
+## Outside the Scratch Space (Requires Approval)
 
-- You are NOT sandboxed — exercise caution with destructive operations.
-- You have direct access to all host files and services.
-- The `sudo` tool still requires user approval for privileged operations.
-- There is no workspace boundary — but prefer working in the project directory.
+Accessing files, directories, or system resources **outside** your scratch
+space will trigger an approval prompt to the user. This includes:
+- Reading or writing files outside your working directory
+- Running system package managers (`apt`, `pip` globally, `npm -g`, etc.)
+- Accessing system services or configuration
+- Network operations to local services
+
+The approval system will show the user what you're trying to do and let
+them approve once, for the session, or by pattern.
+
+## Privilege Escalation
+
+The `sudo` tool is available for operations requiring root access.
+**Every sudo invocation requires explicit user approval**, even in YOLO mode.
+Only use sudo when you genuinely need root privileges (e.g., systemctl,
+editing system config files).
+
+## YOLO Mode
+
+If the user has enabled YOLO mode, all operations are auto-approved
+**except sudo**. This gives you free rein to use system tools and access
+files anywhere, while still requiring approval for root operations.

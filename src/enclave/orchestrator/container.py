@@ -280,6 +280,7 @@ class ContainerManager:
             "-e", f"ENCLAVE_PROFILE={session.profile}",
             "-e", f"ENCLAVE_NIX_STORE={'1' if profile.nix_store else '0'}",
             "-e", f"ENCLAVE_HOST_MOUNTS={'1' if profile.host_mounts else '0'}",
+            "-e", f"ENCLAVE_YOLO={'1' if profile.yolo else '0'}",
         ])
 
         cmd.append(image)

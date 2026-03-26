@@ -292,6 +292,116 @@ async def handle_user_message(
         ))
 
 
+# ---------------------------------------------------------------------------
+# Host-mode permission screening helpers
+# ---------------------------------------------------------------------------
+
+# System tools that require approval when running on the host (non-YOLO).
+_RESTRICTED_COMMANDS = {
+    # System package managers
+    "apt", "apt-get", "dpkg", "pacman", "dnf", "yum", "zypper", "brew",
+    "snap", "flatpak", "nix-env",
+    # Global package installs
+    "pip", "pip3", "npm", "yarn", "pnpm", "gem", "cargo", "go",
+    # Service management
+    "systemctl", "service", "journalctl",
+    # System modification
+    "mount", "umount", "fdisk", "mkfs", "modprobe",
+    "useradd", "usermod", "groupadd", "chown", "chmod",
+    # Dangerous
+    "dd", "rm",
+}
+
+
+def _is_restricted_command(cmd_text: str) -> bool:
+    """Check if a shell command invokes a restricted system tool."""
+    import shlex
+    # Handle pipes/chains — check each segment
+    for segment in cmd_text.replace("&&", ";").replace("||", ";").split(";"):
+        segment = segment.strip()
+        if segment.startswith("|"):
+            segment = segment.lstrip("| ")
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        if not tokens:
+            continue
+        # Skip env vars (KEY=val cmd ...) and sudo/env wrappers
+        cmd = tokens[0]
+        for t in tokens:
+            if "=" not in t:
+                cmd = t
+                break
+        base = os.path.basename(cmd)
+        if base in _RESTRICTED_COMMANDS:
+            return True
+        # pip install --user is fine; global pip install is not
+        # but we screen pip anyway — user can approve
+    return False
+
+
+def _is_in_scratch(path: str, scratch: str) -> bool:
+    """Return True if *path* is inside the scratch (working) directory."""
+    if not path:
+        return True  # empty path = relative = in scratch
+    try:
+        resolved = os.path.realpath(path)
+        scratch_resolved = os.path.realpath(scratch)
+        return resolved == scratch_resolved or resolved.startswith(scratch_resolved + os.sep)
+    except (OSError, ValueError):
+        return False
+
+
+def _request_permission_sync(
+    ipc: "IPCClient | None",
+    perm_type: str,
+    target: str,
+    reason: str,
+) -> "PermissionRequestResult":
+    """Send a permission request to the orchestrator and wait for approval.
+
+    The SDK supports async permission handlers (returning Awaitable), so
+    this actually returns a coroutine despite the name.  Kept as a regular
+    function that returns an awaitable for compatibility.
+    """
+    from copilot import PermissionRequestResult
+
+    if not ipc or not ipc.is_connected:
+        return PermissionRequestResult(
+            kind="denied-by-rules",
+            message="Cannot reach orchestrator for approval",
+        )
+
+    async def _ask() -> PermissionRequestResult:
+        try:
+            response = await ipc.request(
+                Message(
+                    type=MessageType.PERMISSION_REQUEST,
+                    payload={
+                        "perm_type": perm_type,
+                        "target": target,
+                        "reason": reason,
+                    },
+                ),
+                timeout=360.0,
+            )
+            if response.payload.get("approved", False):
+                return PermissionRequestResult(kind="approved")
+            return PermissionRequestResult(
+                kind="denied-interactively-by-user",
+                message=f"User denied access to: {target}",
+            )
+        except Exception as exc:
+            print(f"[agent] Permission request failed: {exc}", file=sys.stderr)
+            return PermissionRequestResult(
+                kind="denied-by-rules",
+                message=f"Permission request failed: {exc}",
+            )
+
+    return _ask()  # Returns a coroutine (Awaitable) — SDK will await it
+
+
 async def try_init_copilot(
     working_directory: str = "/workspace",
     ipc: IPCClient | None = None,
@@ -343,10 +453,63 @@ async def try_init_copilot(
             await client.stop()
             return None
 
-        perm_handler = lambda _req, _meta: PermissionRequestResult(kind="approved")
-
         # Build profile-aware system prompt from external files
         profile_name = os.environ.get("ENCLAVE_PROFILE", "dev")
+        is_host = profile_name == "host"
+        is_yolo = os.environ.get("ENCLAVE_YOLO") == "1"
+
+        # Permission handler: screens SDK tool requests for host profile
+        def perm_handler(_req: object, _meta: object) -> PermissionRequestResult:
+            # Containers are already sandboxed — auto-approve everything
+            if not is_host:
+                return PermissionRequestResult(kind="approved")
+
+            # YOLO mode: auto-approve all SDK tools (sudo still goes through
+            # its own IPC approval flow since it's a custom tool)
+            if is_yolo:
+                return PermissionRequestResult(kind="approved")
+
+            # Host mode (non-YOLO): screen for restricted operations
+            kind = getattr(_req, "kind", "")
+
+            if kind == "shell":
+                cmd_text = getattr(_req, "full_command_text", "") or ""
+                # Check if the command uses restricted system tools
+                if _is_restricted_command(cmd_text):
+                    reason = getattr(_req, "intention", "") or f"Run: {cmd_text[:100]}"
+                    return _request_permission_sync(
+                        ipc, "command", cmd_text, reason,
+                    )
+                # Check if the command touches paths outside the scratch space
+                paths = getattr(_req, "possible_paths", []) or []
+                outside = [p for p in paths if not _is_in_scratch(p, working_directory)]
+                if outside:
+                    reason = getattr(_req, "intention", "") or f"Access: {', '.join(outside[:3])}"
+                    return _request_permission_sync(
+                        ipc, "filesystem", outside[0], reason,
+                    )
+                return PermissionRequestResult(kind="approved")
+
+            if kind == "read":
+                path = getattr(_req, "path", "") or ""
+                if not _is_in_scratch(path, working_directory):
+                    reason = getattr(_req, "intention", "") or f"Read: {path}"
+                    return _request_permission_sync(
+                        ipc, "filesystem", path, reason,
+                    )
+                return PermissionRequestResult(kind="approved")
+
+            if kind == "write":
+                path = getattr(_req, "file_name", "") or ""
+                if not _is_in_scratch(path, working_directory):
+                    reason = getattr(_req, "intention", "") or f"Write: {path}"
+                    return _request_permission_sync(
+                        ipc, "filesystem", path, reason,
+                    )
+                return PermissionRequestResult(kind="approved")
+
+            # url, mcp, memory, hook, custom-tool — auto-approve
+            return PermissionRequestResult(kind="approved")
 
         prompt_dir = Path(__file__).parent / "prompts"
         prompt_parts = []
