@@ -932,6 +932,26 @@ class MessageRouter:
             session.id, full_cmd, reason,
         )
 
+        # Fast reject if privilege broker is not available (user has no sudo)
+        if not self._priv_client.is_connected:
+            if not await self._priv_client.connect():
+                log.info("Auto-rejecting privilege request — no priv broker")
+                response = Message(
+                    type=MessageType.PRIVILEGE_RESPONSE,
+                    payload={
+                        "approved": False,
+                        "command": command,
+                        "error": (
+                            "Sudo is not available — the host user does not have "
+                            "privilege escalation configured. The privilege broker "
+                            "is not running."
+                        ),
+                    },
+                    reply_to=msg.id,
+                )
+                await self.ipc.send_to(session.id, response)
+                return
+
         # Ask for approval via poll in the project room
         status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,

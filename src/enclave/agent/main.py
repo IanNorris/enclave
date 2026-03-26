@@ -457,6 +457,7 @@ async def try_init_copilot(
         profile_name = os.environ.get("ENCLAVE_PROFILE", "dev")
         is_host = profile_name == "host"
         is_yolo = os.environ.get("ENCLAVE_YOLO") == "1"
+        print(f"[agent] Profile: {profile_name} (host={is_host}, yolo={is_yolo})", file=sys.stderr)
 
         # Permission handler: screens SDK tool requests for host profile
         def perm_handler(_req: object, _meta: object) -> PermissionRequestResult:
@@ -516,12 +517,14 @@ async def try_init_copilot(
         for filename in ("base.md", f"{profile_name}.md"):
             prompt_file = prompt_dir / filename
             if prompt_file.exists():
-                prompt_parts.append(prompt_file.read_text())
+                text = prompt_file.read_text()
+                prompt_parts.append(text)
+                print(f"[agent] Loaded prompt: {filename} ({len(text)} bytes)", file=sys.stderr)
             else:
                 print(f"[agent] Warning: prompt file not found: {prompt_file}", file=sys.stderr)
 
         sys_msg = SystemMessageAppendConfig(
-            append="\n\n".join(prompt_parts)
+            content="\n\n".join(prompt_parts)
         )
 
         # Custom tool: send_file — sends a file to the user via Matrix
@@ -817,8 +820,8 @@ async def main() -> None:
     session_id = os.environ.get("SESSION_ID", "unknown")
     session_name = os.environ.get("SESSION_NAME", "unknown")
 
-    print(f"[agent] Starting agent: {session_name} ({session_id})")
-    print(f"[agent] Socket: {socket_path}")
+    print(f"[agent] Starting agent: {session_name} ({session_id})", file=sys.stderr)
+    print(f"[agent] Socket: {socket_path}", file=sys.stderr)
 
     loop = asyncio.get_running_loop()
 
@@ -832,30 +835,30 @@ async def main() -> None:
             break
         except (FileNotFoundError, ConnectionRefusedError):
             retries += 1
-            print(f"[agent] Waiting for socket... ({retries}/10)")
+            print(f"[agent] Waiting for socket... ({retries}/10)", file=sys.stderr)
             await asyncio.sleep(1)
     else:
         print("[agent] Failed to connect to orchestrator", file=sys.stderr)
         sys.exit(1)
 
-    print("[agent] Connected to orchestrator")
+    print("[agent] Connected to orchestrator", file=sys.stderr)
 
     # Try to init Copilot SDK
     sdk_result = await try_init_copilot(ipc=ipc)
     listener_ctl = None
     if sdk_result:
         sdk_client, sdk_session = sdk_result
-        print("[agent] Copilot SDK initialized")
+        print("[agent] Copilot SDK initialized", file=sys.stderr)
         # Register persistent event listener (handles background agents too)
         try:
             listener_ctl = setup_session_listener(ipc, sdk_session, loop)
-            print("[agent] Persistent event listener registered")
+            print("[agent] Persistent event listener registered", file=sys.stderr)
         except ImportError:
-            print("[agent] SessionEventType not available, running in echo mode")
+            print("[agent] SessionEventType not available, running in echo mode", file=sys.stderr)
             sdk_client, sdk_session = None, None
     else:
         sdk_client, sdk_session = None, None
-        print("[agent] Running in echo mode (no Copilot SDK)")
+        print("[agent] Running in echo mode (no Copilot SDK)", file=sys.stderr)
 
     # Send ready status
     await ipc.send(Message(
@@ -873,14 +876,14 @@ async def main() -> None:
         return None
 
     async def on_shutdown(msg: Message) -> Message | None:
-        print("[agent] Shutdown requested")
+        print("[agent] Shutdown requested", file=sys.stderr)
         await ipc.disconnect()
         return None
 
     ipc.on_message(MessageType.USER_MESSAGE, on_user_message)
     ipc.on_message(MessageType.SHUTDOWN, on_shutdown)
 
-    print("[agent] Ready and listening")
+    print("[agent] Ready and listening", file=sys.stderr)
 
     # Keep alive until disconnected
     try:
@@ -907,8 +910,11 @@ async def main() -> None:
             pass
 
     await ipc.disconnect()
-    print("[agent] Shut down")
+    print("[agent] Shut down", file=sys.stderr)
 
 
 if __name__ == "__main__":
+    # Ensure stdout/stderr are unbuffered so logs appear in podman logs
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     asyncio.run(main())
