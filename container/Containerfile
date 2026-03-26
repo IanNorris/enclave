@@ -74,5 +74,12 @@ RUN pip install --no-cache-dir /build && rm -rf /build
 
 WORKDIR /workspace
 
-# Agent entry point
-CMD ["python3", "-m", "enclave.agent.main"]
+# Entrypoint: install Nix on first run (if profile uses it), then start agent
+RUN printf '#!/bin/bash\n\
+if [ "${ENCLAVE_NIX_STORE:-0}" = "1" ]; then\n\
+  source /usr/local/bin/nix-env-setup.sh\n\
+fi\n\
+exec python3 -m enclave.agent.main "$@"\n\
+' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
