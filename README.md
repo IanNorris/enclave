@@ -47,6 +47,24 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 - **Scheduling** — cron-like recurring callbacks and one-shot timers
 - **Session persistence** — conversation history survives container restarts
 - **User identity** — agents know your name and pronouns
+- **Memory** — persistent cross-session memory with auto-dreaming
+- **Sub-agents** — spawn child agents for parallel tasks
+- **Display/UI** — launch GUI apps, capture screenshots on Wayland
+- **Landlock** — kernel-level filesystem sandboxing
+- **Management TUI** — `enclavectl` CLI + interactive terminal dashboard
+- **Room cleanup** — clean up Matrix rooms for stopped sessions
+
+### Management CLI
+
+<p align="center">
+  <img src="assets/screenshot-cli.png" alt="enclavectl status" width="700">
+</p>
+
+### Interactive TUI
+
+<p align="center">
+  <img src="assets/screenshot-tui.png" alt="enclavectl tui" width="700">
+</p>
 
 ## Tech Stack
 
