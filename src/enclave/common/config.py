@@ -128,15 +128,26 @@ class PrivBrokerConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """Cross-session memory settings."""
+
+    auto_memory: bool = False       # Enable memory persistence
+    auto_dreaming: bool = False     # Enable automatic context scanning
+    key_memory_limit: int = 200     # Max lines of key memories in system prompt
+
+
+@dataclass
 class EnclaveConfig:
     """Top-level Enclave configuration."""
 
     matrix: MatrixConfig = field(default_factory=MatrixConfig)
     container: ContainerConfig = field(default_factory=ContainerConfig)
     priv_broker: PrivBrokerConfig = field(default_factory=PrivBrokerConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     users: list[UserMapping] = field(default_factory=list)
     log_level: str = "INFO"
     data_dir: str = str(Path.home() / ".local" / "share" / "enclave")
+    idle_timeout: int = 7200  # seconds (2h) — stop idle sessions
 
     def get_user_mapping(self, matrix_id: str) -> UserMapping | None:
         """Look up the Linux user mapping for a Matrix user."""
@@ -264,8 +275,17 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
         if "users" in data:
             config.users = [_parse_user_mapping(u) for u in data["users"]]
 
+        if "memory" in data:
+            mem = data["memory"]
+            config.memory = MemoryConfig(
+                auto_memory=mem.get("auto_memory", config.memory.auto_memory),
+                auto_dreaming=mem.get("auto_dreaming", config.memory.auto_dreaming),
+                key_memory_limit=mem.get("key_memory_limit", config.memory.key_memory_limit),
+            )
+
         config.log_level = data.get("log_level", config.log_level)
         config.data_dir = data.get("data_dir", config.data_dir)
+        config.idle_timeout = data.get("idle_timeout", config.idle_timeout)
 
     _apply_env_overrides(config)
     return config

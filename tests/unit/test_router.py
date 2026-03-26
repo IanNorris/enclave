@@ -858,3 +858,205 @@ class TestDisplayHandlers:
         sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.SCREENSHOT_REQUEST]
         assert len(sent) == 1
         assert "failed" in sent[0][1].payload.get("error", "").lower()
+
+
+# ------------------------------------------------------------------
+# Tests: Idle Timeout
+# ------------------------------------------------------------------
+
+
+class TestIdleTimeout:
+    """Test idle session detection and shutdown."""
+
+    @pytest.mark.asyncio
+    async def test_touch_activity(self, started_router):
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        router._touch_activity("s1")
+        assert "s1" in router._last_activity
+
+    @pytest.mark.asyncio
+    async def test_idle_session_shutdown(self, started_router):
+        import time
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        router._idle_timeout = 10  # 10 seconds for test
+
+        # Set activity in the past
+        router._last_activity["s1"] = time.monotonic() - 20
+
+        # Mock no running processes
+        router._container_has_processes = AsyncMock(return_value=False)
+
+        await router._check_idle_sessions()
+
+        assert s.status == "stopped"
+        assert any("idle" in m["body"].lower() for m in matrix.sent_messages)
+
+    @pytest.mark.asyncio
+    async def test_busy_session_not_shutdown(self, started_router):
+        import time
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        router._idle_timeout = 10
+
+        router._last_activity["s1"] = time.monotonic() - 20
+        router._container_has_processes = AsyncMock(return_value=True)
+
+        await router._check_idle_sessions()
+
+        assert s.status == "running"
+
+    @pytest.mark.asyncio
+    async def test_active_session_not_shutdown(self, started_router):
+        import time
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        router._idle_timeout = 10
+
+        # Recent activity
+        router._last_activity["s1"] = time.monotonic()
+        router._container_has_processes = AsyncMock(return_value=False)
+
+        await router._check_idle_sessions()
+
+        assert s.status == "running"
+
+    @pytest.mark.asyncio
+    async def test_in_turn_session_not_shutdown(self, started_router):
+        import time
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        router._idle_timeout = 10
+
+        router._last_activity["s1"] = time.monotonic() - 20
+        router._turn_start_time["s1"] = time.monotonic()  # Active turn
+
+        await router._check_idle_sessions()
+
+        assert s.status == "running"
+
+    @pytest.mark.asyncio
+    async def test_disabled_idle_timeout(self, started_router):
+        import time
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        router._idle_timeout = 0  # Disabled
+
+        router._last_activity["s1"] = time.monotonic() - 999999
+
+        await router._check_idle_sessions()
+
+        assert s.status == "running"
+
+
+# ------------------------------------------------------------------
+# Tests: Memory IPC Handlers
+# ------------------------------------------------------------------
+
+
+class TestMemoryHandlers:
+    """Test memory store/query/delete IPC handlers."""
+
+    @pytest.mark.asyncio
+    async def test_memory_store(self, started_router, tmp_path):
+        from enclave.common.config import MemoryConfig
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        router._memory_config = MemoryConfig(auto_memory=True)
+        router._data_dir = str(tmp_path)
+        router._user_mappings = {"@ian:test": MagicMock(
+            allowed_rooms=["*"], matrix_id="@ian:test"
+        )}
+
+        msg = Message(
+            type=MessageType.MEMORY_STORE,
+            payload={"content": "User prefers Python", "category": "technical", "is_key": True},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.MEMORY_STORE]
+        assert len(sent) == 1
+        assert sent[0][1].payload.get("ok") is True
+        assert sent[0][1].payload["memory"]["content"] == "User prefers Python"
+
+    @pytest.mark.asyncio
+    async def test_memory_query(self, started_router, tmp_path):
+        from enclave.common.config import MemoryConfig
+        from enclave.orchestrator.memory import MemoryStore
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        router._memory_config = MemoryConfig(auto_memory=True)
+        router._data_dir = str(tmp_path)
+        router._user_mappings = {"@ian:test": MagicMock(
+            allowed_rooms=["*"], matrix_id="@ian:test"
+        )}
+
+        # Pre-populate store
+        store = router._get_memory_store("@ian:test")
+        store.store("User prefers Python", category="technical")
+        store.store("User likes cats", category="personal")
+
+        msg = Message(
+            type=MessageType.MEMORY_QUERY,
+            payload={"keyword": "Python"},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.MEMORY_QUERY]
+        assert len(sent) == 1
+        assert sent[0][1].payload.get("ok") is True
+        assert sent[0][1].payload["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_memory_disabled(self, started_router):
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        router._memory_config = None  # Disabled
+
+        msg = Message(
+            type=MessageType.MEMORY_STORE,
+            payload={"content": "test"},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.MEMORY_STORE]
+        assert len(sent) == 1
+        assert "not enabled" in sent[0][1].payload.get("error", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_memory_delete(self, started_router, tmp_path):
+        from enclave.common.config import MemoryConfig
+        router, matrix, ipc, containers = started_router
+        s = containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        router._memory_config = MemoryConfig(auto_memory=True)
+        router._data_dir = str(tmp_path)
+        router._user_mappings = {"@ian:test": MagicMock(
+            allowed_rooms=["*"], matrix_id="@ian:test"
+        )}
+
+        store = router._get_memory_store("@ian:test")
+        mem = store.store("to delete")
+
+        msg = Message(
+            type=MessageType.MEMORY_DELETE,
+            payload={"memory_id": mem.id},
+        )
+
+        await ipc.simulate_agent_message("s1", msg)
+
+        sent = [(sid, m) for sid, m in ipc.sent if m.type == MessageType.MEMORY_DELETE]
+        assert len(sent) == 1
+        assert sent[0][1].payload.get("ok") is True
+        assert store.count() == 0

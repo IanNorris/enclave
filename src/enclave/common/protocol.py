@@ -46,6 +46,13 @@ class MessageType(str, Enum):
     # Orchestrator → Agent (scheduled callbacks)
     SCHEDULE_TRIGGER = "schedule_trigger"
     TIMER_TRIGGER = "timer_trigger"
+    # Memory
+    MEMORY_STORE = "memory_store"
+    MEMORY_QUERY = "memory_query"
+    MEMORY_LIST = "memory_list"
+    MEMORY_DELETE = "memory_delete"
+    DREAM_REQUEST = "dream_request"
+    DREAM_COMPLETE = "dream_complete"
 
 
 @dataclass

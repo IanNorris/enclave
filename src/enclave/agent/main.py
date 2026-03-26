@@ -539,6 +539,14 @@ async def try_init_copilot(
             prompt_parts.insert(0, identity_line)
             print(f"[agent] User: {user_name} ({user_pronouns})", file=sys.stderr)
 
+        # Load key memories from workspace (written by orchestrator)
+        memories_path = Path(working_directory) / ".enclave-memories"
+        if memories_path.exists():
+            memories_text = memories_path.read_text().strip()
+            if memories_text:
+                prompt_parts.append(memories_text)
+                print(f"[agent] Loaded key memories ({len(memories_text)} chars)", file=sys.stderr)
+
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)
         )
@@ -1076,6 +1084,198 @@ async def try_init_copilot(
         )
         custom_tools.append(screenshot_tool)
 
+        # Custom tool: remember — store a memory for future sessions
+        async def _remember_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            content = args.get("content", "")
+            category = args.get("category", "other")
+            is_key = args.get("is_key", False)
+            if not content:
+                return ToolResult(
+                    text_result_for_llm="Error: 'content' parameter is required",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                response = await ipc.request(
+                    Message(
+                        type=MessageType.MEMORY_STORE,
+                        payload={"content": content, "category": category, "is_key": is_key},
+                    ),
+                    timeout=10.0,
+                )
+                rp = response.payload
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"Memory store failed: {rp['error']}",
+                        result_type="error",
+                    )
+                mem = rp.get("memory", {})
+                key_str = " (key memory)" if is_key else ""
+                return ToolResult(
+                    text_result_for_llm=f"Memory stored{key_str}: [{category}] {content[:80]}... (id: {mem.get('id', '?')})",
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Memory store timed out",
+                    result_type="error",
+                )
+
+        remember_tool = Tool(
+            name="remember",
+            description=(
+                "Store a memory that persists across sessions. Use for things worth "
+                "remembering: user preferences, coding style, personal facts, project "
+                "decisions. Key memories (is_key=true) are included in every future "
+                "session's context."
+            ),
+            handler=_remember_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The memory content (concise note)",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["personal", "technical", "project", "workflow", "debug", "other"],
+                        "description": "Memory category",
+                    },
+                    "is_key": {
+                        "type": "boolean",
+                        "description": "If true, included in every future session's system prompt",
+                    },
+                },
+                "required": ["content"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(remember_tool)
+
+        # Custom tool: recall — search memories from past sessions
+        async def _recall_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            keyword = args.get("keyword", "")
+            category = args.get("category", "")
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                response = await ipc.request(
+                    Message(
+                        type=MessageType.MEMORY_QUERY,
+                        payload={"keyword": keyword, "category": category},
+                    ),
+                    timeout=10.0,
+                )
+                rp = response.payload
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"Memory query failed: {rp['error']}",
+                        result_type="error",
+                    )
+                memories = rp.get("memories", [])
+                if not memories:
+                    return ToolResult(text_result_for_llm="No memories found.")
+                lines = []
+                for m in memories:
+                    key = "🔑" if m.get("is_key_memory") else ""
+                    lines.append(f"- [{m['category']}]{key} {m['content']} (id:{m['id']})")
+                return ToolResult(
+                    text_result_for_llm=f"Found {len(memories)} memories:\n" + "\n".join(lines),
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Memory query timed out",
+                    result_type="error",
+                )
+
+        recall_tool = Tool(
+            name="recall",
+            description=(
+                "Search your memories from past sessions. Use to look up user "
+                "preferences, past decisions, project knowledge, or anything "
+                "you've previously stored with 'remember'."
+            ),
+            handler=_recall_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "Search keyword (substring match on content)",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["personal", "technical", "project", "workflow", "debug", "other"],
+                        "description": "Filter by category",
+                    },
+                },
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(recall_tool)
+
+        # Custom tool: forget — delete a memory
+        async def _forget_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            memory_id = args.get("memory_id", "")
+            if not memory_id:
+                return ToolResult(
+                    text_result_for_llm="Error: 'memory_id' parameter is required",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            try:
+                response = await ipc.request(
+                    Message(
+                        type=MessageType.MEMORY_DELETE,
+                        payload={"memory_id": memory_id},
+                    ),
+                    timeout=10.0,
+                )
+                rp = response.payload
+                if rp.get("ok"):
+                    return ToolResult(text_result_for_llm=f"Memory {memory_id} deleted.")
+                return ToolResult(
+                    text_result_for_llm=f"Memory {memory_id} not found.",
+                    result_type="error",
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Memory delete timed out",
+                    result_type="error",
+                )
+
+        forget_tool = Tool(
+            name="forget",
+            description="Delete a memory by its ID. Use recall first to find the ID.",
+            handler=_forget_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": "The memory ID to delete",
+                    },
+                },
+                "required": ["memory_id"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(forget_tool)
+
         # Try to resume the most recent session (preserves conversation history)
         infinite_sessions_config = {
             "enabled": True,
@@ -1196,10 +1396,68 @@ async def main() -> None:
         await ipc.disconnect()
         return None
 
+    async def on_dream_request(msg: Message) -> Message | None:
+        """Auto-dreaming: extract noteworthy memories from context."""
+        print("[agent] Dream request received — extracting memories", file=sys.stderr)
+        reason = msg.payload.get("reason", "")
+
+        # Build a focused extraction prompt
+        dream_prompt = (
+            "Review the conversation so far and extract any noteworthy information "
+            "that should be remembered across sessions. Look for:\n"
+            "- Personal facts (name, family, preferences, timezone)\n"
+            "- Technical preferences (languages, frameworks, code style)\n"
+            "- Project knowledge (architecture, conventions, key decisions)\n"
+            "- Workflow patterns (how the user likes to work)\n"
+            "- Debugging insights (solutions to problems encountered)\n\n"
+            "Return a JSON array of objects, each with:\n"
+            '  {"content": "concise note", "category": "personal|technical|project|workflow|debug|other", "is_key": true/false}\n\n'
+            "Only include genuinely useful information. Key memories (is_key=true) "
+            "are loaded into every future session. Be selective.\n"
+            "If nothing noteworthy, return an empty array: []"
+        )
+
+        try:
+            # Use the SDK to extract memories from the current context
+            turn = sdk_session.send(
+                dream_prompt,
+                options={"model": "gpt-4o-mini"},  # use smaller model for extraction
+            )
+            response_text = ""
+            async for event in turn:
+                etype = str(getattr(event, "type", ""))
+                if "text_message_content" in etype:
+                    text = getattr(event, "text", "")
+                    if text:
+                        response_text = text
+
+            # Parse the JSON response
+            import json as _json
+            # Extract JSON from response (may have markdown code blocks)
+            cleaned = response_text.strip()
+            if cleaned.startswith("```"):
+                lines = cleaned.split("\n")
+                cleaned = "\n".join(lines[1:-1])
+            memories = _json.loads(cleaned)
+
+            if memories and isinstance(memories, list):
+                print(f"[agent] Auto-dreaming extracted {len(memories)} memories", file=sys.stderr)
+                await ipc.send(Message(
+                    type=MessageType.DREAM_COMPLETE,
+                    payload={"memories": memories},
+                ))
+            else:
+                print("[agent] Auto-dreaming: nothing noteworthy found", file=sys.stderr)
+        except Exception as e:
+            print(f"[agent] Auto-dreaming failed: {e}", file=sys.stderr)
+
+        return None
+
     ipc.on_message(MessageType.USER_MESSAGE, on_user_message)
     ipc.on_message(MessageType.SCHEDULE_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.TIMER_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.SHUTDOWN, on_shutdown)
+    ipc.on_message(MessageType.DREAM_REQUEST, on_dream_request)
 
     print("[agent] Ready and listening", file=sys.stderr)
 

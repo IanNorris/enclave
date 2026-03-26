@@ -62,6 +62,8 @@ async def run() -> None:
         data_dir=config.data_dir,
         priv_broker_socket=config.priv_broker.socket_path,
         approval_timeout=config.priv_broker.timeout,
+        idle_timeout=config.idle_timeout,
+        memory_config=config.memory,
     )
     await router.start()
 

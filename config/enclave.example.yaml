@@ -48,3 +48,14 @@ display:
   clipboard_tools:
     copy: wl-copy
     paste: wl-paste
+
+# Memory settings
+memory:
+  auto_memory: true        # Enable cross-session memory persistence
+  auto_dreaming: true      # Enable automatic context scanning
+  key_memory_limit: 200    # Max lines of key memories in system prompt
+
+# Idle timeout (seconds). Sessions with no activity and no running
+# processes are stopped after this duration. Default: 7200 (2 hours).
+# Set to 0 to disable.
+idle_timeout: 7200

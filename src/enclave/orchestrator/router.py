@@ -35,6 +35,7 @@ from enclave.orchestrator.permissions import (
 from enclave.orchestrator.priv_client import PrivBrokerClient
 from enclave.orchestrator.scheduler import Scheduler, ScheduleEntry, TimerEntry
 from enclave.orchestrator.display import DisplayManager
+from enclave.orchestrator.memory import MemoryStore
 
 log = get_logger("router")
 
@@ -66,6 +67,8 @@ class MessageRouter:
         data_dir: str = "",
         priv_broker_socket: str = "/run/enclave-priv/broker.sock",
         approval_timeout: float = 300.0,
+        idle_timeout: int = 7200,
+        memory_config: Any | None = None,
     ):
         self.matrix = matrix
         self.ipc = ipc
@@ -150,6 +153,15 @@ class MessageRouter:
         # Display manager for desktop interaction
         self._display = DisplayManager()
         self._display.detect_session()
+
+        # ── Idle timeout ──
+        self._last_activity: dict[str, float] = {}  # session_id → monotonic timestamp
+        self._idle_timeout = idle_timeout  # seconds, 0 = disabled
+
+        # ── Memory stores (per user) ──
+        self._memory_stores: dict[str, MemoryStore] = {}  # matrix_user_id → store
+        self._memory_config = memory_config
+        self._data_dir = data_dir or os.path.expanduser("~/.local/share/enclave")
 
     async def start(self) -> None:
         """Wire up all the event handlers."""
@@ -238,10 +250,123 @@ class MessageRouter:
                             )
                         # Remove so we don't spam the warning
                         self._turn_start_time.pop(sid, None)
+
+                # Check for idle sessions (no activity within timeout)
+                if self._idle_timeout > 0:
+                    await self._check_idle_sessions()
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 log.error("Health check error: %s", e)
+
+    def _touch_activity(self, session_id: str) -> None:
+        """Record that a session had activity (prevents idle shutdown)."""
+        self._last_activity[session_id] = time.monotonic()
+
+    async def _check_idle_sessions(self) -> None:
+        """Stop sessions that have been idle beyond the timeout.
+
+        A session is idle if:
+        - No user/agent messages within idle_timeout seconds
+        - Not currently in a turn (no active _turn_start_time)
+        - Container has no busy subprocesses (via podman top)
+        """
+        if self._idle_timeout <= 0:
+            return
+        now = time.monotonic()
+        for session in self.containers.active_sessions():
+            sid = session.id
+
+            # Skip sessions in active turns
+            if sid in self._turn_start_time:
+                continue
+
+            last = self._last_activity.get(sid)
+            if last is None:
+                # First check — set the timestamp and skip
+                self._last_activity[sid] = now
+                continue
+
+            elapsed = now - last
+            if elapsed < self._idle_timeout:
+                continue
+
+            # Check if the container has busy processes
+            if await self._container_has_processes(sid):
+                log.debug("Session %s idle but has running processes", sid)
+                continue
+
+            log.info(
+                "Session %s idle for %.0fs — shutting down", sid, elapsed
+            )
+
+            # Trigger auto-dreaming before shutdown if enabled
+            if self._memory_config and self._memory_config.auto_dreaming:
+                await self._trigger_dream_on_shutdown(session)
+
+            await self.matrix.send_message(
+                session.room_id,
+                "💤 Session idle — shutting down. Send a message to restart.",
+            )
+            await self.containers.stop_session(sid)
+            self._last_activity.pop(sid, None)
+
+    async def _container_has_processes(self, session_id: str) -> bool:
+        """Check if a container has non-trivial running processes."""
+        try:
+            result = await asyncio.create_subprocess_exec(
+                self.containers.config.runtime, "top", session_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(result.communicate(), timeout=5)
+            if result.returncode != 0:
+                return False
+            lines = stdout.decode().strip().split("\n")
+            # podman top output: header + one line per process
+            # If more than 2 processes (init + agent), something is running
+            return len(lines) > 3
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Memory store helpers
+    # ------------------------------------------------------------------
+
+    def _get_memory_store(self, matrix_user_id: str) -> MemoryStore | None:
+        """Get or create memory store for a user. Returns None if disabled."""
+        if not self._memory_config or not self._memory_config.auto_memory:
+            return None
+        if matrix_user_id not in self._memory_stores:
+            self._memory_stores[matrix_user_id] = MemoryStore(
+                self._data_dir, matrix_user_id
+            )
+        return self._memory_stores[matrix_user_id]
+
+    def _get_user_for_session(self, session: Any) -> str:
+        """Find the Matrix user ID that owns a session (by room mapping)."""
+        for uid, mapping in self._user_mappings.items():
+            # Check if this user's sessions include this room
+            if mapping.allowed_rooms == ["*"] or session.room_id in mapping.allowed_rooms:
+                return uid
+        # Fallback — return first user
+        if self._user_mappings:
+            return next(iter(self._user_mappings))
+        return ""
+
+    async def _trigger_dream_on_shutdown(self, session: Any) -> None:
+        """Send a dream request to the agent before shutdown."""
+        if not self.ipc.is_connected(session.id):
+            return
+        try:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.DREAM_REQUEST,
+                payload={"reason": "session_idle_shutdown"},
+            ))
+            # Give the agent a few seconds to extract and send memories
+            await asyncio.sleep(5)
+        except Exception as e:
+            log.warning("Dream trigger failed for %s: %s", session.id, e)
 
     def _is_user_allowed(self, sender: str) -> bool:
         """Check if a sender is allowed to use Enclave."""
@@ -459,6 +584,7 @@ class MessageRouter:
         )
 
         sent = await self.ipc.send_to(session.id, msg)
+        self._touch_activity(session.id)
         if not sent:
             await self.matrix.set_typing(room_id, False)
             if thinking_eid:
@@ -481,6 +607,9 @@ class MessageRouter:
         if session is None:
             log.warning("Message from unknown session: %s", session_id)
             return None
+
+        # Any IPC message counts as session activity
+        self._touch_activity(session_id)
 
         if msg.type == MessageType.AGENT_RESPONSE:
             await self._handle_agent_response(session, msg)
@@ -526,6 +655,16 @@ class MessageRouter:
             await self._handle_gui_launch(session, msg)
         elif msg.type == MessageType.SCREENSHOT_REQUEST:
             await self._handle_screenshot(session, msg)
+        elif msg.type == MessageType.MEMORY_STORE:
+            await self._handle_memory_store(session, msg)
+        elif msg.type == MessageType.MEMORY_QUERY:
+            await self._handle_memory_query(session, msg)
+        elif msg.type == MessageType.MEMORY_LIST:
+            await self._handle_memory_list(session, msg)
+        elif msg.type == MessageType.MEMORY_DELETE:
+            await self._handle_memory_delete(session, msg)
+        elif msg.type == MessageType.DREAM_COMPLETE:
+            await self._handle_dream_complete(session, msg)
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -1572,6 +1711,22 @@ class MessageRouter:
         )
         log.info("[project:%s] Session created: %s", project_name, session.id)
 
+        # Write key memories to workspace for agent to read
+        if sender:
+            store = self._get_memory_store(sender)
+            if store:
+                prompt = store.key_memories_as_prompt(
+                    max_lines=self._memory_config.key_memory_limit
+                    if self._memory_config else 200
+                )
+                if prompt:
+                    mem_path = Path(session.workspace_path) / ".enclave-memories"
+                    mem_path.write_text(prompt)
+                    log.info(
+                        "[project:%s] Wrote %d key memories to workspace",
+                        project_name, len(store.list_key_memories()),
+                    )
+
         await self.ipc.remove_socket(f"pending-{project_name}")
         socket_path = await self.ipc.create_socket(session.id)
         session.socket_path = str(socket_path)
@@ -1818,6 +1973,137 @@ class MessageRouter:
                 payload={"error": "Screenshot failed"},
                 reply_to=msg.id,
             ))
+
+    # ------------------------------------------------------------------
+    # Memory IPC handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_memory_store(self, session: Session, msg: Message) -> None:
+        """Store a memory from an agent."""
+        user_id = self._get_user_for_session(session)
+        store = self._get_memory_store(user_id)
+        if not store:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.MEMORY_STORE,
+                payload={"error": "Memory not enabled"},
+                reply_to=msg.id,
+            ))
+            return
+
+        content = msg.payload.get("content", "")
+        category = msg.payload.get("category", "other")
+        is_key = msg.payload.get("is_key", False)
+
+        if not content:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.MEMORY_STORE,
+                payload={"error": "Empty content"},
+                reply_to=msg.id,
+            ))
+            return
+
+        mem = store.store(
+            content=content,
+            category=category,
+            source_session=session.id,
+            is_key_memory=is_key,
+        )
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.MEMORY_STORE,
+            payload={"ok": True, "memory": mem.to_dict()},
+            reply_to=msg.id,
+        ))
+
+    async def _handle_memory_query(self, session: Session, msg: Message) -> None:
+        """Search memories for an agent."""
+        user_id = self._get_user_for_session(session)
+        store = self._get_memory_store(user_id)
+        if not store:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.MEMORY_QUERY,
+                payload={"error": "Memory not enabled"},
+                reply_to=msg.id,
+            ))
+            return
+
+        keyword = msg.payload.get("keyword", "")
+        category = msg.payload.get("category", "")
+        limit = msg.payload.get("limit", 20)
+
+        results = store.query(keyword=keyword, category=category, limit=limit)
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.MEMORY_QUERY,
+            payload={
+                "ok": True,
+                "memories": [m.to_dict() for m in results],
+                "count": len(results),
+            },
+            reply_to=msg.id,
+        ))
+
+    async def _handle_memory_list(self, session: Session, msg: Message) -> None:
+        """List key or recent memories."""
+        user_id = self._get_user_for_session(session)
+        store = self._get_memory_store(user_id)
+        if not store:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.MEMORY_LIST,
+                payload={"error": "Memory not enabled"},
+                reply_to=msg.id,
+            ))
+            return
+
+        mode = msg.payload.get("mode", "key")  # "key" or "recent"
+        if mode == "key":
+            results = store.list_key_memories()
+        else:
+            limit = msg.payload.get("limit", 20)
+            results = store.list_recent(limit=limit)
+
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.MEMORY_LIST,
+            payload={
+                "ok": True,
+                "memories": [m.to_dict() for m in results],
+                "count": len(results),
+            },
+            reply_to=msg.id,
+        ))
+
+    async def _handle_memory_delete(self, session: Session, msg: Message) -> None:
+        """Delete a memory."""
+        user_id = self._get_user_for_session(session)
+        store = self._get_memory_store(user_id)
+        if not store:
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.MEMORY_DELETE,
+                payload={"error": "Memory not enabled"},
+                reply_to=msg.id,
+            ))
+            return
+
+        memory_id = msg.payload.get("memory_id", "")
+        deleted = store.delete(memory_id)
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.MEMORY_DELETE,
+            payload={"ok": deleted, "memory_id": memory_id},
+            reply_to=msg.id,
+        ))
+
+    async def _handle_dream_complete(self, session: Session, msg: Message) -> None:
+        """Store memories extracted by auto-dreaming."""
+        user_id = self._get_user_for_session(session)
+        store = self._get_memory_store(user_id)
+        if not store:
+            return
+
+        extracted = msg.payload.get("memories", [])
+        if extracted:
+            stored = store.store_from_dreaming(extracted, source_session=session.id)
+            log.info(
+                "Dream complete for %s: %d new memories stored",
+                session.id, stored,
+            )
 
     async def _cmd_sessions(self) -> None:
         """Handle the sessions command — list active sessions."""
