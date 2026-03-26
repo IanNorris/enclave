@@ -123,14 +123,14 @@ Ranked by overall value:
 3. **Memory Containers** — Shared SQLite memory per user, cross-session
    learning, key memories in every system prompt, auto-dreaming.
    Inspired by Claude Code's memory model but container-aware.
-4. **Cost/Token Tracking** — Track LLM usage per session/project.
+4. **Management Dashboard** — Web UI with LDAP auth, live container
+   monitoring, disk usage, session management, Matrix room cleanup.
+5. **Cost/Token Tracking** — Track LLM usage per session/project.
    Set budgets and alerts.
-5. **Audit Log** — Structured log of all agent actions (commands run,
+6. **Audit Log** — Structured log of all agent actions (commands run,
    files modified, permissions granted) for security review.
-6. **Plugin System** — User-defined tools/extensions without modifying
+7. **Plugin System** — User-defined tools/extensions without modifying
    core code. Drop a Python file in a plugins dir.
-7. **Web Dashboard** — Simple web UI for session management, logs,
-   permissions — complement to Matrix.
 
 ---
 
@@ -257,6 +257,95 @@ but adapted for Enclave's multi-container architecture.
 - Auto-dreaming is transparent — no tool call needed
 
 **Categories:** personal, technical, project, workflow, debug, other
+
+### Management Dashboard
+
+**Priority:** High | **Effort:** High
+
+Web-based management UI for Enclave administrators. Provides real-time
+visibility into running agents, resource usage, and session lifecycle
+management. Complements Matrix chat — chat is for agent interaction,
+the dashboard is for operations.
+
+**Authentication — LDAP:**
+- Users login with their actual system username/password
+- LDAP bind against the host's LDAP/AD server (configurable)
+- Maps LDAP user → existing `UserMapping` in enclave config
+- Session cookies (JWT or signed cookie) with configurable expiry
+- Config:
+  ```yaml
+  dashboard:
+    enabled: true
+    bind: "0.0.0.0:8443"
+    tls_cert: "/etc/enclave/dashboard.crt"  # or auto-generate self-signed
+    tls_key: "/etc/enclave/dashboard.key"
+    auth:
+      method: "ldap"          # ldap | local | none
+      ldap_url: "ldap://localhost:389"
+      ldap_base_dn: "dc=example,dc=com"
+      ldap_user_filter: "(uid={username})"
+  ```
+- Fallback: `local` auth using PAM or config-file credentials
+- `none` for trusted networks (development only)
+
+**Dashboard Views:**
+
+1. **Sessions Overview** — All active/stopped sessions
+   - Status (running/stopped/crashed), profile, user, created_at
+   - Real-time resource usage: CPU%, memory, disk per container
+   - Quick actions: stop, restart, remove, view logs
+   - Data source: `ContainerManager.list_sessions()` +
+     `podman stats --no-stream --format json`
+
+2. **Session Detail** — Deep dive into one session
+   - Live container stats (top-like: CPU, memory, PID tree)
+   - Recent agent activity (last N messages/tool calls)
+   - Disk usage breakdown (workspace size, state dir, container layers)
+   - Permission history (grants, denials, pending)
+   - Logs tail (podman logs --follow, streamed via WebSocket)
+
+3. **System Overview** — Host-level health
+   - CPU, memory, disk, network utilisation
+   - Total containers, total disk, Enclave uptime
+   - Scheduler status (active crons, pending timers)
+
+4. **Matrix Room Cleanup** — Manage chat room lifecycle
+   - List all rooms the bot is in (via matrix-nio `joined_rooms`)
+   - Show which rooms have active sessions vs archived/stopped
+   - Bulk actions: leave room, archive (leave + mark in DB)
+   - Auto-archive policy: rooms for sessions stopped > N days
+   - Adds `room_leave()` wrapper to EnclaveMatrixClient
+   - Option to tombstone rooms (Matrix `m.room.tombstone` event)
+
+**Architecture:**
+
+```
+┌──────────┐    HTTPS    ┌──────────────┐
+│  Browser  │◄──────────►│  Dashboard   │
+│  (admin)  │            │  (FastAPI)   │
+└──────────┘    WSS      │              │
+     │       ◄──────────►│  WebSocket   │
+     │                   │  (live logs) │
+     │                   └──────┬───────┘
+     │                          │ internal API
+     │                   ┌──────▼───────┐
+     │                   │ Orchestrator  │
+     │                   │ (existing)    │
+     │                   └──────────────┘
+```
+
+- FastAPI app running as a separate thread/process in the orchestrator
+- Or standalone service sharing the same config + session store
+- WebSocket endpoint for live log streaming and stats updates
+- REST API: /api/sessions, /api/sessions/{id}/stats,
+  /api/sessions/{id}/logs, /api/system, /api/rooms
+- Frontend: lightweight (htmx + alpine.js or similar), no heavy SPA
+
+**Implementation phases:**
+1. REST API + LDAP auth (no frontend) — immediately useful for scripts
+2. Basic dashboard (sessions list, system overview)
+3. Live stats + log streaming via WebSocket
+4. Matrix room cleanup UI + auto-archive policy
 
 ### File Change Notifications
 
