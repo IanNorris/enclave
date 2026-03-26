@@ -240,8 +240,24 @@ def setup_session_listener(
             print(f"[agent] Session truncation: {data}", file=sys.stderr)
 
         else:
-            # Log unhandled events for diagnostics
-            if etype_str not in ("assistant.usage", "session.idle"):
+            # Forward usage/token events for cost tracking
+            if etype_str == "assistant.usage":
+                input_tokens = getattr(data, "input_tokens", 0) or getattr(data, "prompt_tokens", 0)
+                output_tokens = getattr(data, "output_tokens", 0) or getattr(data, "completion_tokens", 0)
+                total_tokens = getattr(data, "total_tokens", 0)
+                model = getattr(data, "model", "")
+                if input_tokens or output_tokens or total_tokens:
+                    _fire_and_forget(ipc.send(Message(
+                        type=MessageType.USAGE_REPORT,
+                        payload={
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": total_tokens,
+                            "model": model or "",
+                        },
+                    )))
+            elif etype_str not in ("session.idle",):
+                # Log truly unhandled events for diagnostics
                 print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
 
     def set_current_msg(msg_id: str | None) -> None:
@@ -1823,6 +1839,154 @@ async def try_init_copilot(
         )
         custom_tools.append(git_pr_tool)
 
+        # ── System Status Tool ──
+        async def _system_status_handler(params: dict) -> str:
+            """Gather host system information."""
+            import shutil
+            sections = []
+
+            # Uptime
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "uptime", "-p",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                sections.append(f"**Uptime:** {stdout.decode().strip()}")
+            except Exception:
+                sections.append("**Uptime:** unavailable")
+
+            # CPU info
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "nproc",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                cpus = stdout.decode().strip()
+
+                proc2 = await asyncio.create_subprocess_exec(
+                    "cat", "/proc/loadavg",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5)
+                load = stdout2.decode().strip().split()[:3]
+                sections.append(f"**CPU:** {cpus} cores, load avg: {' '.join(load)}")
+            except Exception:
+                sections.append("**CPU:** unavailable")
+
+            # Memory
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "free", "-h", "--si",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                lines = stdout.decode().strip().split("\n")
+                if len(lines) >= 2:
+                    parts = lines[1].split()
+                    if len(parts) >= 3:
+                        sections.append(f"**Memory:** {parts[2]} used / {parts[1]} total")
+            except Exception:
+                sections.append("**Memory:** unavailable")
+
+            # Disk
+            try:
+                total, used, free = shutil.disk_usage("/")
+                total_gb = total / (1024**3)
+                used_gb = used / (1024**3)
+                free_gb = free / (1024**3)
+                pct = (used / total) * 100
+                sections.append(
+                    f"**Disk (/):** {used_gb:.1f}G used / {total_gb:.1f}G total "
+                    f"({pct:.0f}%), {free_gb:.1f}G free"
+                )
+            except Exception:
+                sections.append("**Disk:** unavailable")
+
+            # Network (basic connectivity)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "hostname", "-I",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                ips = stdout.decode().strip().split()[:3]
+                sections.append(f"**Network:** {', '.join(ips)}")
+            except Exception:
+                sections.append("**Network:** unavailable")
+
+            # Pending system updates (if apt available)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "bash", "-c",
+                    "apt list --upgradable 2>/dev/null | grep -c upgradable || echo 0",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                count = stdout.decode().strip()
+                if count and count != "0":
+                    sections.append(f"**Updates:** {count} packages upgradable")
+                else:
+                    sections.append("**Updates:** system up to date")
+            except Exception:
+                pass
+
+            # Systemd failed units
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "systemctl", "--user", "--failed", "--no-legend", "--no-pager",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                failed = stdout.decode().strip()
+                if failed:
+                    sections.append(f"**Failed services:**\n```\n{failed}\n```")
+                else:
+                    sections.append("**Services:** all healthy")
+            except Exception:
+                pass
+
+            return "\n".join(sections)
+
+        system_status_tool = copilot.types.Tool(
+            name="system_status",
+            description=(
+                "Get a comprehensive system status report including uptime, CPU, "
+                "memory, disk, network, pending updates, and service health."
+            ),
+            handler=_system_status_handler,
+            parameters={
+                "type": "object",
+                "properties": {},
+            },
+        )
+        custom_tools.append(system_status_tool)
+
+        # ── Load plugin tools ──
+        try:
+            from enclave.agent.plugins import discover_plugins
+            plugin_tools = discover_plugins(workspace=working_directory)
+            for pt in plugin_tools:
+                tool = copilot.types.Tool(
+                    name=pt.name,
+                    description=pt.description,
+                    handler=pt.handler,
+                    parameters=pt.parameters,
+                )
+                custom_tools.append(tool)
+                print(f"[agent] Plugin tool loaded: {pt.name} (from {pt.source_file})",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"[agent] Plugin discovery failed: {e}", file=sys.stderr)
+
         # Try to resume the most recent session (preserves conversation history)
         infinite_sessions_config = {
             "enabled": True,
@@ -2075,4 +2239,30 @@ if __name__ == "__main__":
     # Ensure stdout/stderr are unbuffered so logs appear in podman logs
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
+
+    # Apply Landlock sandbox in host mode (before any other work)
+    if os.environ.get("ENCLAVE_HOST_MODE") == "1":
+        workspace = os.environ.get("ENCLAVE_WORKSPACE", os.getcwd())
+        try:
+            from enclave.orchestrator.landlock import apply_sandbox, is_supported
+            if is_supported():
+                socket_dir = str(Path(os.environ.get("IPC_SOCKET", "")).parent)
+                readonly_paths = [
+                    "/usr", "/nix", "/etc", "/lib", "/lib64", "/bin", "/sbin",
+                    "/proc",
+                ]
+                # Socket dir needs RW for IPC communication
+                apply_sandbox(
+                    scratch_dir=workspace,
+                    readonly_paths=readonly_paths + [socket_dir],
+                )
+                print(f"[agent] Landlock sandbox applied (workspace={workspace})",
+                      file=sys.stderr)
+            else:
+                print("[agent] Landlock not supported, running without sandbox",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"[agent] Landlock sandbox failed: {e} (continuing without)",
+                  file=sys.stderr)
+
     asyncio.run(main())

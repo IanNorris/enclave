@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import os
+import signal
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +42,7 @@ class Session:
     image: str = ""  # resolved container image for this session
     user_display_name: str = ""
     user_pronouns: str = ""
+    host_pid: int | None = None  # PID for host-mode subprocess agents
 
 
 class ContainerManager:
@@ -201,9 +205,19 @@ class ContainerManager:
             log.error("Session not found: %s", session_id)
             return False, "Session not found"
 
+        session.status = "starting"
+        socket_dir = str(Path(session.socket_path).parent)
+
+        # Resolve profile settings for this session
+        profile = self.config.get_profile(session.profile)
+
+        # ── Host mode: spawn subprocess instead of container ──
+        # An explicit empty image in the profile means host mode (no container).
+        if profile.image == "":
+            return await self._start_host_session(session, profile)
+
         # Clean up any leftover container with the same name
         log.info("[start:%s] Cleaning up old container...", session_id)
-        # First try to stop any running container, then remove
         stop_result = await _run_command(
             [self.config.runtime, "stop", "-t", "5", session_id], timeout=15.0
         )
@@ -213,12 +227,6 @@ class ContainerManager:
         )
         log.debug("rm result: rc=%d stderr=%s", rm_result.returncode, rm_result.stderr[:100])
         log.info("[start:%s] Cleanup done, building run command...", session_id)
-
-        session.status = "starting"
-        socket_dir = str(Path(session.socket_path).parent)
-
-        # Resolve profile settings for this session
-        profile = self.config.get_profile(session.profile)
 
         # Select network mode:
         # - Copilot SDK containers need network for API access
@@ -345,8 +353,83 @@ class ContainerManager:
             log.error("[start:%s] Exception starting container: %s", session_id, e)
             return False, f"Exception: {e}"
 
+    async def _start_host_session(
+        self, session: Session, profile: "ContainerProfile"
+    ) -> tuple[bool, str]:
+        """Start an agent as a host subprocess (no container).
+
+        Passes all required environment to the subprocess. Landlock
+        sandboxing is applied inside the agent process at startup.
+        """
+        log.info("[start:%s] Starting in host mode (no container)", session.id)
+
+        env = os.environ.copy()
+        env["IPC_SOCKET"] = session.socket_path
+        env["SESSION_ID"] = session.id
+        env["SESSION_NAME"] = session.name
+        env["ENCLAVE_PROFILE"] = session.profile
+        env["ENCLAVE_NIX_STORE"] = "1" if profile.nix_store else "0"
+        env["ENCLAVE_HOST_MOUNTS"] = "0"
+        env["ENCLAVE_YOLO"] = "1" if profile.yolo else "0"
+        env["ENCLAVE_HOST_MODE"] = "1"
+
+        if self.config.github_token:
+            env["GITHUB_TOKEN"] = self.config.github_token
+
+        if session.user_display_name:
+            env["ENCLAVE_USER_NAME"] = session.user_display_name
+        if session.user_pronouns:
+            env["ENCLAVE_USER_PRONOUNS"] = session.user_pronouns
+
+        # Landlock config: pass workspace path so agent can apply sandbox
+        env["ENCLAVE_WORKSPACE"] = session.workspace_path
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "enclave.agent.main",
+                env=env,
+                cwd=session.workspace_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            session.host_pid = proc.pid
+            session.status = "running"
+            log.info(
+                "[start:%s] Host agent started (pid: %d)",
+                session.id, proc.pid,
+            )
+
+            # Start background task to log output and detect exit
+            asyncio.create_task(self._monitor_host_process(session, proc))
+
+            return True, ""
+        except Exception as e:
+            session.status = "stopped"
+            log.error("[start:%s] Failed to start host agent: %s", session.id, e)
+            return False, f"Host mode start failed: {e}"
+
+    async def _monitor_host_process(
+        self, session: Session, proc: asyncio.subprocess.Process
+    ) -> None:
+        """Monitor a host-mode agent subprocess for exit."""
+        try:
+            stdout, stderr = await proc.communicate()
+            if stdout:
+                log.info("[host:%s] stdout: %s", session.id, stdout.decode()[-500:])
+            if stderr:
+                log.info("[host:%s] stderr: %s", session.id, stderr.decode()[-500:])
+            if proc.returncode != 0:
+                log.warning(
+                    "[host:%s] Agent exited with code %d",
+                    session.id, proc.returncode,
+                )
+            session.status = "stopped"
+            session.host_pid = None
+        except Exception as e:
+            log.error("[host:%s] Error monitoring process: %s", session.id, e)
+
     async def stop_session(self, session_id: str) -> bool:
-        """Stop and remove a session's container.
+        """Stop and remove a session's container or host process.
 
         Returns True on success.
         """
@@ -357,7 +440,23 @@ class ContainerManager:
 
         session.status = "stopping"
 
-        if session.container_id:
+        # Host mode: kill the subprocess
+        if session.host_pid:
+            try:
+                os.kill(session.host_pid, signal.SIGTERM)
+                # Wait briefly for graceful shutdown
+                await asyncio.sleep(2)
+                try:
+                    os.kill(session.host_pid, 0)  # Check if still alive
+                    os.kill(session.host_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already exited
+            except ProcessLookupError:
+                pass  # Already dead
+            except Exception as e:
+                log.warning("Error stopping host process %d: %s", session.host_pid, e)
+            session.host_pid = None
+        elif session.container_id:
             try:
                 await _run_command(
                     [self.config.runtime, "stop", "-t", "10", session_id]
@@ -401,6 +500,22 @@ class ContainerManager:
         for session in list(self._sessions.values()):
             if session.status != "running":
                 continue
+
+            # Host mode: check if PID is still alive
+            if session.host_pid:
+                try:
+                    os.kill(session.host_pid, 0)
+                except ProcessLookupError:
+                    log.warning(
+                        "Session %s host process (pid %d) no longer running — "
+                        "marking stopped",
+                        session.id, session.host_pid,
+                    )
+                    session.status = "stopped"
+                    session.host_pid = None
+                    crashed.append(session)
+                continue
+
             actual = await self.get_container_status(session.id)
             if actual is None or actual not in ("running", "created"):
                 log.warning(

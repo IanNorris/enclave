@@ -115,34 +115,37 @@ system, Landlock sandboxing, host-mode security.
 
 Ranked by overall value:
 
-1. **MCP (Model Context Protocol) Server** — Expose Enclave as an MCP
+1. **MCP (Model Context Protocol) Server** ✅ — Expose Enclave as an MCP
    server so external tools (VS Code, other agents) can interact.
-   Biggest interop win.
+   Module: `src/enclave/orchestrator/mcp_server.py`, `enclavectl mcp`.
 2. **Multi-Model Support** — Allow switching between LLM providers
    (Anthropic, OpenAI, local via Ollama). Currently tied to Copilot SDK.
-3. **Memory Containers** — Shared SQLite memory per user, cross-session
+3. **Memory Containers** ✅ — Shared SQLite memory per user, cross-session
    learning, key memories in every system prompt, auto-dreaming.
-   Inspired by Claude Code's memory model but container-aware.
 4. **Management Dashboard** — Web UI with LDAP auth, live container
    monitoring, disk usage, session management, Matrix room cleanup.
-5. **Cost/Token Tracking** — Track LLM usage per session/project.
-   Set budgets and alerts.
-6. **Audit Log** — Structured log of all agent actions (commands run,
-   files modified, permissions granted) for security review.
-7. **Plugin System** — User-defined tools/extensions without modifying
-   core code. Drop a Python file in a plugins dir.
+5. **Cost/Token Tracking** ✅ — Track LLM usage per session/project.
+   Set budgets and alerts. Module: `src/enclave/common/cost_tracker.py`.
+6. **Audit Log** ✅ — Structured JSONL log of all agent actions (commands,
+   permissions, tool calls) for security review.
+   Module: `src/enclave/common/audit.py`.
+7. **Plugin System** ✅ — User-defined tools via drop-in Python files
+   in `{workspace}/.enclave/plugins/` or `~/.config/enclave/plugins/`.
+   Module: `src/enclave/agent/plugins.py`.
+8. **System Status Dashboard** ✅ — Agent tool for host system info
+   (uptime, CPU, memory, disk, services, updates).
 
 ---
 
 ## Backlog
 
-### Host Mode — Agent Execution
+### Host Mode — Agent Execution ✅
 
-**Priority:** High | **Effort:** Medium
+**Priority:** High | **Effort:** Medium | **Status:** Implemented
 
-Wire up the orchestrator to run agents directly on the host when the
-"host" profile is selected (image=""). Currently only config and prompts
-exist — the container manager needs to handle this case by spawning a
+Agents can run directly on the host when the "host" profile is selected
+(image=""). The container manager spawns a subprocess instead of a
+podman container, with Landlock kernel sandboxing applied automatically.
 subprocess instead of a podman container.
 
 ### Git Workstream Management

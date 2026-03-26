@@ -57,6 +57,9 @@ class MessageType(str, Enum):
     # File watching
     FILE_CHANGE = "file_change"
 
+    # Token/cost tracking
+    USAGE_REPORT = "usage_report"
+
 
 @dataclass
 class Message:

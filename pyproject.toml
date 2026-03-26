@@ -26,6 +26,9 @@ tui = [
     "rich>=13.0",
     "textual>=0.40",
 ]
+mcp = [
+    "mcp[cli]>=1.0",
+]
 
 [project.scripts]
 enclave = "enclave.orchestrator.main:main"

@@ -14,7 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from enclave.common.audit import AuditLog
 from enclave.common.config import UserMapping
+from enclave.common.cost_tracker import CostTracker
 from enclave.common.logging import get_logger
 from enclave.common.protocol import Message, MessageType
 from enclave.orchestrator.approval import ApprovalManager
@@ -171,6 +173,12 @@ class MessageRouter:
         self._memory_config = memory_config
         self._data_dir = data_dir or os.path.expanduser("~/.local/share/enclave")
 
+        # ── Audit log ──
+        self._audit = AuditLog(self._data_dir)
+
+        # ── Cost / token tracking ──
+        self._cost = CostTracker(self._data_dir)
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
@@ -258,6 +266,10 @@ class MessageRouter:
                 if started:
                     restored += 1
                     log.info("Auto-restored session %s", session.id)
+                    self._audit.log(
+                        "session_restored", session_id=session.id,
+                        name=session.name,
+                    )
                     await self.matrix.send_message(
                         session.room_id,
                         "🔄 Session restored after system restart.",
@@ -510,6 +522,10 @@ class MessageRouter:
             return
 
         log.info("Command from %s (event %s): %s %s", sender, event_id, cmd.command.value, cmd.raw_args)
+        self._audit.log(
+            "command", user=sender,
+            command=cmd.command.value, args=cmd.raw_args,
+        )
 
         # 👀 ack → immediately replace with 🤔 + typing
         eyes_eid = None
@@ -746,6 +762,14 @@ class MessageRouter:
             await self._handle_dream_complete(session, msg)
         elif msg.type == MessageType.SUB_AGENT_REQUEST:
             return await self._handle_sub_agent_request(session, msg)
+        elif msg.type == MessageType.USAGE_REPORT:
+            self._cost.record_usage(
+                session_id=session.id,
+                input_tokens=msg.payload.get("input_tokens", 0),
+                output_tokens=msg.payload.get("output_tokens", 0),
+                total_tokens=msg.payload.get("total_tokens", 0),
+                model=msg.payload.get("model", ""),
+            )
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -837,6 +861,10 @@ class MessageRouter:
         if tool_name in ("report_intent",):
             return
         log.debug("Agent %s tool start: %s", session.id, tool_name)
+        self._audit.log(
+            "tool_start", session_id=session.id,
+            tool=tool_name, description=description,
+        )
         thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
         if description:
             status_text = f"🔧 **{tool_name}**: {description}"
@@ -853,6 +881,10 @@ class MessageRouter:
         if tool_name in ("report_intent",):
             return
         log.debug("Agent %s tool complete: %s (success=%s)", session.id, tool_name, success)
+        self._audit.log(
+            "tool_complete", session_id=session.id,
+            tool=tool_name, success=success,
+        )
         # Keep typing indicator while more work may come
         await self.matrix.set_typing(session.room_id, True)
 
@@ -1252,6 +1284,10 @@ class MessageRouter:
             "Permission request from %s: %s %s (%s)",
             session.id, perm_type.value, target, reason,
         )
+        self._audit.log(
+            "permission_request", session_id=session.id,
+            perm_type=perm_type.value, target=target, reason=reason,
+        )
 
         status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,
@@ -1273,6 +1309,16 @@ class MessageRouter:
                 scope=scope,
                 granted_by="approval",
                 pattern=pattern,
+            )
+            self._audit.log(
+                "permission_granted", session_id=session.id,
+                perm_type=perm_type.value, target=pattern or target,
+                scope=scope.value,
+            )
+        elif status != RequestStatus.APPROVED:
+            self._audit.log(
+                "permission_denied", session_id=session.id,
+                perm_type=perm_type.value, target=target,
             )
 
         # Send response back to agent
@@ -1304,6 +1350,10 @@ class MessageRouter:
         log.info(
             "Privilege request from %s: %s (%s)",
             session.id, full_cmd, reason,
+        )
+        self._audit.log(
+            "privilege_request", session_id=session.id,
+            command=full_cmd, reason=reason,
         )
 
         # Fast reject if privilege broker is not available (user has no sudo)
@@ -1339,6 +1389,9 @@ class MessageRouter:
         )
 
         if status != RequestStatus.APPROVED:
+            self._audit.log(
+                "privilege_denied", session_id=session.id, command=full_cmd,
+            )
             response = Message(
                 type=MessageType.PRIVILEGE_RESPONSE,
                 payload={
@@ -1361,6 +1414,10 @@ class MessageRouter:
                 scope=scope,
                 granted_by="approval",
                 pattern=pattern,
+            )
+            self._audit.log(
+                "privilege_granted", session_id=session.id,
+                command=full_cmd, scope=scope.value,
             )
 
         # Execute via privilege broker
@@ -1385,6 +1442,11 @@ class MessageRouter:
             session_id=session.id,
             command=command,
             args=args,
+        )
+        self._audit.log(
+            "privilege_executed", session_id=session.id,
+            command=full_cmd, exit_code=result.exit_code,
+            success=result.success,
         )
 
         response = Message(
@@ -1417,6 +1479,10 @@ class MessageRouter:
         log.info(
             "Mount request from %s: %s (%s)",
             session.id, source_path, reason,
+        )
+        self._audit.log(
+            "mount_request", session_id=session.id,
+            source_path=source_path, reason=reason,
         )
 
         # Ask for approval via poll in the project room
@@ -1694,6 +1760,7 @@ class MessageRouter:
     async def _on_agent_connect(self, session_id: str) -> None:
         """Called when an agent connects via IPC."""
         log.info("Agent connected: %s", session_id)
+        self._audit.log("agent_connected", session_id=session_id)
         # Start file watcher for workspace changes
         await self._start_watcher(session_id)
 
@@ -1712,6 +1779,7 @@ class MessageRouter:
                 "⚠️ Agent disconnected.",
             )
         log.info("Agent disconnected: %s", session_id)
+        self._audit.log("agent_disconnected", session_id=session_id)
 
     async def _start_watcher(self, session_id: str) -> None:
         """Start a file watcher for a session's workspace."""
@@ -1947,6 +2015,11 @@ class MessageRouter:
             user_pronouns=user_pronouns,
         )
         log.info("[project:%s] Session created: %s", project_name, session.id)
+        self._audit.log(
+            "session_created", session_id=session.id, user=sender,
+            name=project_name, profile=resolved_profile,
+            room_id=room_id,
+        )
 
         # Write key memories to workspace for agent to read
         if sender:
@@ -2375,6 +2448,7 @@ class MessageRouter:
 
         removed = await self.containers.remove_session(session_id)
         await self.ipc.remove_socket(session_id)
+        self._audit.log("session_killed", session_id=session_id)
 
         if removed:
             await self._reply_control(

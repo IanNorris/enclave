@@ -356,6 +356,125 @@ def cmd_tui(args):
     run_tui()
 
 
+def cmd_audit(args):
+    """Show recent audit log entries."""
+    config = _load_config()
+    data_dir = config.container.session_base.replace("/sessions", "")
+    from enclave.common.audit import AuditLog
+    audit = AuditLog(data_dir)
+
+    if args.session_id:
+        entries = audit.read_session(args.session_id, tail=args.tail)
+        title = f"Audit: {args.session_id}"
+    else:
+        entries = audit.read_global(tail=args.tail)
+        title = "Audit: global"
+
+    if not entries:
+        console.print("[dim]No audit entries found.[/dim]")
+        return
+
+    table = Table(title=title, box=box.SIMPLE_HEAVY)
+    table.add_column("Time", style="dim", width=19)
+    table.add_column("Event", style="bold")
+    table.add_column("Session", width=12)
+    table.add_column("Details")
+
+    for entry in entries:
+        ts = entry.get("ts", "")[:19].replace("T", " ")
+        event = entry.get("event", "")
+        sid = entry.get("session_id", "")[:12]
+        # Build details from remaining keys
+        skip = {"ts", "event", "session_id", "user"}
+        details_parts = []
+        if entry.get("user"):
+            details_parts.append(f"user={entry['user']}")
+        for k, v in entry.items():
+            if k not in skip:
+                details_parts.append(f"{k}={v}")
+        details = " ".join(details_parts)
+        if len(details) > 80:
+            details = details[:77] + "..."
+        table.add_row(ts, event, sid, details)
+
+    console.print(table)
+
+
+def cmd_costs(args):
+    """Show token usage and cost estimates."""
+    config = _load_config()
+    data_dir = config.container.session_base.replace("/sessions", "")
+    from enclave.common.cost_tracker import CostTracker
+    tracker = CostTracker(data_dir)
+
+    if args.session_id:
+        stats = tracker.session_stats(args.session_id)
+        console.print(Panel(
+            Text.from_markup(
+                f"  Session:      [cyan]{args.session_id}[/cyan]\n"
+                f"  Input tokens: {stats['total_input_tokens']:,}\n"
+                f"  Output tokens:{stats['total_output_tokens']:,}\n"
+                f"  Total tokens: {stats['total_tokens']:,}\n"
+                f"  Turns:        {stats['turn_count']}\n"
+                f"  Est. cost:    [green]${stats['estimated_cost_usd']:.4f}[/green]"
+            ),
+            title="Session Usage",
+            border_style="blue",
+        ))
+
+        budget = tracker.check_budget(args.session_id)
+        if budget:
+            pct = budget["percent_used"]
+            color = "red" if budget["over_budget"] else ("yellow" if budget["alert"] else "green")
+            console.print(f"\n  Budget: [{color}]{pct:.1f}%[/{color}] used "
+                          f"({budget['used_tokens']:,} / {budget['max_tokens']:,})")
+    else:
+        stats = tracker.global_stats()
+        console.print(Panel(
+            Text.from_markup(
+                f"  Sessions:     {stats['session_count']}\n"
+                f"  Input tokens: {stats['total_input_tokens']:,}\n"
+                f"  Output tokens:{stats['total_output_tokens']:,}\n"
+                f"  Total tokens: {stats['total_tokens']:,}\n"
+                f"  Total turns:  {stats['turn_count']}\n"
+                f"  Est. cost:    [green]${stats['estimated_cost_usd']:.4f}[/green]"
+            ),
+            title="Global Token Usage",
+            border_style="blue",
+        ))
+
+        # Per-session breakdown
+        sessions = _get_sessions(config)
+        if sessions:
+            table = Table(title="Per-Session Breakdown", box=box.SIMPLE_HEAVY)
+            table.add_column("Session", style="cyan", width=12)
+            table.add_column("Name", style="bold")
+            table.add_column("Tokens", justify="right")
+            table.add_column("Turns", justify="right")
+            table.add_column("Cost", justify="right", style="green")
+
+            for s in sessions:
+                sid = s.get("id", "")
+                ss = tracker.session_stats(sid)
+                if ss["total_tokens"] > 0:
+                    table.add_row(
+                        sid[:12],
+                        s.get("name", ""),
+                        f"{ss['total_tokens']:,}",
+                        str(ss["turn_count"]),
+                        f"${ss['estimated_cost_usd']:.4f}",
+                    )
+            console.print(table)
+
+    tracker.close()
+
+
+def cmd_mcp(args):
+    """Start the MCP server."""
+    from enclave.orchestrator.mcp_server import run_mcp_server
+    run_mcp_server()
+
+
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
@@ -396,6 +515,18 @@ def main():
     # tui
     sub.add_parser("tui", help="Interactive terminal dashboard")
 
+    # audit
+    audit_p = sub.add_parser("audit", help="Show recent audit log entries")
+    audit_p.add_argument("session_id", nargs="?", default="", help="Session ID (omit for global)")
+    audit_p.add_argument("-n", "--tail", type=int, default=50, help="Number of entries")
+
+    # costs
+    costs_p = sub.add_parser("costs", help="Show token usage and cost estimates")
+    costs_p.add_argument("session_id", nargs="?", default="", help="Session ID (omit for global)")
+
+    # mcp
+    sub.add_parser("mcp", help="Start MCP server (stdio transport)")
+
     args = parser.parse_args()
 
     commands = {
@@ -406,6 +537,9 @@ def main():
         "stop": cmd_stop,
         "cleanup": cmd_cleanup,
         "tui": cmd_tui,
+        "audit": cmd_audit,
+        "costs": cmd_costs,
+        "mcp": cmd_mcp,
     }
 
     if args.command is None:
