@@ -22,9 +22,14 @@ dev = [
     "ruff",
     "mypy",
 ]
+tui = [
+    "rich>=13.0",
+    "textual>=0.40",
+]
 
 [project.scripts]
 enclave = "enclave.orchestrator.main:main"
+enclavectl = "enclave.cli.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/enclave"]

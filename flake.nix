@@ -76,6 +76,8 @@
           unpaddedbase64
           pydantic
           python-dateutil
+          rich
+          textual
           # Dev deps
           pytest
           pytest-asyncio
