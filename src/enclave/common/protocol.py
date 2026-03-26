@@ -54,6 +54,9 @@ class MessageType(str, Enum):
     DREAM_REQUEST = "dream_request"
     DREAM_COMPLETE = "dream_complete"
 
+    # File watching
+    FILE_CHANGE = "file_change"
+
 
 @dataclass
 class Message:

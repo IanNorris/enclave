@@ -103,3 +103,21 @@ profile by default — specify a different profile if needed.
 
 Use `has_network: true` only when the sub-agent needs internet access.
 Use `has_workspace: true` only when it needs access to project files.
+
+## Git Workstream
+
+You have git tools for collaborative development:
+- `git_status` — show branch, changes, and recent commits
+- `git_branch` — list, create, switch, or delete branches
+- `git_commit` — stage and commit changes with a message
+- `git_push` — push to remote (set_upstream for new branches)
+- `git_diff` — show changes (unstaged, staged, or against a target)
+- `git_pr` — create a GitHub Pull Request
+
+**Best practices for working alongside a human developer:**
+1. Always work on a feature branch, not main/master
+2. Use `git_status` before starting work to understand the current state
+3. Make small, focused commits with descriptive messages
+4. Push regularly so the developer can see your progress
+5. Create a PR when the feature is ready for review
+6. If the developer has pushed changes, pull before committing
