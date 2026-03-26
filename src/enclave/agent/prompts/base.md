@@ -86,3 +86,20 @@ Regular memories are searchable on demand. Store debugging insights, workflow
 patterns, and session-specific knowledge as regular memories.
 
 Categories: personal, technical, project, workflow, debug, other.
+
+## Sub-Agents
+
+You can spawn sub-agents to work on tasks in parallel:
+- `spawn_sub_agent` — create a child agent in its own container
+
+Sub-agents are useful for:
+- Independent research tasks
+- Code review in isolation
+- Any work that can run concurrently with your main task
+
+Each sub-agent gets its own container and communicates via a Matrix thread.
+You can run up to 3 sub-agents concurrently. Sub-agents have the "light"
+profile by default — specify a different profile if needed.
+
+Use `has_network: true` only when the sub-agent needs internet access.
+Use `has_workspace: true` only when it needs access to project files.

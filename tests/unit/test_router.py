@@ -1060,3 +1060,140 @@ class TestMemoryHandlers:
         assert len(sent) == 1
         assert sent[0][1].payload.get("ok") is True
         assert store.count() == 0
+
+
+# ------------------------------------------------------------------
+# Tests: Sub-agent request handling
+# ------------------------------------------------------------------
+
+
+class TestSubAgentRequest:
+    """Test sub-agent spawn via IPC request."""
+
+    @pytest.mark.asyncio
+    async def test_spawn_sub_agent_success(self, started_router):
+        """Successfully spawns a sub-agent container."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        msg = Message(
+            type=MessageType.SUB_AGENT_REQUEST,
+            payload={
+                "name": "researcher",
+                "purpose": "Look up Python async patterns",
+                "has_network": True,
+            },
+        )
+
+        response = await ipc.simulate_agent_message("s1", msg)
+
+        # Should return success with sub-agent info
+        assert response is not None
+        assert response.payload.get("status") == "running"
+        assert response.payload.get("name") == "researcher"
+        assert "sub_agent_id" in response.payload
+
+        # Sub-agent session should exist in containers
+        sub_id = response.payload["sub_agent_id"]
+        sub_session = containers.get_session(sub_id)
+        assert sub_session is not None
+        assert sub_session.status == "running"
+
+        # Thread message should have been sent
+        thread_msgs = [
+            m for m in matrix.sent_messages
+            if "Sub-agent: researcher" in m.get("body", "")
+        ]
+        assert len(thread_msgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_spawn_sub_agent_missing_purpose(self, started_router):
+        """Rejects sub-agent request without a purpose."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        msg = Message(
+            type=MessageType.SUB_AGENT_REQUEST,
+            payload={"name": "researcher"},
+        )
+
+        response = await ipc.simulate_agent_message("s1", msg)
+
+        assert response is not None
+        assert "purpose is required" in response.payload.get("error", "")
+
+    @pytest.mark.asyncio
+    async def test_spawn_sub_agent_max_concurrent(self, started_router):
+        """Rejects when max concurrent sub-agents reached."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        # Spawn 3 sub-agents (the max)
+        for i in range(3):
+            msg = Message(
+                type=MessageType.SUB_AGENT_REQUEST,
+                payload={
+                    "name": f"agent-{i}",
+                    "purpose": f"Task {i}",
+                },
+            )
+            response = await ipc.simulate_agent_message("s1", msg)
+            assert response.payload.get("status") == "running"
+
+        # Fourth should be rejected
+        msg = Message(
+            type=MessageType.SUB_AGENT_REQUEST,
+            payload={"name": "agent-3", "purpose": "Task 3"},
+        )
+        response = await ipc.simulate_agent_message("s1", msg)
+        assert response is not None
+        assert "Max 3" in response.payload.get("error", "")
+
+    @pytest.mark.asyncio
+    async def test_spawn_sub_agent_container_fail(self, started_router):
+        """Handles container start failure gracefully."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        # Make container starts fail
+        containers._start_result = False
+
+        msg = Message(
+            type=MessageType.SUB_AGENT_REQUEST,
+            payload={"name": "researcher", "purpose": "Do research"},
+        )
+
+        response = await ipc.simulate_agent_message("s1", msg)
+
+        assert response is not None
+        assert "Failed to start" in response.payload.get("error", "")
+
+    @pytest.mark.asyncio
+    async def test_spawn_sub_agent_sends_initial_message(self, started_router):
+        """Sends purpose as initial user message to sub-agent."""
+        router, matrix, ipc, containers = started_router
+        containers.add_test_session("s1", "Test", "!project:test")
+        ipc.mark_connected("s1")
+
+        msg = Message(
+            type=MessageType.SUB_AGENT_REQUEST,
+            payload={
+                "name": "coder",
+                "purpose": "Fix the login bug in auth.py",
+            },
+        )
+
+        response = await ipc.simulate_agent_message("s1", msg)
+        sub_id = response.payload["sub_agent_id"]
+
+        # Check that a USER_MESSAGE was sent to the sub-agent
+        user_msgs = [
+            (sid, m) for sid, m in ipc.sent
+            if sid == sub_id and m.type == MessageType.USER_MESSAGE
+        ]
+        assert len(user_msgs) == 1
+        assert "Fix the login bug" in user_msgs[0][1].payload.get("content", "")
