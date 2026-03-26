@@ -523,6 +523,17 @@ async def try_init_copilot(
             else:
                 print(f"[agent] Warning: prompt file not found: {prompt_file}", file=sys.stderr)
 
+        # Inject user identity into prompt if available
+        user_name = os.environ.get("ENCLAVE_USER_NAME", "")
+        user_pronouns = os.environ.get("ENCLAVE_USER_PRONOUNS", "")
+        if user_name:
+            identity_line = f"The user's name is **{user_name}**"
+            if user_pronouns:
+                identity_line += f" ({user_pronouns})"
+            identity_line += ". Address them by name."
+            prompt_parts.insert(0, identity_line)
+            print(f"[agent] User: {user_name} ({user_pronouns})", file=sys.stderr)
+
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)
         )

@@ -11,6 +11,7 @@ import os
 import time
 from typing import Any
 
+from enclave.common.config import UserMapping
 from enclave.common.logging import get_logger
 from enclave.common.protocol import Message, MessageType
 from enclave.orchestrator.approval import ApprovalManager
@@ -57,6 +58,7 @@ class MessageRouter:
         control_room_id: str,
         space_id: str | None = None,
         allowed_users: list[str] | None = None,
+        user_mappings: list[UserMapping] | None = None,
         data_dir: str = "",
         priv_broker_socket: str = "/run/enclave-priv/broker.sock",
         approval_timeout: float = 300.0,
@@ -67,6 +69,7 @@ class MessageRouter:
         self.control_room_id = control_room_id
         self.space_id = space_id
         self.allowed_users = allowed_users
+        self._user_mappings = {u.matrix_id: u for u in (user_mappings or [])}
 
         # Track thread event IDs per session for threading replies
         self._thread_events: dict[str, str] = {}
@@ -1517,11 +1520,18 @@ class MessageRouter:
         log.info("[project:%s] Creating IPC socket...", project_name)
         socket_path = await self.ipc.create_socket(f"pending-{project_name}")
 
+        # Look up user identity for personalization
+        user = self._user_mappings.get(sender)
+        user_display_name = user.display_name if user else ""
+        user_pronouns = user.pronouns if user else ""
+
         session = await self.containers.create_session(
             name=project_name,
             room_id=room_id,
             socket_path=str(socket_path),
             profile=resolved_profile,
+            user_display_name=user_display_name,
+            user_pronouns=user_pronouns,
         )
         log.info("[project:%s] Session created: %s", project_name, session.id)
 

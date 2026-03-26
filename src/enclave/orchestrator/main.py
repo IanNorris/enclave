@@ -58,6 +58,7 @@ async def run() -> None:
         control_room_id=config.matrix.control_room_id,
         space_id=config.matrix.space_id,
         allowed_users=allowed,
+        user_mappings=config.users,
         data_dir=config.data_dir,
         priv_broker_socket=config.priv_broker.socket_path,
         approval_timeout=config.priv_broker.timeout,

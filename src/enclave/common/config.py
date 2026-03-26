@@ -112,6 +112,8 @@ class UserMapping:
 
     matrix_id: str
     linux_user: str
+    display_name: str = ""
+    pronouns: str = ""
     max_sessions: int = 5
     can_approve_privilege: bool = True
     allowed_rooms: list[str] = field(default_factory=lambda: ["*"])
@@ -174,6 +176,8 @@ def _parse_user_mapping(data: dict[str, Any]) -> UserMapping:
     return UserMapping(
         matrix_id=data["matrix_id"],
         linux_user=data["linux_user"],
+        display_name=data.get("display_name", ""),
+        pronouns=data.get("pronouns", ""),
         max_sessions=data.get("max_sessions", 5),
         can_approve_privilege=data.get("can_approve_privilege", True),
         allowed_rooms=data.get("allowed_rooms", ["*"]),

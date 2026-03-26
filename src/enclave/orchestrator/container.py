@@ -37,6 +37,8 @@ class Session:
     status: str = "created"  # created, starting, running, stopping, stopped
     profile: str = ""  # container profile name (e.g., "dev", "light")
     image: str = ""  # resolved container image for this session
+    user_display_name: str = ""
+    user_pronouns: str = ""
 
 
 class ContainerManager:
@@ -128,6 +130,8 @@ class ContainerManager:
         room_id: str,
         socket_path: str,
         profile: str = "",
+        user_display_name: str = "",
+        user_pronouns: str = "",
     ) -> Session:
         """Create a new agent session with workspace and container.
 
@@ -137,6 +141,8 @@ class ContainerManager:
             socket_path: Path to the IPC socket for this session.
             profile: Container profile name (e.g., "dev", "light").
                      Empty string uses the default profile.
+            user_display_name: Display name of the user who owns this session.
+            user_pronouns: Pronouns of the user (e.g., "he/him").
 
         Returns:
             The created Session object.
@@ -163,6 +169,8 @@ class ContainerManager:
             socket_path=socket_path,
             profile=resolved_profile,
             image=profile_obj.image,
+            user_display_name=user_display_name,
+            user_pronouns=user_pronouns,
         )
 
         self._sessions[session_id] = session
@@ -282,6 +290,12 @@ class ContainerManager:
             "-e", f"ENCLAVE_HOST_MOUNTS={'1' if profile.host_mounts else '0'}",
             "-e", f"ENCLAVE_YOLO={'1' if profile.yolo else '0'}",
         ])
+
+        # Pass user identity so the agent can address them by name
+        if session.user_display_name:
+            cmd.extend(["-e", f"ENCLAVE_USER_NAME={session.user_display_name}"])
+        if session.user_pronouns:
+            cmd.extend(["-e", f"ENCLAVE_USER_PRONOUNS={session.user_pronouns}"])
 
         cmd.append(image)
 
