@@ -315,7 +315,17 @@ async def try_init_copilot(
 
     try:
         github_token = os.environ.get("GITHUB_TOKEN")
-        sdk_config = SubprocessConfig(github_token=github_token) if github_token else None
+
+        # Persist SDK state (sessions, history) to the workspace so it
+        # survives container restarts.
+        state_dir = os.path.join(working_directory, ".copilot-state")
+        os.makedirs(state_dir, exist_ok=True)
+
+        cli_args = ["--config-dir", state_dir]
+        sdk_config = SubprocessConfig(
+            github_token=github_token,
+            cli_args=cli_args,
+        ) if github_token else SubprocessConfig(cli_args=cli_args)
 
         client = CopilotClient(sdk_config)
         await client.start()
