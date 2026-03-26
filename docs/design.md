@@ -149,7 +149,7 @@ The orchestrator can then `mount --bind` paths into the workspace at runtime, an
 a permission database per-session with entries that can be added, revoked, or
 modified at any time without restarting the container.
 
-**Approval UI — Reaction-based** (validated in spike testing):
+**Approval UI — Reaction-based**:
 Polls (MSC3381) are unreliable in E2EE rooms. Instead, use reactions:
 
 ```

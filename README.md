@@ -29,13 +29,18 @@ See [docs/design.md](docs/design.md) for the full design document.
 
 ## Status
 
-🚧 **Early development** — proving out core architecture via isolated spikes.
+🚧 **Active development** — core architecture is functional.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 
-## Spikes
+## Features
 
-1. `spikes/spike1_copilot_in_podman/` — Copilot SDK running inside a podman container
-2. `spikes/spike2_matrix_e2ee/` — Matrix E2EE bot with thread creation
-3. `spikes/spike3_ipc_bridge/` — Unix socket IPC between host and container
+- **Sandboxed agents** — each runs in a podman container with explicit permissions
+- **Profile system** — dev (Nix), light (minimal), host (direct) profiles
+- **Privilege escalation** — sudo via Matrix approval polls, with pattern-based grants
+- **Dynamic mounts** — request host directories at runtime, approved via chat
+- **Scheduling** — cron-like recurring callbacks and one-shot timers
+- **Session persistence** — conversation history survives container restarts
+- **User identity** — agents know your name and pronouns
 
 ## Tech Stack
 
