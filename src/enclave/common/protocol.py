@@ -38,6 +38,14 @@ class MessageType(str, Enum):
     FILE_SEND = "file_send"
     DOWNLOAD_REQUEST = "download_request"
     STATUS_UPDATE = "status_update"
+    SCHEDULE_SET = "schedule_set"
+    SCHEDULE_CANCEL = "schedule_cancel"
+    TIMER_SET = "timer_set"
+    TIMER_CANCEL = "timer_cancel"
+
+    # Orchestrator → Agent (scheduled callbacks)
+    SCHEDULE_TRIGGER = "schedule_trigger"
+    TIMER_TRIGGER = "timer_trigger"
 
 
 @dataclass
