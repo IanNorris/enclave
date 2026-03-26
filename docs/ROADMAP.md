@@ -120,8 +120,9 @@ Ranked by overall value:
    Biggest interop win.
 2. **Multi-Model Support** — Allow switching between LLM providers
    (Anthropic, OpenAI, local via Ollama). Currently tied to Copilot SDK.
-3. **Persistent Memory / RAG** — Long-term memory across sessions.
-   Agent remembers project conventions, past decisions, user preferences.
+3. **Memory Containers** — Shared SQLite memory per user, cross-session
+   learning, key memories in every system prompt, auto-dreaming.
+   Inspired by Claude Code's memory model but container-aware.
 4. **Cost/Token Tracking** — Track LLM usage per session/project.
    Set budgets and alerts.
 5. **Audit Log** — Structured log of all agent actions (commands run,
@@ -172,12 +173,90 @@ auto-restart with approval. Foundation for server management workflow.
 Expose Enclave capabilities via Model Context Protocol so external
 tools can use Enclave-managed agents as tools.
 
-### Persistent Memory / RAG
+### Memory Containers
 
-**Priority:** Medium | **Effort:** High
+**Priority:** High | **Effort:** High
 
-Long-term memory using vector store (e.g., ChromaDB) for project
-context, user preferences, and past decisions across sessions.
+Shared cross-session memory per user, stored in SQLite. Agents
+accumulate knowledge across sessions — user preferences, project
+conventions, personal facts, debugging insights. Inspired by
+[Claude Code's memory model](https://code.claude.com/docs/en/memory)
+but adapted for Enclave's multi-container architecture.
+
+**Core concepts:**
+
+- **Memory database** — SQLite file per user at
+  `{data_dir}/memory/{matrix_user_id}.db`. Tables: `memories`
+  (id, category, content, source_session, created_at, last_accessed,
+  access_count, is_key_memory). Shared across all that user's sessions.
+
+- **Key memories** — Memories flagged `is_key_memory=true` are injected
+  into every session's system prompt via SystemMessageAppendConfig.
+  Limited to first ~200 lines (like Claude Code). Agent sees them as
+  persistent context. Examples: user's name, coding preferences,
+  project architecture decisions.
+
+- **Auto-dreaming** — Automatic memory extraction. The agent's context
+  window is scanned for noteworthy information during two events:
+  1. **Consolidation** — before context window overflow / summarization
+  2. **Session end** — after idle timeout, before container shutdown
+
+  The scan uses a focused prompt asking the LLM to extract:
+  - Personal facts (name, family, preferences)
+  - Technical preferences (languages, frameworks, style)
+  - Project-specific knowledge (architecture, conventions)
+  - Debugging insights and solutions
+  - Workflow patterns
+
+  Extracted memories are deduplicated against existing entries and
+  stored with source session attribution.
+
+- **Configuration:**
+  ```yaml
+  memory:
+    auto_memory: true      # enable memory persistence
+    auto_dreaming: true    # enable automatic extraction
+    key_memory_limit: 200  # max lines in system prompt
+  ```
+  Both settings off by default. Auto-dreaming requires auto_memory.
+
+**Architecture:**
+
+```
+┌──────────────┐    IPC     ┌──────────────┐
+│   Agent A    │◄──────────►│              │
+│  (session 1) │            │  Orchestrator │
+└──────────────┘            │              │
+                            │  ┌─────────┐ │
+┌──────────────┐    IPC     │  │ Memory  │ │
+│   Agent B    │◄──────────►│  │ Store   │ │
+│  (session 2) │            │  │ (SQLite)│ │
+└──────────────┘            │  └─────────┘ │
+                            └──────────────┘
+```
+
+- Orchestrator owns the database (single-writer, avoids corruption)
+- Agents interact via IPC: MEMORY_STORE, MEMORY_QUERY, MEMORY_LIST
+- Key memories loaded by orchestrator and injected into prompt at
+  session creation time
+- Dreaming happens orchestrator-side: receives context dump from agent,
+  runs extraction, stores results
+
+**IPC messages (new):**
+- `MEMORY_STORE` — agent stores a memory (content, category, is_key)
+- `MEMORY_QUERY` — agent searches memories (keyword/category)
+- `MEMORY_LIST` — list key memories or recent memories
+- `MEMORY_DELETE` — remove a memory by ID
+- `DREAM_REQUEST` — agent sends context for dreaming extraction
+- `DREAM_COMPLETE` — orchestrator returns extracted memories
+
+**Agent tools:**
+- `remember(content, category, is_key)` — store a memory manually
+- `recall(query, category)` — search memories
+- `forget(memory_id)` — delete a memory
+- Auto-dreaming is transparent — no tool call needed
+
+**Categories:** personal, technical, project, workflow, debug, other
 
 ### File Change Notifications
 
