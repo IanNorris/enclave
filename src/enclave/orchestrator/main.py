@@ -7,7 +7,9 @@ and message router into a running orchestrator.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
+import socket
 import sys
 
 import yaml
@@ -20,6 +22,34 @@ from enclave.orchestrator.matrix_client import EnclaveMatrixClient
 from enclave.orchestrator.router import MessageRouter
 
 log = get_logger("main")
+
+
+def _sd_notify(state: str) -> None:
+    """Send a notification to systemd via NOTIFY_SOCKET (no deps required)."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        if addr.startswith("@"):
+            addr = "\0" + addr[1:]
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.connect(addr)
+        sock.sendall(state.encode())
+        sock.close()
+    except Exception:
+        pass
+
+
+async def _watchdog_loop() -> None:
+    """Periodically ping the systemd watchdog."""
+    usec = os.environ.get("WATCHDOG_USEC")
+    if not usec:
+        return
+    # Ping at half the watchdog interval
+    interval = int(usec) / 1_000_000 / 2
+    while True:
+        await asyncio.sleep(interval)
+        _sd_notify("WATCHDOG=1")
 
 
 def _persist_control_room_id(config_path: str | None, room_id: str) -> None:
@@ -120,13 +150,9 @@ async def run() -> None:
 
     log.info("Enclave orchestrator running")
 
-    # Notify systemd that we're ready and send initial watchdog ping
-    try:
-        from systemd.daemon import notify
-        notify("READY=1")
-        notify("WATCHDOG=1")
-    except Exception:
-        pass
+    # Notify systemd that we're ready and start watchdog pings
+    _sd_notify("READY=1")
+    _sd_notify("WATCHDOG=1")
 
     # Handle graceful shutdown
     stop_event = asyncio.Event()
@@ -142,6 +168,7 @@ async def run() -> None:
 
     # Start Matrix sync in background with watchdog
     sync_task = asyncio.create_task(matrix.sync_forever())
+    watchdog_task = asyncio.create_task(_watchdog_loop())
 
     def _on_sync_done(task: asyncio.Task[None]) -> None:
         """Restart sync if it exits unexpectedly."""
