@@ -39,8 +39,5 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=enclave
 
-# Watchdog: restart if hung for 5 minutes
-WatchdogSec=300
-
 [Install]
 WantedBy=default.target
