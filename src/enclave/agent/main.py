@@ -1030,9 +1030,12 @@ async def try_init_copilot(
         gui_tool = Tool(
             name="launch_gui",
             description=(
-                "Launch a GUI application on the user's desktop (Wayland/Hyprland). "
-                "Requires user approval. Use for browsers, editors, media players, etc. "
-                "Example: launch_gui(command='firefox https://example.com', reason='Open docs')"
+                "Launch a GUI application on the user's desktop. This runs the "
+                "command on the HOST machine (not inside the container), so it has "
+                "access to the user's Wayland/X11 display. Requires user approval. "
+                "Use for browsers, editors, image viewers, media players, etc. "
+                "Example: launch_gui(command='firefox https://example.com', reason='Open docs'). "
+                "To open a file from the workspace, use the full path under /workspace/."
             ),
             handler=_gui_handler,
             parameters={
@@ -1956,7 +1959,7 @@ async def try_init_copilot(
 
             return "\n".join(sections)
 
-        system_status_tool = copilot.types.Tool(
+        system_status_tool = Tool(
             name="system_status",
             description=(
                 "Get a comprehensive system status report including uptime, CPU, "
@@ -1975,7 +1978,7 @@ async def try_init_copilot(
             from enclave.agent.plugins import discover_plugins
             plugin_tools = discover_plugins(workspace=working_directory)
             for pt in plugin_tools:
-                tool = copilot.types.Tool(
+                tool = Tool(
                     name=pt.name,
                     description=pt.description,
                     handler=pt.handler,
@@ -2055,7 +2058,8 @@ async def main() -> None:
     print("[agent] Connected to orchestrator", file=sys.stderr)
 
     # Try to init Copilot SDK
-    sdk_result = await try_init_copilot(ipc=ipc)
+    working_directory = os.environ.get("ENCLAVE_WORKSPACE", os.getcwd())
+    sdk_result = await try_init_copilot(working_directory=working_directory, ipc=ipc)
     listener_ctl = None
     if sdk_result:
         sdk_client, sdk_session = sdk_result
@@ -2222,7 +2226,7 @@ async def main() -> None:
             pass
     if sdk_session:
         try:
-            sdk_session.disconnect()
+            await sdk_session.disconnect()
         except Exception:
             pass
     if sdk_client:
@@ -2240,29 +2244,10 @@ if __name__ == "__main__":
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 
-    # Apply Landlock sandbox in host mode (before any other work)
-    if os.environ.get("ENCLAVE_HOST_MODE") == "1":
-        workspace = os.environ.get("ENCLAVE_WORKSPACE", os.getcwd())
-        try:
-            from enclave.orchestrator.landlock import apply_sandbox, is_supported
-            if is_supported():
-                socket_dir = str(Path(os.environ.get("IPC_SOCKET", "")).parent)
-                readonly_paths = [
-                    "/usr", "/nix", "/etc", "/lib", "/lib64", "/bin", "/sbin",
-                    "/proc",
-                ]
-                # Socket dir needs RW for IPC communication
-                apply_sandbox(
-                    scratch_dir=workspace,
-                    readonly_paths=readonly_paths + [socket_dir],
-                )
-                print(f"[agent] Landlock sandbox applied (workspace={workspace})",
-                      file=sys.stderr)
-            else:
-                print("[agent] Landlock not supported, running without sandbox",
-                      file=sys.stderr)
-        except Exception as e:
-            print(f"[agent] Landlock sandbox failed: {e} (continuing without)",
-                  file=sys.stderr)
+    # Landlock sandbox is disabled for now — container isolation is the
+    # primary security boundary.  Host-mode sessions rely on user-level
+    # permissions until Landlock policy is refined.
+    # if os.environ.get("ENCLAVE_HOST_MODE") == "1":
+    #     ...
 
     asyncio.run(main())

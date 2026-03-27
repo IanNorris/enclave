@@ -190,10 +190,16 @@ class MessageRouter:
         self.ipc.on_disconnect(self._on_agent_disconnect)
 
         # Send startup announcement — also establishes Megolm session
-        await self.matrix.send_message(
-            self.control_room_id,
-            "🏰 Enclave orchestrator online. Type `help` for commands.",
-        )
+        # The bot may not have joined the control room yet (awaiting invite).
+        if self.control_room_id not in self.matrix.client.rooms:
+            log.warning(
+                "Control room %s not joined — waiting for invite", self.control_room_id
+            )
+        else:
+            await self.matrix.send_message(
+                self.control_room_id,
+                "🏰 Enclave orchestrator online. Type `help` for commands.",
+            )
 
         # Connect to privilege broker (non-blocking — broker may not be running)
         if not await self._priv_client.connect():

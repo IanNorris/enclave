@@ -31,6 +31,7 @@ class MatrixConfig:
     device_name: str = "Enclave Bot"
     store_path: str = str(Path.home() / ".local" / "share" / "enclave" / "matrix_store")
     control_room_id: str = ""
+    control_room_name: str = "Enclave Control"
     space_id: str = ""
 
 
@@ -231,6 +232,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 device_name=m.get("device_name", "Enclave Bot"),
                 store_path=m.get("store_path", config.matrix.store_path),
                 control_room_id=m.get("control_room_id", ""),
+                control_room_name=m.get("control_room_name", "Enclave Control"),
                 space_id=m.get("space_id", ""),
             )
 

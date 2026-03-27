@@ -10,7 +10,12 @@ requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
     "github-copilot-sdk",
-    "matrix-nio[e2ee]",
+    "matrix-nio",
+    # E2EE deps (matrix-nio >=0.25 dropped the [e2ee] extra)
+    "python-olm",
+    "cachetools",
+    "peewee",
+    "atomicwrites",
     "pyyaml>=6.0",
 ]
 

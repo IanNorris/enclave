@@ -375,6 +375,9 @@ class ContainerManager:
 
         if self.config.github_token:
             env["GITHUB_TOKEN"] = self.config.github_token
+            log.debug("[start:%s] Passing GITHUB_TOKEN to host agent", session.id)
+        else:
+            log.warning("[start:%s] No github_token configured — host agent will lack Copilot SDK", session.id)
 
         if session.user_display_name:
             env["ENCLAVE_USER_NAME"] = session.user_display_name
@@ -411,13 +414,21 @@ class ContainerManager:
     async def _monitor_host_process(
         self, session: Session, proc: asyncio.subprocess.Process
     ) -> None:
-        """Monitor a host-mode agent subprocess for exit."""
+        """Monitor a host-mode agent subprocess, streaming stderr to log."""
         try:
-            stdout, stderr = await proc.communicate()
+            # Stream stderr in real time so we can see SDK init messages
+            async def _stream_stderr():
+                assert proc.stderr is not None
+                async for line in proc.stderr:
+                    text = line.decode().rstrip()
+                    if text:
+                        log.info("[host:%s] %s", session.id, text)
+
+            stderr_task = asyncio.create_task(_stream_stderr())
+            stdout, _ = await proc.communicate()
+            await stderr_task
             if stdout:
                 log.info("[host:%s] stdout: %s", session.id, stdout.decode()[-500:])
-            if stderr:
-                log.info("[host:%s] stderr: %s", session.id, stderr.decode()[-500:])
             if proc.returncode != 0:
                 log.warning(
                     "[host:%s] Agent exited with code %d",

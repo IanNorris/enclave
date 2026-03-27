@@ -10,6 +10,8 @@ import asyncio
 import signal
 import sys
 
+import yaml
+
 from enclave.common.config import load_config
 from enclave.common.logging import get_logger, setup_logging
 from enclave.orchestrator.container import ContainerManager
@@ -18,6 +20,21 @@ from enclave.orchestrator.matrix_client import EnclaveMatrixClient
 from enclave.orchestrator.router import MessageRouter
 
 log = get_logger("main")
+
+
+def _persist_control_room_id(config_path: str | None, room_id: str) -> None:
+    """Write the control_room_id back to the YAML config file."""
+    if not config_path:
+        return
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+        data.setdefault("matrix", {})["control_room_id"] = room_id
+        with open(config_path, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        log.info("Persisted control_room_id to %s", config_path)
+    except Exception as e:
+        log.warning("Could not persist control_room_id: %s", e)
 
 
 async def run() -> None:
@@ -42,6 +59,40 @@ async def run() -> None:
         sys.exit(1)
 
     await matrix.initial_sync()
+
+    # Resolve or create the control room
+    control_room_id = config.matrix.control_room_id
+    if not control_room_id or control_room_id not in matrix.client.rooms:
+        # Check if we're already in a room with the configured name
+        for rid, room in matrix.client.rooms.items():
+            if room.name == config.matrix.control_room_name:
+                control_room_id = rid
+                log.info("Found existing control room '%s': %s",
+                         config.matrix.control_room_name, rid)
+                break
+        else:
+            # Create the control room and invite configured users
+            invite_users = [u.matrix_id for u in config.users] if config.users else []
+            control_room_id = await matrix.create_room(
+                name=config.matrix.control_room_name,
+                topic="Enclave orchestrator control room",
+                invite=invite_users,
+                space_id=config.matrix.space_id or None,
+            )
+            if not control_room_id:
+                log.error("Failed to create control room — exiting")
+                sys.exit(1)
+            log.info("Created control room '%s': %s",
+                     config.matrix.control_room_name, control_room_id)
+
+            # Invite users (create_room passes invite=[] currently, so do it explicitly)
+            for user_id in invite_users:
+                await matrix.invite_user(control_room_id, user_id)
+
+        # Persist the room ID so we reuse it next startup
+        if control_room_id != config.matrix.control_room_id:
+            config.matrix.control_room_id = control_room_id
+            _persist_control_room_id(config_path, control_room_id)
 
     # IPC server
     ipc = IPCServer(socket_dir=config.container.socket_dir)

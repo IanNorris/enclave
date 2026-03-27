@@ -118,6 +118,27 @@ def _container_stats_all() -> dict[str, dict]:
     return {}
 
 
+def _mark_session_stopped(config, session_id: str):
+    """Update session status to stopped in sessions.json."""
+    if config is None:
+        return
+    sessions_file = Path(config.container.session_base) / "sessions.json"
+    if not sessions_file.exists():
+        return
+    try:
+        data = json.loads(sessions_file.read_text())
+        if not isinstance(data, list):
+            return
+        for s in data:
+            if s.get("id") == session_id:
+                s["status"] = "stopped"
+                s["host_pid"] = None
+                break
+        sessions_file.write_text(json.dumps(data, indent=2))
+    except (json.JSONDecodeError, OSError):
+        pass
+
+
 def _get_journal_lines(n: int = 50) -> list[str]:
     """Get recent journal lines for enclave service."""
     try:
@@ -259,6 +280,7 @@ class EnclaveTUI(App):
         Binding("r", "refresh", "Refresh"),
         Binding("s", "focus_sessions", "Sessions"),
         Binding("l", "focus_logs", "Logs"),
+        Binding("x", "stop_session", "Stop Session"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -306,6 +328,66 @@ class EnclaveTUI(App):
         log_panel.update_logs(_get_journal_lines(100))
 
     def _auto_refresh(self):
+        self._do_refresh()
+
+    def action_stop_session(self):
+        """Stop the currently selected session."""
+        table = self.query_one("#sessions-dt", DataTable)
+        if table.cursor_row is None:
+            self.notify("No session selected", severity="warning")
+            return
+
+        sessions = _get_sessions(self._config)
+        if table.cursor_row >= len(sessions):
+            return
+
+        session = sessions[table.cursor_row]
+        sid = session.get("id", "?")
+        status = session.get("status", "")
+
+        if status != "running":
+            self.notify(f"Session {sid} is already {status}", severity="warning")
+            return
+
+        container_id = session.get("container_id", "")
+        host_pid = session.get("host_pid")
+
+        success = False
+        if container_id:
+            try:
+                result = subprocess.run(
+                    ["podman", "stop", container_id],
+                    capture_output=True, text=True, timeout=30,
+                )
+                success = result.returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        # Try by container name (matches session ID)
+        if not success:
+            try:
+                result = subprocess.run(
+                    ["podman", "stop", sid],
+                    capture_output=True, text=True, timeout=30,
+                )
+                success = result.returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        if not success and host_pid:
+            import signal
+            try:
+                os.kill(host_pid, signal.SIGTERM)
+                success = True
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        if success:
+            _mark_session_stopped(self._config, sid)
+            self.notify(f"Stopped session {sid}", severity="information")
+        else:
+            self.notify(f"Failed to stop session {sid}", severity="error")
+
         self._do_refresh()
 
 

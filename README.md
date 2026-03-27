@@ -77,7 +77,66 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 - **systemd** — service management
 - **Nix** — reproducible builds and dev environment
 
-## Quick Start (Nix)
+## Prerequisites
+
+- **Python 3.12+**
+- **Podman** (or Docker)
+- **Rust toolchain** (for the privilege broker):
+  ```bash
+  # If using rustup, ensure a toolchain is installed:
+  rustup default stable
+  ```
+- **Nix** (optional but recommended — `nix develop` provides everything above)
+
+## Installation
+
+```bash
+git clone https://github.com/icstatic/enclave.git
+cd enclave
+
+# Edit config before starting
+cp enclave.yaml.example ~/.config/enclave/enclave.yaml
+nano ~/.config/enclave/enclave.yaml
+
+# Install orchestrator (user-level) — builds, installs, and enables the service
+./install.sh orchestrator
+
+# Build container image
+./install.sh image
+
+# Install privilege broker — builds, installs, and enables the system service
+./install.sh broker
+```
+
+### NixOS
+
+On NixOS, the privilege broker is managed as a NixOS module. Add the flake
+input and enable the service in your `configuration.nix`:
+
+```nix
+# flake.nix
+{
+  inputs.enclave.url = "github:icstatic/enclave";
+
+  outputs = { nixpkgs, enclave, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        enclave.nixosModules.default
+        {
+          services.enclave.enable = true;
+          services.enclave.broker.allowedUser = "ian";
+        }
+      ];
+    };
+  };
+}
+```
+
+Then rebuild: `sudo nixos-rebuild switch`
+
+The orchestrator is still installed as a user service via `./install.sh orchestrator`.
+
+## Development (Nix)
 
 ```bash
 # Development shell with all dependencies

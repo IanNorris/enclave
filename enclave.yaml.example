@@ -1,41 +1,93 @@
+# ─── Enclave Orchestrator Configuration ───
+#
+# Copy to ~/.config/enclave/enclave.yaml and edit.
+# All fields have sensible defaults — only matrix credentials are required.
+# Environment variables (ENCLAVE_*) override file values.
+
+# ── Matrix Connection ──
 matrix:
   homeserver: "https://your.homeserver"
-  user_id: "@enclave-dev:your.homeserver"
-  password: 'YOUR_PASSWORD_HERE'
-  device_name: "Enclave Orchestrator"
-  store_path: "/home/ian/.local/share/enclave/matrix_store"
-  control_room_id: "!rrPHYeAltLgbZwwGJJ:your.homeserver"
-  space_id: ""
+  user_id: "@enclave:your.homeserver"       # Bot account (lowercase!)
+  password: "YOUR_PASSWORD_HERE"
+  device_name: "Enclave Bot"                # Shown in device list
+  store_path: "~/.local/share/enclave/matrix_store"
+  control_room_id: ""                       # Leave blank to auto-create on first run
+  control_room_name: "Enclave Control"      # Name for the auto-created control room
+  space_id: ""                              # Optional Matrix space to organize rooms
 
+# ── Container Runtime ──
 container:
-  image: "enclave-agent:latest"       # Default image (used if no profile matches)
+  image: "enclave-agent:latest"             # Default container image
   runtime: "podman"
-  network: "none"             # Default network for non-SDK containers (isolated)
-  copilot_network: "slirp4netns"  # Network mode when Copilot SDK is enabled
-  dns: ""                     # Optional custom DNS (e.g. "1.1.1.1" to restrict resolver)
-  userns: "keep-id"
-  workspace_base: "/home/ian/.local/share/enclave/workspaces"
-  session_base: "/home/ian/.local/share/enclave/sessions"
-  socket_dir: "/home/ian/.local/share/enclave/sockets"
-  github_token: ""  # GitHub token for Copilot SDK auth (from `gh auth token`)
+  network: "none"                           # Network for containers without Copilot SDK
+  copilot_network: "pasta"                  # Network when Copilot SDK is enabled
+  dns: ""                                   # Custom DNS (e.g. "1.1.1.1"), blank = default
+  userns: "keep-id"                         # Rootless podman user namespace mode
+  workspace_base: "~/.local/share/enclave/workspaces"
+  session_base: "~/.local/share/enclave/sessions"
+  socket_dir: "~/.local/share/enclave/sockets"
+  nix_store: "~/.local/share/enclave/nix"   # Host path for /nix bind-mount
+  github_token: ""                          # Copilot SDK auth (or set ENCLAVE_GITHUB_TOKEN)
   default_profile: "dev"
+
+  # Container profiles — users pick a profile when creating a session.
   profiles:
     dev:
-      image: "enclave-agent:latest"   # Full image with nix + host tool access
-      nix_store: true
-      host_mounts: true
+      image: "enclave-agent:latest"         # Full image with nix + dev tools
+      nix_store: true                       # Mount /nix store for nix packages
+      host_mounts: true                     # Bind-mount host paths (read-only)
+      yolo: false                           # YOLO mode — skip confirmations
       description: "🛠️ Native App Development"
     light:
-      image: "enclave-light:latest"   # Minimal (~200MB), no nix, no host mounts
+      image: "enclave-light:latest"         # Minimal image (~200MB)
       nix_store: false
       host_mounts: false
+      yolo: false
       description: "💬 General"
+    host:
+      image: ""                             # Empty = run directly on host (no container)
+      nix_store: false
+      host_mounts: false
+      yolo: false
+      description: "🖥️ Host (no container)"
 
+  # Read-only host paths bind-mounted into containers as /host/<path>.
+  # Only used when a profile has host_mounts: true.
+  host_mounts:
+    - "/usr/bin"
+    - "/usr/lib"
+    - "/usr/libexec"
+    - "/usr/include"
+    - "/usr/share"
+    - "/usr/local/bin"
+    - "/usr/local/lib"
+    - "/usr/local/include"
+
+# ── User Mappings ──
+# Maps Matrix users to Linux accounts and permissions.
 users:
   - matrix_id: "@your_user:your.homeserver"
-    linux_user: "ian"
-    max_sessions: 10
-    can_approve_privilege: true
+    linux_user: "your_user"
+    display_name: ""                        # Friendly name (optional)
+    pronouns: ""                            # Pronouns (optional, shared with agents)
+    max_sessions: 10                        # Max concurrent agent sessions
+    can_approve_privilege: true              # Can approve sudo requests
+    allowed_rooms: ["*"]                    # Room restrictions ("*" = all)
 
-log_level: "DEBUG"
-data_dir: "/home/ian/.local/share/enclave"
+# ── Privilege Broker ──
+# Connects to the enclave-priv-broker daemon for controlled sudo access.
+priv_broker:
+  socket_path: "/run/enclave-priv/broker.sock"
+  timeout: 300.0                            # Approval timeout in seconds (5 min)
+
+# ── Memory ──
+# Cross-session memory — agents remember facts across conversations.
+memory:
+  auto_memory: false                        # Persist memories automatically
+  auto_dreaming: false                      # Extract memories from session logs
+  key_memory_limit: 200                     # Max lines of key memories in system prompt
+
+# ── General ──
+log_level: "INFO"                           # DEBUG, INFO, WARNING, ERROR
+data_dir: "~/.local/share/enclave"          # Base directory for all data
+idle_timeout: 7200                          # Kill idle sessions after N seconds (0 = never)

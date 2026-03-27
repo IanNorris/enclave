@@ -1,9 +1,16 @@
-"""Desktop integration: Hyprland session detection, GUI launching, screenshots.
+"""Desktop integration: Wayland session detection, GUI launching, screenshots.
 
-Detects the active Hyprland session and provides methods to:
+Detects the active Wayland session and provides methods to:
 - Launch GUI applications on the user's desktop
 - Take screenshots and send them to Matrix
+- Get/set clipboard contents
 - Fall back to headless mode (tmux) when no display is available
+
+Compositor support:
+- Generic Wayland (any compositor): launch, screenshot, clipboard
+- Hyprland: window listing, active window info
+- Sway: window listing, active window info
+- Others: graceful degradation to generic Wayland
 """
 
 from __future__ import annotations
@@ -11,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import json
+import shutil
 from pathlib import Path
 
 from enclave.common.logging import get_logger
@@ -21,59 +29,108 @@ log = get_logger("display")
 class DisplayManager:
     """Manages desktop session detection and interaction.
 
-    Supports Hyprland (primary) with headless fallback via tmux.
+    Works with any Wayland compositor. Compositor-specific features
+    (window listing) degrade gracefully when unavailable.
     """
 
     def __init__(self, user: str = ""):
         self.user = user or os.environ.get("USER", "")
-        self._hyprland_socket: str | None = None
         self._display_available = False
+        self._compositor: str = "generic"  # hyprland, sway, cosmic, generic
+        self._wayland_display: str | None = None
+        self._display_env: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Session detection
     # ------------------------------------------------------------------
 
     def detect_session(self) -> bool:
-        """Detect active Hyprland session.
+        """Detect active Wayland (or X11) session.
 
-        Checks for Hyprland socket and environment variables.
+        Checks environment variables and compositor sockets.
         Returns True if a desktop session is available.
         """
-        # Check env var first
-        instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-        if instance:
-            socket_path = f"/tmp/hypr/{instance}/.socket.sock"
-            if Path(socket_path).exists():
-                self._hyprland_socket = socket_path
-                self._display_available = True
-                log.info("Hyprland session detected: %s", instance)
-                return True
-
-        # Scan for Hyprland sockets
-        hypr_dir = Path("/tmp/hypr")
-        if hypr_dir.exists():
-            for instance_dir in hypr_dir.iterdir():
-                sock = instance_dir / ".socket.sock"
-                if sock.exists():
-                    self._hyprland_socket = str(sock)
-                    self._display_available = True
-                    log.info("Found Hyprland socket: %s", sock)
-                    return True
-
-        # Check XDG_RUNTIME_DIR for Hyprland
+        # Build display environment from current env or well-known paths
+        self._display_env = {}
         xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-        hypr_xdg = Path(xdg) / "hypr"
-        if hypr_xdg.exists():
-            for instance_dir in hypr_xdg.iterdir():
-                sock = instance_dir / ".socket.sock"
-                if sock.exists():
-                    self._hyprland_socket = str(sock)
-                    self._display_available = True
-                    log.info("Found Hyprland socket (XDG): %s", sock)
-                    return True
+        self._display_env["XDG_RUNTIME_DIR"] = xdg
+
+        # Check for Wayland display
+        wayland = os.environ.get("WAYLAND_DISPLAY")
+        if not wayland:
+            # Scan XDG_RUNTIME_DIR for wayland sockets
+            xdg_path = Path(xdg)
+            if xdg_path.exists():
+                for sock in sorted(xdg_path.glob("wayland-*")):
+                    if sock.is_socket():
+                        wayland = sock.name
+                        break
+
+        if wayland:
+            self._wayland_display = wayland
+            self._display_env["WAYLAND_DISPLAY"] = wayland
+            self._display_available = True
+
+            # Detect compositor type
+            self._compositor = self._detect_compositor()
+            log.info(
+                "Wayland session detected: %s (compositor: %s)",
+                wayland,
+                self._compositor,
+            )
+
+            # Pass through X11 display for XWayland apps
+            x_display = os.environ.get("DISPLAY")
+            if x_display:
+                self._display_env["DISPLAY"] = x_display
+
+            return True
+
+        # X11 fallback
+        x_display = os.environ.get("DISPLAY")
+        if x_display:
+            self._display_env["DISPLAY"] = x_display
+            self._display_available = True
+            self._compositor = "x11"
+            log.info("X11 session detected: %s", x_display)
+            return True
 
         self._display_available = False
         log.info("No desktop session detected")
+        return False
+
+    def _detect_compositor(self) -> str:
+        """Detect which Wayland compositor is running."""
+        # Check environment hints
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        if "hyprland" in desktop:
+            return "hyprland"
+        if "sway" in desktop:
+            return "sway"
+        if "cosmic" in desktop:
+            return "cosmic"
+
+        hypr_sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if hypr_sig:
+            return "hyprland"
+        if os.environ.get("SWAYSOCK"):
+            return "sway"
+
+        # Check for running compositor binaries
+        if shutil.which("hyprctl") and self._check_hyprland_running():
+            return "hyprland"
+        if shutil.which("swaymsg"):
+            return "sway"
+
+        return "generic"
+
+    def _check_hyprland_running(self) -> bool:
+        """Check if Hyprland sockets exist."""
+        for base in [Path("/tmp/hypr"), Path(self._display_env.get("XDG_RUNTIME_DIR", "")) / "hypr"]:
+            if base.exists():
+                for d in base.iterdir():
+                    if (d / ".socket.sock").exists():
+                        return True
         return False
 
     @property
@@ -83,51 +140,45 @@ class DisplayManager:
 
     @property
     def session_type(self) -> str:
-        """Type of display session."""
-        if self._hyprland_socket:
-            return "hyprland"
+        """Type of display session (compositor name or 'headless')."""
+        if self._display_available:
+            return self._compositor
         return "headless"
 
+    def get_display_env(self) -> dict[str, str]:
+        """Get environment variables needed for GUI apps."""
+        return dict(self._display_env)
+
     # ------------------------------------------------------------------
-    # Hyprland interaction
+    # Compositor interaction
     # ------------------------------------------------------------------
 
-    async def hyprctl(self, *args: str) -> str | None:
-        """Run a hyprctl command and return stdout.
-
-        Returns None if Hyprland is not available or command fails.
-        """
-        if not self._display_available:
-            return None
-
-        cmd = ["hyprctl"] + list(args)
+    async def _run_cmd(
+        self, *args: str, env_override: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
+        """Run a command with display environment, return (rc, stdout, stderr)."""
         env = dict(os.environ)
-        if self._hyprland_socket:
-            # Extract instance signature from socket path
-            parts = self._hyprland_socket.split("/")
-            for i, p in enumerate(parts):
-                if p == "hypr" and i + 1 < len(parts):
-                    env["HYPRLAND_INSTANCE_SIGNATURE"] = parts[i + 1]
-                    break
+        env.update(self._display_env)
+        if env_override:
+            env.update(env_override)
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
             stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                return stdout.decode().strip()
-            log.warning("hyprctl failed: %s", stderr.decode().strip())
-            return None
+            return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
         except FileNotFoundError:
-            log.warning("hyprctl not found")
-            return None
+            return -1, "", f"{args[0]} not found"
 
     async def launch_app(self, command: str) -> bool:
-        """Launch a GUI application on the Hyprland desktop.
+        """Launch a GUI application on the desktop.
+
+        Uses compositor-native launching when available, otherwise
+        spawns the process directly with the correct display env.
 
         Args:
             command: The command to run (e.g., "firefox", "code .")
@@ -139,38 +190,119 @@ class DisplayManager:
             log.info("No desktop available, cannot launch GUI: %s", command)
             return False
 
-        result = await self.hyprctl("dispatch", "exec", command)
-        if result is not None:
-            log.info("Launched GUI app: %s", command)
+        # Compositor-native launch (better window management)
+        if self._compositor == "hyprland":
+            rc, _, err = await self._run_cmd("hyprctl", "dispatch", "exec", command)
+            if rc == 0:
+                log.info("Launched via hyprctl: %s", command)
+                return True
+            log.warning("hyprctl launch failed: %s", err)
+
+        elif self._compositor == "sway":
+            rc, _, err = await self._run_cmd("swaymsg", "exec", command)
+            if rc == 0:
+                log.info("Launched via swaymsg: %s", command)
+                return True
+            log.warning("swaymsg launch failed: %s", err)
+
+        # Generic fallback — spawn with display env
+        env = dict(os.environ)
+        env.update(self._display_env)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+            log.info("Launched GUI app (generic): %s (pid=%d)", command, proc.pid)
             return True
-        return False
+        except Exception as e:
+            log.error("Failed to launch GUI app: %s", e)
+            return False
 
     async def get_active_window(self) -> dict | None:
-        """Get info about the currently active window."""
-        result = await self.hyprctl("activewindow", "-j")
-        if result:
-            try:
-                return json.loads(result)
-            except json.JSONDecodeError:
-                pass
+        """Get info about the currently active window.
+
+        Returns a dict with at least 'title' and 'class' keys, or None.
+        """
+        if self._compositor == "hyprland":
+            rc, out, _ = await self._run_cmd("hyprctl", "activewindow", "-j")
+            if rc == 0 and out:
+                try:
+                    return json.loads(out)
+                except json.JSONDecodeError:
+                    pass
+
+        elif self._compositor == "sway":
+            rc, out, _ = await self._run_cmd(
+                "swaymsg", "-t", "get_tree",
+            )
+            if rc == 0 and out:
+                try:
+                    tree = json.loads(out)
+                    return self._sway_find_focused(tree)
+                except json.JSONDecodeError:
+                    pass
+
+        return None
+
+    def _sway_find_focused(self, node: dict) -> dict | None:
+        """Recursively find the focused node in a sway tree."""
+        if node.get("focused"):
+            return {
+                "title": node.get("name", ""),
+                "class": node.get("app_id", ""),
+                "pid": node.get("pid"),
+            }
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            result = self._sway_find_focused(child)
+            if result:
+                return result
         return None
 
     async def list_windows(self) -> list[dict]:
         """List all windows."""
-        result = await self.hyprctl("clients", "-j")
-        if result:
-            try:
-                return json.loads(result)
-            except json.JSONDecodeError:
-                pass
+        if self._compositor == "hyprland":
+            rc, out, _ = await self._run_cmd("hyprctl", "clients", "-j")
+            if rc == 0 and out:
+                try:
+                    return json.loads(out)
+                except json.JSONDecodeError:
+                    pass
+
+        elif self._compositor == "sway":
+            rc, out, _ = await self._run_cmd("swaymsg", "-t", "get_tree")
+            if rc == 0 and out:
+                try:
+                    tree = json.loads(out)
+                    return self._sway_collect_windows(tree)
+                except json.JSONDecodeError:
+                    pass
+
         return []
+
+    def _sway_collect_windows(self, node: dict) -> list[dict]:
+        """Collect all leaf windows from a sway tree."""
+        windows = []
+        if node.get("type") == "con" and node.get("name"):
+            windows.append({
+                "title": node.get("name", ""),
+                "class": node.get("app_id", ""),
+                "pid": node.get("pid"),
+                "focused": node.get("focused", False),
+            })
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            windows.extend(self._sway_collect_windows(child))
+        return windows
 
     # ------------------------------------------------------------------
     # Screenshots
     # ------------------------------------------------------------------
 
     async def take_screenshot(self, output_path: str) -> bool:
-        """Take a screenshot using grim.
+        """Take a screenshot using grim (Wayland) or scrot (X11).
 
         Args:
             output_path: Where to save the screenshot (PNG).
@@ -182,81 +314,72 @@ class DisplayManager:
             log.info("No desktop available for screenshot")
             return False
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "grim", output_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode == 0:
+        if self._compositor != "x11":
+            # Wayland: use grim
+            rc, _, err = await self._run_cmd("grim", output_path)
+            if rc == 0:
                 log.info("Screenshot saved: %s", output_path)
                 return True
-            log.warning("grim failed: %s", stderr.decode().strip())
-            return False
-        except FileNotFoundError:
-            log.warning("grim not found — install grim for screenshots")
-            return False
+            log.warning("grim failed: %s", err)
+        else:
+            # X11: use scrot
+            rc, _, err = await self._run_cmd("scrot", output_path)
+            if rc == 0:
+                log.info("Screenshot saved: %s", output_path)
+                return True
+            log.warning("scrot failed: %s", err)
 
-    async def take_region_screenshot(
-        self, output_path: str
-    ) -> bool:
+        return False
+
+    async def take_region_screenshot(self, output_path: str) -> bool:
         """Take a screenshot of a selected region using slurp + grim.
 
-        Note: Requires user interaction (selection) so only useful when present.
+        Note: Requires user interaction (selection).
         """
         if not self._display_available:
             return False
 
-        try:
-            # Get region from slurp
-            slurp = await asyncio.create_subprocess_exec(
-                "slurp",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            region_out, _ = await slurp.communicate()
-            if slurp.returncode != 0:
-                return False
+        if self._compositor == "x11":
+            rc, _, _ = await self._run_cmd("scrot", "-s", output_path)
+            return rc == 0
 
-            region = region_out.decode().strip()
-            proc = await asyncio.create_subprocess_exec(
-                "grim", "-g", region, output_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            return proc.returncode == 0
-        except FileNotFoundError:
+        # Wayland: slurp for region, grim to capture
+        rc, region, _ = await self._run_cmd("slurp")
+        if rc != 0:
             return False
+
+        rc, _, _ = await self._run_cmd("grim", "-g", region, output_path)
+        return rc == 0
 
     # ------------------------------------------------------------------
     # Clipboard
     # ------------------------------------------------------------------
 
     async def get_clipboard(self) -> str | None:
-        """Get clipboard contents using wl-paste."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "wl-paste",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            if proc.returncode == 0:
-                return stdout.decode()
-            return None
-        except FileNotFoundError:
-            return None
+        """Get clipboard contents (wl-paste for Wayland, xclip for X11)."""
+        if self._compositor != "x11":
+            rc, out, _ = await self._run_cmd("wl-paste")
+        else:
+            rc, out, _ = await self._run_cmd("xclip", "-selection", "clipboard", "-o")
+        return out if rc == 0 else None
 
     async def set_clipboard(self, text: str) -> bool:
-        """Set clipboard contents using wl-copy."""
+        """Set clipboard contents (wl-copy for Wayland, xclip for X11)."""
+        env = dict(os.environ)
+        env.update(self._display_env)
+
         try:
+            if self._compositor != "x11":
+                cmd = ["wl-copy"]
+            else:
+                cmd = ["xclip", "-selection", "clipboard"]
+
             proc = await asyncio.create_subprocess_exec(
-                "wl-copy",
+                *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             await proc.communicate(input=text.encode())
             return proc.returncode == 0
@@ -291,14 +414,12 @@ class DisplayManager:
             await check.communicate()
 
             if check.returncode == 0:
-                # Session exists, send command to it
                 proc = await asyncio.create_subprocess_exec(
                     "tmux", "send-keys", "-t", session_name, command, "Enter",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
             else:
-                # Create new session
                 proc = await asyncio.create_subprocess_exec(
                     "tmux", "new-session", "-d", "-s", session_name, command,
                     stdout=asyncio.subprocess.PIPE,

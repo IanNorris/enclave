@@ -292,17 +292,62 @@ def cmd_stop(args):
         return
 
     container_id = session.get("container_id", "")
+    host_pid = session.get("host_pid")
+    sid = args.session_id
+
+    stopped = False
+
+    # Try stopping by container ID first
     if container_id:
         result = subprocess.run(
             ["podman", "stop", container_id],
             capture_output=True, text=True, timeout=30,
         )
-        if result.returncode == 0:
-            console.print(f"[green]✅ Stopped session[/green] {args.session_id}")
-        else:
-            console.print(f"[red]Failed to stop: {result.stderr.strip()}[/red]")
+        stopped = result.returncode == 0
+
+    # Try stopping by container name (podman names match session ID)
+    if not stopped:
+        result = subprocess.run(
+            ["podman", "stop", sid],
+            capture_output=True, text=True, timeout=30,
+        )
+        stopped = result.returncode == 0
+
+    # Try host PID
+    if not stopped and host_pid:
+        import signal
+        try:
+            os.kill(host_pid, signal.SIGTERM)
+            stopped = True
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    if stopped:
+        _mark_session_stopped(config, sid)
+        console.print(f"[green]✅ Stopped session[/green] {sid}")
     else:
-        console.print("[red]No container ID for this session.[/red]")
+        # Even if we can't kill it, mark it stopped to prevent auto-restore
+        _mark_session_stopped(config, sid)
+        console.print(f"[yellow]Marked session {sid} as stopped (process may already be gone).[/yellow]")
+
+
+def _mark_session_stopped(config, session_id: str):
+    """Update session status to stopped in sessions.json."""
+    sessions_file = Path(config.container.session_base) / "sessions.json"
+    if not sessions_file.exists():
+        return
+    try:
+        data = json.loads(sessions_file.read_text())
+        if not isinstance(data, list):
+            return
+        for s in data:
+            if s.get("id") == session_id:
+                s["status"] = "stopped"
+                s["host_pid"] = None
+                break
+        sessions_file.write_text(json.dumps(data, indent=2))
+    except (json.JSONDecodeError, OSError):
+        pass
 
 
 def cmd_cleanup(args):

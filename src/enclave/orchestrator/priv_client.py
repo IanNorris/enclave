@@ -44,7 +44,7 @@ class PrivBrokerClient:
             )
             log.info("Connected to priv broker at %s", self.socket_path)
             return True
-        except (FileNotFoundError, ConnectionRefusedError) as e:
+        except (FileNotFoundError, ConnectionRefusedError, PermissionError) as e:
             log.error("Failed to connect to priv broker: %s", e)
             return False
 

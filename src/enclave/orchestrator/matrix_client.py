@@ -20,6 +20,7 @@ from nio import (
     DownloadResponse,
     Event,
     InviteMemberEvent,
+    LocalProtocolError,
     LoginResponse,
     MatrixRoom,
     MegolmEvent,
@@ -197,6 +198,12 @@ class EnclaveMatrixClient:
         self._start_time = time.time()
         await self.client.sync(timeout=10000, full_state=True)
         await self._trust_all_devices()
+
+        # Auto-join any pending invites from before we started syncing
+        for room_id in list(self.client.invited_rooms):
+            log.info("Pending invite for %s — joining", room_id)
+            await self.client.join(room_id)
+
         log.info("Initial sync complete — %d rooms", len(self.client.rooms))
 
     async def sync_forever(self, timeout: int = 30000) -> None:
@@ -624,7 +631,10 @@ class EnclaveMatrixClient:
 
     async def _trust_all_devices(self) -> None:
         """Trust all devices in all joined rooms (for E2EE)."""
-        await self.client.keys_query()
+        try:
+            await self.client.keys_query()
+        except LocalProtocolError:
+            pass
         for room_id in self.client.rooms:
             await self._trust_devices_in_room(room_id)
 
@@ -944,41 +954,18 @@ class EnclaveMatrixClient:
                 log.error("Poll response handler error: %s", e)
 
     async def _on_megolm(self, room: MatrixRoom, event: MegolmEvent) -> None:
-        """Handle undecryptable messages — forward to handlers and notify."""
+        """Log undecryptable messages without replying (to avoid feedback loops)."""
+        # Silently ignore old messages and our own
+        if event.server_timestamp < (self._start_time * 1000 - 5000):
+            return
+        if event.sender == self.client.user_id:
+            return
         log.warning(
             "Undecryptable message from %s in %s (session: %s)",
             event.sender,
             room.room_id,
             event.session_id,
         )
-        # Don't respond to our own undecryptable messages (e.g. from initial sync)
-        if event.sender == self.client.user_id:
-            return
-        # Ignore old messages
-        if event.server_timestamp < (self._start_time * 1000 - 5000):
-            return
-
-        # Forward to message handlers with a placeholder body so that
-        # session restore and other routing logic still triggers.
-        source = event.source or {}
-        body = "[Encrypted message — unable to decrypt]"
-        for handler in self._message_handlers:
-            try:
-                await handler(room.room_id, event.sender, body, source, [])
-            except Exception as e:
-                log.error("Message handler error (megolm): %s", e)
-
-        # Also notify the user
-        try:
-            await self.send_message(
-                room.room_id,
-                "🔐 I couldn't decrypt your message. This can happen after "
-                "a restart. Your message was still forwarded to the agent "
-                "(it will see it as encrypted). Try re-sending if the agent "
-                "doesn't understand.",
-            )
-        except Exception:
-            pass  # Room might not be in sync store yet
 
     async def _on_encrypted(
         self, room: MatrixRoom, event: RoomEncryptionEvent
