@@ -20,6 +20,28 @@ if TYPE_CHECKING:
     from copilot.session import CopilotSession as _CopilotSession
 
 
+class AgentState:
+    """Mutable container for agent runtime state.
+
+    Closures in main() reference this object so that session recovery can
+    swap sdk_client / sdk_session and all handlers immediately see the new
+    references without re-binding.
+    """
+
+    __slots__ = (
+        "sdk_client", "sdk_session", "listener_ctl",
+        "ipc", "loop", "working_directory",
+    )
+
+    def __init__(self) -> None:
+        self.sdk_client: _CopilotClient | None = None
+        self.sdk_session: _CopilotSession | None = None
+        self.listener_ctl: object | None = None
+        self.ipc: IPCClient | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.working_directory: str = "/workspace"
+
+
 def setup_session_listener(
     ipc: IPCClient,
     sdk_session: _CopilotSession,
@@ -272,11 +294,8 @@ def setup_session_listener(
 
 
 async def handle_user_message(
-    ipc: IPCClient,
-    sdk_session: _CopilotSession | None,
+    state: AgentState,
     msg: Message,
-    loop: asyncio.AbstractEventLoop,
-    listener_ctl: object | None = None,
 ) -> None:
     """Handle a user message — stream events back via IPC."""
     content = msg.payload.get("content", "")
@@ -286,8 +305,8 @@ async def handle_user_message(
     if timestamp:
         content = f"<current_datetime>{timestamp}</current_datetime>\n\n{content}"
 
-    if sdk_session is None:
-        await ipc.send(Message(
+    if state.sdk_session is None:
+        await state.ipc.send(Message(
             type=MessageType.AGENT_RESPONSE,
             payload={"content": f"[echo] {content}", "in_reply_to": msg.id},
             reply_to=msg.id,
@@ -295,12 +314,12 @@ async def handle_user_message(
         return
 
     # Point the persistent listener at this message
-    if listener_ctl and hasattr(listener_ctl, "set_current_msg"):
-        listener_ctl.set_current_msg(msg.id)
+    if state.listener_ctl and hasattr(state.listener_ctl, "set_current_msg"):
+        state.listener_ctl.set_current_msg(msg.id)
 
     try:
         print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
-        await sdk_session.send(content)
+        await state.sdk_session.send(content)
         print(f"[agent] SDK send() returned", file=sys.stderr)
         # Don't wait for SESSION_IDLE here — the persistent listener handles
         # all responses including those from background sub-agents.
@@ -308,29 +327,113 @@ async def handle_user_message(
         err_str = str(e)
         print(f"[agent] SDK send() error: {e}", file=sys.stderr)
 
-        # Session lost — try to recreate it
+        # Session lost — recover from .copilot-state/ checkpoint
         if "Session not found" in err_str:
-            print("[agent] SDK session lost, creating new session...", file=sys.stderr)
-            try:
-                new_result = await try_init_copilot(
-                    working_directory=os.environ.get("ENCLAVE_WORKSPACE", os.getcwd()),
-                    ipc=ipc,
-                )
-                if new_result:
-                    new_client, new_session = new_result
-                    # Update the caller's references via the mutable container
-                    sdk_session.__dict__.update(new_session.__dict__)
-                    print("[agent] SDK session recreated, retrying...", file=sys.stderr)
-                    await sdk_session.send(content)
+            recovered = await _recover_sdk_session(state)
+            if recovered:
+                # Notify user about the recovery
+                await state.ipc.send(Message(
+                    type=MessageType.AGENT_RESPONSE,
+                    payload={
+                        "content": (
+                            "⚠️ *Session recovered from checkpoint — "
+                            "some recent context may be summarized. "
+                            "Continuing...*"
+                        ),
+                        "in_reply_to": msg.id,
+                    },
+                    reply_to=msg.id,
+                ))
+                # Point new listener at this message and retry
+                if state.listener_ctl and hasattr(state.listener_ctl, "set_current_msg"):
+                    state.listener_ctl.set_current_msg(msg.id)
+                try:
+                    await state.sdk_session.send(content)
                     return
-            except Exception as retry_err:
-                print(f"[agent] SDK session recovery failed: {retry_err}", file=sys.stderr)
+                except Exception as retry_err:
+                    print(f"[agent] Retry after recovery failed: {retry_err}", file=sys.stderr)
 
-        await ipc.send(Message(
+        await state.ipc.send(Message(
             type=MessageType.AGENT_RESPONSE,
             payload={"content": f"[error] {e}", "in_reply_to": msg.id},
             reply_to=msg.id,
         ))
+
+
+async def _recover_sdk_session(state: AgentState) -> bool:
+    """Recover from a lost SDK session.
+
+    Strategy:
+    1. Resume on the existing CopilotClient (reuses Node.js subprocess).
+       The SDK loads session state from .copilot-state/ on disk, which
+       includes conversation history via infinite_sessions checkpoints.
+    2. If the existing client can't resume, do a full re-init (new
+       subprocess + resume from disk).
+
+    In both cases the event listener is re-registered on the new session.
+    """
+    old_client = state.sdk_client
+    old_session_id = getattr(state.sdk_session, "session_id", None)
+    print(f"[agent] Recovering SDK session (old={old_session_id})", file=sys.stderr)
+
+    # Unsubscribe old event listener — will re-register on new session
+    if state.listener_ctl and callable(state.listener_ctl):
+        try:
+            state.listener_ctl()
+        except Exception:
+            pass
+        state.listener_ctl = None
+
+    # Strategy 1: Resume on existing client (same Node.js subprocess)
+    if old_client:
+        try:
+            result = await try_init_copilot(
+                working_directory=state.working_directory,
+                ipc=state.ipc,
+                existing_client=old_client,
+            )
+            if result:
+                state.sdk_client, state.sdk_session = result
+                state.listener_ctl = setup_session_listener(
+                    state.ipc, state.sdk_session, state.loop,
+                )
+                print(
+                    f"[agent] Recovered on existing client: "
+                    f"{state.sdk_session.session_id}",
+                    file=sys.stderr,
+                )
+                return True
+        except Exception as e:
+            print(f"[agent] Recovery on existing client failed: {e}", file=sys.stderr)
+
+    # Strategy 2: Full re-init (new Node.js subprocess)
+    print("[agent] Falling back to full SDK re-init", file=sys.stderr)
+    if old_client:
+        try:
+            await old_client.stop()
+        except Exception:
+            pass
+
+    try:
+        result = await try_init_copilot(
+            working_directory=state.working_directory,
+            ipc=state.ipc,
+        )
+        if result:
+            state.sdk_client, state.sdk_session = result
+            state.listener_ctl = setup_session_listener(
+                state.ipc, state.sdk_session, state.loop,
+            )
+            print(
+                f"[agent] Recovered with new client: "
+                f"{state.sdk_session.session_id}",
+                file=sys.stderr,
+            )
+            return True
+    except Exception as e:
+        print(f"[agent] Full SDK re-init failed: {e}", file=sys.stderr)
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -446,11 +549,15 @@ def _request_permission_sync(
 async def try_init_copilot(
     working_directory: str = "/workspace",
     ipc: IPCClient | None = None,
+    existing_client: _CopilotClient | None = None,
 ) -> tuple[_CopilotClient, _CopilotSession] | None:
     """Try to initialize the Copilot SDK.
 
     Attempts to resume the most recent session first (preserving conversation
     history across container restarts). Falls back to creating a new session.
+
+    If *existing_client* is provided the Node.js subprocess is reused —
+    this is the fast path for session recovery after idle timeout.
 
     Returns (client, session) tuple or None if SDK unavailable.
     """
@@ -466,33 +573,37 @@ async def try_init_copilot(
         return None
 
     try:
-        github_token = os.environ.get("GITHUB_TOKEN")
+        if existing_client:
+            # Reuse the Node.js subprocess — fast recovery path
+            client = existing_client
+        else:
+            github_token = os.environ.get("GITHUB_TOKEN")
 
-        # Persist SDK state (sessions, history) to the workspace so it
-        # survives container restarts.
-        state_dir = os.path.join(working_directory, ".copilot-state")
-        os.makedirs(state_dir, exist_ok=True)
+            # Persist SDK state (sessions, history) to the workspace so it
+            # survives container restarts.
+            state_dir = os.path.join(working_directory, ".copilot-state")
+            os.makedirs(state_dir, exist_ok=True)
 
-        cli_args = ["--config-dir", state_dir]
-        sdk_config = SubprocessConfig(
-            github_token=github_token,
-            cli_args=cli_args,
-        ) if github_token else SubprocessConfig(cli_args=cli_args)
+            cli_args = ["--config-dir", state_dir]
+            sdk_config = SubprocessConfig(
+                github_token=github_token,
+                cli_args=cli_args,
+            ) if github_token else SubprocessConfig(cli_args=cli_args)
 
-        client = CopilotClient(sdk_config)
-        await client.start()
+            client = CopilotClient(sdk_config)
+            await client.start()
 
-        # Verify authentication before creating a session
-        try:
-            auth = await client.get_auth_status()
-            if not auth.isAuthenticated:
-                print("[agent] Copilot SDK: not authenticated, falling back to echo", file=sys.stderr)
+            # Verify authentication before creating a session
+            try:
+                auth = await client.get_auth_status()
+                if not auth.isAuthenticated:
+                    print("[agent] Copilot SDK: not authenticated, falling back to echo", file=sys.stderr)
+                    await client.stop()
+                    return None
+            except Exception as e:
+                print(f"[agent] Copilot SDK auth check failed: {e}", file=sys.stderr)
                 await client.stop()
                 return None
-        except Exception as e:
-            print(f"[agent] Copilot SDK auth check failed: {e}", file=sys.stderr)
-            await client.stop()
-            return None
 
         # Build profile-aware system prompt from external files
         profile_name = os.environ.get("ENCLAVE_PROFILE", "dev")
@@ -2078,21 +2189,25 @@ async def main() -> None:
     print("[agent] Connected to orchestrator", file=sys.stderr)
 
     # Try to init Copilot SDK
-    working_directory = os.environ.get("ENCLAVE_WORKSPACE", os.getcwd())
-    sdk_result = await try_init_copilot(working_directory=working_directory, ipc=ipc)
-    listener_ctl = None
+    state = AgentState()
+    state.ipc = ipc
+    state.loop = loop
+    state.working_directory = os.environ.get("ENCLAVE_WORKSPACE", os.getcwd())
+
+    sdk_result = await try_init_copilot(
+        working_directory=state.working_directory, ipc=ipc,
+    )
     if sdk_result:
-        sdk_client, sdk_session = sdk_result
+        state.sdk_client, state.sdk_session = sdk_result
         print("[agent] Copilot SDK initialized", file=sys.stderr)
         # Register persistent event listener (handles background agents too)
         try:
-            listener_ctl = setup_session_listener(ipc, sdk_session, loop)
+            state.listener_ctl = setup_session_listener(ipc, state.sdk_session, loop)
             print("[agent] Persistent event listener registered", file=sys.stderr)
         except ImportError:
             print("[agent] SessionEventType not available, running in echo mode", file=sys.stderr)
-            sdk_client, sdk_session = None, None
+            state.sdk_client, state.sdk_session = None, None
     else:
-        sdk_client, sdk_session = None, None
         print("[agent] Running in echo mode (no Copilot SDK)", file=sys.stderr)
 
     # Send ready status
@@ -2101,13 +2216,13 @@ async def main() -> None:
         payload={
             "status": "ready",
             "session_id": session_id,
-            "copilot_available": sdk_session is not None,
+            "copilot_available": state.sdk_session is not None,
         },
     ))
 
     # Register message handlers
     async def on_user_message(msg: Message) -> Message | None:
-        await handle_user_message(ipc, sdk_session, msg, loop, listener_ctl)
+        await handle_user_message(state, msg)
         return None
 
     async def on_scheduled_trigger(msg: Message) -> Message | None:
@@ -2123,7 +2238,7 @@ async def main() -> None:
             type=MessageType.USER_MESSAGE,
             payload={"content": content, "sender": "scheduler", "timestamp": ts},
         )
-        await handle_user_message(ipc, sdk_session, synth, loop, listener_ctl)
+        await handle_user_message(state, synth)
         return None
 
     async def on_shutdown(msg: Message) -> Message | None:
@@ -2153,8 +2268,11 @@ async def main() -> None:
         )
 
         try:
+            if not state.sdk_session:
+                print("[agent] No SDK session for dreaming", file=sys.stderr)
+                return None
             # Use the SDK to extract memories from the current context
-            turn = sdk_session.send(
+            turn = state.sdk_session.send(
                 dream_prompt,
                 options={"model": "gpt-4o-mini"},  # use smaller model for extraction
             )
@@ -2190,7 +2308,7 @@ async def main() -> None:
 
     async def on_file_change(msg: Message) -> Message | None:
         """Handle file change notifications from workspace watcher."""
-        if not session:
+        if not state.sdk_session:
             return None
         changes = msg.payload.get("changes", [])
         count = msg.payload.get("count", 0)
@@ -2213,10 +2331,7 @@ async def main() -> None:
         # Send as a system-level notification to the session
         print(f"[agent] File changes detected: {count} files", file=sys.stderr)
         try:
-            await session.send_user_message(
-                notification,
-                reply_to=None,
-            )
+            await state.sdk_session.send(notification)
         except Exception as e:
             print(f"[agent] Failed to notify about file changes: {e}", file=sys.stderr)
 
@@ -2239,19 +2354,19 @@ async def main() -> None:
         pass
 
     # Cleanup
-    if listener_ctl and callable(listener_ctl):
+    if state.listener_ctl and callable(state.listener_ctl):
         try:
-            listener_ctl()
+            state.listener_ctl()
         except Exception:
             pass
-    if sdk_session:
+    if state.sdk_session:
         try:
-            await sdk_session.disconnect()
+            await state.sdk_session.disconnect()
         except Exception:
             pass
-    if sdk_client:
+    if state.sdk_client:
         try:
-            await sdk_client.stop()
+            await state.sdk_client.stop()
         except Exception:
             pass
 
