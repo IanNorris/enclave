@@ -305,7 +305,27 @@ async def handle_user_message(
         # Don't wait for SESSION_IDLE here — the persistent listener handles
         # all responses including those from background sub-agents.
     except Exception as e:
+        err_str = str(e)
         print(f"[agent] SDK send() error: {e}", file=sys.stderr)
+
+        # Session lost — try to recreate it
+        if "Session not found" in err_str:
+            print("[agent] SDK session lost, creating new session...", file=sys.stderr)
+            try:
+                new_result = await try_init_copilot(
+                    working_directory=os.environ.get("ENCLAVE_WORKSPACE", os.getcwd()),
+                    ipc=ipc,
+                )
+                if new_result:
+                    new_client, new_session = new_result
+                    # Update the caller's references via the mutable container
+                    sdk_session.__dict__.update(new_session.__dict__)
+                    print("[agent] SDK session recreated, retrying...", file=sys.stderr)
+                    await sdk_session.send(content)
+                    return
+            except Exception as retry_err:
+                print(f"[agent] SDK session recovery failed: {retry_err}", file=sys.stderr)
+
         await ipc.send(Message(
             type=MessageType.AGENT_RESPONSE,
             payload={"content": f"[error] {e}", "in_reply_to": msg.id},
