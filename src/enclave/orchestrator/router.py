@@ -766,6 +766,7 @@ class MessageRouter:
         elif msg.type == MessageType.TURN_START:
             log.info("Agent %s turn started", session.id)
             self._turn_start_time[session.id] = time.monotonic()
+            self._control.cancel_turn_end(session.id)
         elif msg.type == MessageType.TURN_END:
             elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
             log.info("Agent %s turn ended (%.1fs)", session.id, elapsed)

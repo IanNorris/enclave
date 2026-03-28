@@ -40,6 +40,8 @@ class ControlServer:
         self._server: asyncio.AbstractServer | None = None
         # session_id → set of (queue) for response subscribers
         self._subscribers: dict[str, set[asyncio.Queue[dict]]] = {}
+        # Debounce timers for turn_end (cancel if turn_start follows)
+        self._turn_end_timers: dict[str, asyncio.TimerHandle] = {}
 
     async def start(self) -> None:
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -64,9 +66,33 @@ class ControlServer:
             q.put_nowait({"ok": True, "type": "response", "content": content})
 
     def notify_turn_end(self, session_id: str) -> None:
-        """Called by the router when an agent's turn ends."""
-        for q in self._subscribers.get(session_id, set()):
-            q.put_nowait({"ok": True, "type": "turn_end"})
+        """Called by the router when an agent's turn ends.
+
+        Debounced: waits 2s before notifying subscribers, cancelled if a new
+        turn starts (agents do multiple turns per interaction).
+        """
+        # Cancel any pending debounce
+        timer = self._turn_end_timers.pop(session_id, None)
+        if timer:
+            timer.cancel()
+
+        subs = self._subscribers.get(session_id)
+        if not subs:
+            return
+
+        def _fire() -> None:
+            self._turn_end_timers.pop(session_id, None)
+            for q in self._subscribers.get(session_id, set()):
+                q.put_nowait({"ok": True, "type": "turn_end"})
+
+        loop = asyncio.get_event_loop()
+        self._turn_end_timers[session_id] = loop.call_later(2.0, _fire)
+
+    def cancel_turn_end(self, session_id: str) -> None:
+        """Cancel a pending turn_end debounce (called on turn_start)."""
+        timer = self._turn_end_timers.pop(session_id, None)
+        if timer:
+            timer.cancel()
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
