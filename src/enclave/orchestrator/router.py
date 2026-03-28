@@ -7,6 +7,7 @@ and routes agent responses back to Matrix. Handles control room commands.
 from __future__ import annotations
 
 import asyncio
+import html as _html_mod
 import os
 import time
 import uuid
@@ -48,6 +49,11 @@ _EDIT_THROTTLE = 1.5
 
 # Max length for accumulated activity messages before starting a new one
 _MAX_ACTIVITY_LEN = 3500
+
+
+def _html_escape(text: str) -> str:
+    """Escape text for safe inclusion in HTML."""
+    return _html_mod.escape(text, quote=False)
 
 
 class MessageRouter:
@@ -833,8 +839,9 @@ class MessageRouter:
         intent = msg.payload.get("intent", "")
         if intent:
             log.debug("Agent %s intent: %s", session.id, intent)
-            status_text = f"💭 {intent}"
-            await self._update_activity(session, status_text, thread_id)
+            plain = f"💭 {intent}"
+            html = f"💭 <i>{_html_escape(intent)}</i>"
+            await self._update_activity(session, plain, thread_id, html=html)
             return
 
         # Full reasoning text (complete thinking block)
@@ -845,8 +852,9 @@ class MessageRouter:
             if len(reasoning) > 200:
                 preview += "…"
             log.debug("Agent %s reasoning: %s", session.id, preview[:80])
-            status_text = f"🧠 {preview}"
-            await self._update_activity(session, status_text, thread_id)
+            plain = f"🧠 {preview}"
+            html = f"🧠 <i>{_html_escape(preview)}</i>"
+            await self._update_activity(session, plain, thread_id, html=html)
             return
 
         # Streaming reasoning delta — accumulate and show latest chunk
@@ -854,8 +862,29 @@ class MessageRouter:
         if delta:
             preview = delta.strip()[:150].replace("\n", " ")
             if preview:
-                status_text = f"🧠 …{preview}"
-                await self._update_activity(session, status_text, thread_id)
+                plain = f"🧠 …{preview}"
+                html = f"🧠 <i>…{_html_escape(preview)}</i>"
+                await self._update_activity(session, plain, thread_id, html=html)
+
+    # Friendly display names for common SDK tools
+    _TOOL_LABELS: dict[str, str] = {
+        "bash": "Running command",
+        "read_bash": "Reading output",
+        "write_bash": "Sending input",
+        "stop_bash": "Stopping process",
+        "view": "Reading file",
+        "edit": "Editing file",
+        "create": "Creating file",
+        "grep": "Searching code",
+        "glob": "Finding files",
+        "web_fetch": "Fetching URL",
+        "web_search": "Searching web",
+        "task": "Running sub-agent",
+        "read_agent": "Reading agent result",
+        "sql": "Running query",
+        "ask_user": "Asking user",
+        "list_bash": "Listing sessions",
+    }
 
     async def _handle_tool_start(
         self, session: Session, msg: Message
@@ -872,11 +901,15 @@ class MessageRouter:
             tool=tool_name, description=description,
         )
         thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
+
+        label = self._TOOL_LABELS.get(tool_name, tool_name)
         if description:
-            status_text = f"🔧 **{tool_name}**: {description}"
+            plain = f"🔧 {label}: {description}"
+            html = f"🔧 <b>{label}</b>: {_html_escape(description)}"
         else:
-            status_text = f"🔧 **{tool_name}**"
-        await self._update_activity(session, status_text, thread_id)
+            plain = f"🔧 {label}"
+            html = f"🔧 <b>{label}</b>"
+        await self._update_activity(session, plain, thread_id, html=html)
 
     async def _handle_tool_complete(
         self, session: Session, msg: Message
@@ -1041,7 +1074,8 @@ class MessageRouter:
         )
 
     async def _update_activity(
-        self, session: Session, text: str, thread_id: str | None
+        self, session: Session, text: str, thread_id: str | None,
+        html: str | None = None,
     ) -> None:
         """Append a line to the activity status message.
 
@@ -1051,27 +1085,33 @@ class MessageRouter:
         messages are **not** deleted — they stay in the chat history.
         """
         lines = self._activity_lines.setdefault(session.id, [])
-        lines.append(text)
-        combined = "\n".join(lines)
+        lines.append((text, html or text))
+        combined_plain = "\n".join(t for t, _ in lines)
+        combined_html = "<br/>".join(h for _, h in lines)
 
         existing = self._activity_msg.get(session.id)
 
-        if existing and len(combined) <= _MAX_ACTIVITY_LEN:
+        if existing and len(combined_plain) <= _MAX_ACTIVITY_LEN:
             # Still fits — edit the existing message
-            await self.matrix.edit_message(session.room_id, existing, combined)
+            await self.matrix.edit_message(
+                session.room_id, existing, combined_plain,
+                html_body=combined_html,
+            )
         elif existing:
             # Over the limit — finalise current message and start a new one
             self._activity_msg.pop(session.id, None)
-            self._activity_lines[session.id] = [text]
+            self._activity_lines[session.id] = [(text, html or text)]
             event_id = await self.matrix.send_message(
-                session.room_id, text, thread_event_id=thread_id,
+                session.room_id, text, html_body=html or text,
+                thread_event_id=thread_id,
             )
             if event_id:
                 self._activity_msg[session.id] = event_id
         else:
             # No existing message — create one
             event_id = await self.matrix.send_message(
-                session.room_id, combined, thread_event_id=thread_id,
+                session.room_id, combined_plain, html_body=combined_html,
+                thread_event_id=thread_id,
             )
             if event_id:
                 self._activity_msg[session.id] = event_id
