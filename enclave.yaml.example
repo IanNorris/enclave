@@ -36,18 +36,21 @@ container:
       image: "enclave-agent:latest"         # Full image with nix + dev tools
       nix_store: true                       # Mount /nix store for nix packages
       host_mounts: true                     # Bind-mount host paths (read-only)
+      gui: true                             # Mount Wayland socket + GPU for GUI apps
       yolo: false                           # YOLO mode — skip confirmations
       description: "🛠️ Native App Development"
     light:
       image: "enclave-light:latest"         # Minimal image (~200MB)
       nix_store: false
       host_mounts: false
+      gui: false
       yolo: false
       description: "💬 General"
     host:
       image: ""                             # Empty = run directly on host (no container)
       nix_store: false
       host_mounts: false
+      gui: false                            # Host agents use display directly
       yolo: false
       description: "🖥️ Host (no container)"
 

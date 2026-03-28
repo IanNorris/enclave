@@ -265,6 +265,24 @@ class ContainerManager:
                     container_path = f"/host{host_path}"
                     cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
 
+        # GUI passthrough: mount Wayland socket + GPU for direct rendering
+        if profile.gui:
+            xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            wayland = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+            wayland_sock = Path(xdg) / wayland
+            if wayland_sock.exists():
+                cmd.extend([
+                    "-v", f"{wayland_sock}:/run/user/1000/{wayland}:rw",
+                    "-e", f"WAYLAND_DISPLAY={wayland}",
+                    "-e", f"XDG_RUNTIME_DIR=/run/user/1000",
+                ])
+                log.info("[start:%s] Wayland socket mounted: %s", session_id, wayland)
+            # GPU device for hardware-accelerated rendering
+            dri = Path("/dev/dri")
+            if dri.exists():
+                cmd.extend(["--device", "/dev/dri"])
+                log.info("[start:%s] GPU device mounted", session_id)
+
         # Build PATH — include nix and host dirs only when enabled
         path_parts = ["/usr/local/bin", "/usr/bin", "/bin"]
         if profile.nix_store:

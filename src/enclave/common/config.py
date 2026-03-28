@@ -42,6 +42,7 @@ class ContainerProfile:
     image: str = "enclave-agent:latest"
     nix_store: bool = True
     host_mounts: bool = False
+    gui: bool = False
     yolo: bool = False
     description: str = ""
 
@@ -247,6 +248,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                         image=pdata.get("image", "enclave-agent:latest"),
                         nix_store=pdata.get("nix_store", True),
                         host_mounts=pdata.get("host_mounts", True),
+                        gui=pdata.get("gui", False),
                         yolo=pdata.get("yolo", False),
                         description=pdata.get("description", ""),
                     )
