@@ -103,9 +103,9 @@ class ControlServer:
 
     async def _handle_list(self, writer: asyncio.StreamWriter) -> None:
         sessions = []
-        for sid, session in self._router.containers.sessions.items():
+        for session in self._router.containers.list_sessions():
             sessions.append({
-                "id": sid,
+                "id": session.id,
                 "name": session.name,
                 "status": session.status,
                 "room_id": session.room_id,
@@ -126,7 +126,7 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": "Missing session or content"})
             return
 
-        session = self._router.containers.sessions.get(session_id)
+        session = self._router.containers.get_session(session_id)
         if not session:
             await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
             return
