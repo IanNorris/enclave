@@ -282,6 +282,17 @@ class ContainerManager:
             if dri.exists():
                 cmd.extend(["--device", "/dev/dri"])
                 log.info("[start:%s] GPU device mounted", session_id)
+            # NixOS GPU driver stack (Mesa, EGL, Vulkan)
+            opengl_driver = Path("/run/opengl-driver")
+            if opengl_driver.exists():
+                real_driver = opengl_driver.resolve()
+                cmd.extend([
+                    "-v", f"{real_driver}:/run/opengl-driver:ro",
+                    "-e", "LIBGL_DRIVERS_PATH=/run/opengl-driver/lib/dri",
+                    "-e", "__EGL_VENDOR_LIBRARY_DIRS=/run/opengl-driver/share/glvnd/egl_vendor.d",
+                    "-e", "LD_LIBRARY_PATH=/run/opengl-driver/lib",
+                ])
+                log.info("[start:%s] NixOS GPU drivers mounted: %s", session_id, real_driver)
 
         # Build PATH — include nix and host dirs only when enabled
         path_parts = ["/usr/local/bin", "/usr/bin", "/bin"]
