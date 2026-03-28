@@ -2275,6 +2275,11 @@ class MessageRouter:
             ))
             return
 
+        # Translate container paths to host paths
+        if "/workspace" in command and session.workspace_path:
+            command = command.replace("/workspace", session.workspace_path)
+            log.debug("Translated GUI command path: %s", command)
+
         # Require approval like sudo
         status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,

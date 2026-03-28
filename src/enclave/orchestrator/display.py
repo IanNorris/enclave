@@ -212,11 +212,24 @@ class DisplayManager:
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 env=env,
                 start_new_session=True,
             )
             log.info("Launched GUI app (generic): %s (pid=%d)", command, proc.pid)
+
+            # Monitor stderr briefly for early failures
+            async def _watch_stderr() -> None:
+                try:
+                    data = await asyncio.wait_for(proc.stderr.read(4096), timeout=5.0)
+                    if data:
+                        log.warning("GUI app stderr: %s", data.decode(errors="replace").strip())
+                except asyncio.TimeoutError:
+                    pass  # Still running, no early error
+                except Exception:
+                    pass
+            asyncio.create_task(_watch_stderr())
+
             return True
         except Exception as e:
             log.error("Failed to launch GUI app: %s", e)
