@@ -290,9 +290,17 @@ class ContainerManager:
                     "-v", f"{real_driver}:/run/opengl-driver:ro",
                     "-e", "LIBGL_DRIVERS_PATH=/run/opengl-driver/lib/dri",
                     "-e", "__EGL_VENDOR_LIBRARY_DIRS=/run/opengl-driver/share/glvnd/egl_vendor.d",
-                    "-e", "LD_LIBRARY_PATH=/run/opengl-driver/lib",
                 ])
+                ld_paths = ["/run/opengl-driver/lib"]
                 log.info("[start:%s] NixOS GPU drivers mounted: %s", session_id, real_driver)
+                # libglvnd provides the GL dispatch layer (libEGL.so.1, libGL.so.1)
+                # that apps link against — Mesa only has vendor libs (libEGL_mesa.so)
+                glvnd_path = self._find_libglvnd(real_driver)
+                if glvnd_path:
+                    cmd.extend(["-v", f"{glvnd_path}:/run/libglvnd:ro"])
+                    ld_paths.insert(0, "/run/libglvnd/lib")
+                    log.info("[start:%s] libglvnd mounted: %s", session_id, glvnd_path)
+                cmd.extend(["-e", f"LD_LIBRARY_PATH={':'.join(ld_paths)}"])
 
         # Build PATH — include nix and host dirs only when enabled
         path_parts = ["/usr/local/bin", "/usr/bin", "/bin"]
@@ -381,6 +389,22 @@ class ContainerManager:
             session.status = "stopped"
             log.error("[start:%s] Exception starting container: %s", session_id, e)
             return False, f"Exception: {e}"
+
+    @staticmethod
+    def _find_libglvnd(driver_path: Path) -> Path | None:
+        """Find the libglvnd store path from the NixOS graphics driver closure."""
+        try:
+            result = subprocess.run(
+                ["nix-store", "-q", "--requisites", str(driver_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.splitlines():
+                p = Path(line.strip())
+                if "libglvnd" in p.name and (p / "lib" / "libEGL.so.1").exists():
+                    return p
+        except Exception as e:
+            log.warning("Failed to find libglvnd: %s", e)
+        return None
 
     async def _start_host_session(
         self, session: Session, profile: "ContainerProfile"
