@@ -41,6 +41,7 @@ from enclave.orchestrator.scheduler import Scheduler, ScheduleEntry, TimerEntry
 from enclave.orchestrator.display import DisplayManager
 from enclave.orchestrator.memory import MemoryStore
 from enclave.orchestrator.watcher import WorkspaceWatcher
+from enclave.orchestrator.control import ControlServer
 
 log = get_logger("router")
 
@@ -185,6 +186,10 @@ class MessageRouter:
         # ── Cost / token tracking ──
         self._cost = CostTracker(self._data_dir)
 
+        # ── Control socket for external message injection ──
+        control_sock = os.path.join(self._data_dir, "control.sock")
+        self._control = ControlServer(control_sock, self)
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)
@@ -219,6 +224,9 @@ class MessageRouter:
         # Start scheduler
         await self._scheduler.start()
 
+        # Start control socket
+        await self._control.start()
+
         # Auto-restore sessions that were running before last shutdown
         await self._auto_restore_sessions()
 
@@ -237,9 +245,32 @@ class MessageRouter:
             except asyncio.CancelledError:
                 pass
         await self._scheduler.stop()
+        await self._control.stop()
         await self._priv_client.disconnect()
         self._perm_db.close()
         log.info("Router stopped")
+
+    async def inject_message(self, session_id: str, content: str) -> bool:
+        """Inject a user message into a session (from control socket)."""
+        session = self.containers.get_session(session_id)
+        if not session:
+            return False
+        msg = Message(
+            type=MessageType.USER_MESSAGE,
+            payload={
+                "content": content,
+                "sender": "control",
+                "room_id": session.room_id,
+                "thread_id": None,
+                "attachments": [],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        sent = await self.ipc.send_to(session_id, msg)
+        if sent:
+            self._touch_activity(session_id)
+            log.info("Injected control message to %s: %s", session_id, content[:80])
+        return sent
 
     async def _auto_restore_sessions(self) -> None:
         """Restore sessions that were running before last shutdown/reboot.
@@ -738,6 +769,7 @@ class MessageRouter:
         elif msg.type == MessageType.TURN_END:
             elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
             log.info("Agent %s turn ended (%.1fs)", session.id, elapsed)
+            self._control.notify_turn_end(session.id)
         elif msg.type == MessageType.STATUS_UPDATE:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
@@ -1124,6 +1156,9 @@ class MessageRouter:
         content = msg.payload.get("content", "")
         if not content:
             return
+
+        # Notify control socket subscribers
+        self._control.notify_response(session.id, content)
 
         thread_id = self._thread_events.get(session.id)
         log.info(
