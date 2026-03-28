@@ -251,7 +251,11 @@ class MessageRouter:
         log.info("Router stopped")
 
     async def inject_message(self, session_id: str, content: str) -> bool:
-        """Inject a user message into a session (from control socket)."""
+        """Inject a user message into a session (from control socket).
+
+        Also echoes the message to the agent's Matrix room so users can
+        follow the conversation.
+        """
         session = self.containers.get_session(session_id)
         if not session:
             return False
@@ -270,6 +274,12 @@ class MessageRouter:
         if sent:
             self._touch_activity(session_id)
             log.info("Injected control message to %s: %s", session_id, content[:80])
+            # Echo to Matrix so the user can see what was sent
+            await self.matrix.send_message(
+                session.room_id,
+                content,
+                html_body=f"<i>{_html_escape(content)}</i>",
+            )
         return sent
 
     async def _auto_restore_sessions(self) -> None:
