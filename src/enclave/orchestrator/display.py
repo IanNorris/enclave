@@ -174,7 +174,7 @@ class DisplayManager:
         except FileNotFoundError:
             return -1, "", f"{args[0]} not found"
 
-    async def launch_app(self, command: str) -> bool:
+    async def launch_app(self, command: str, extra_env: dict[str, str] | None = None) -> bool:
         """Launch a GUI application on the desktop.
 
         Uses compositor-native launching when available, otherwise
@@ -182,6 +182,7 @@ class DisplayManager:
 
         Args:
             command: The command to run (e.g., "firefox", "code .")
+            extra_env: Additional environment variables to set.
 
         Returns:
             True if launched successfully.
@@ -208,6 +209,8 @@ class DisplayManager:
         # Generic fallback — spawn with display env
         env = dict(os.environ)
         env.update(self._display_env)
+        if extra_env:
+            env.update(extra_env)
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,

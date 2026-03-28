@@ -2276,9 +2276,20 @@ class MessageRouter:
             return
 
         # Translate container paths to host paths
+        extra_env: dict[str, str] = {}
         if "/workspace" in command and session.workspace_path:
             command = command.replace("/workspace", session.workspace_path)
             log.debug("Translated GUI command path: %s", command)
+
+            # Container-built binaries may need libraries from the container's
+            # nix store or system libs.  Resolve missing shared libs on the host.
+            extra_lib_dirs = await self._resolve_missing_libs(command)
+            if extra_lib_dirs:
+                existing = os.environ.get("LD_LIBRARY_PATH", "")
+                extra_env["LD_LIBRARY_PATH"] = ":".join(extra_lib_dirs) + (
+                    f":{existing}" if existing else ""
+                )
+                log.info("Added LD_LIBRARY_PATH for GUI: %s", extra_env["LD_LIBRARY_PATH"])
 
         # Require approval like sudo
         status, scope, pattern = await self._approval.request_permission(
@@ -2299,12 +2310,66 @@ class MessageRouter:
             ))
             return
 
-        success = await self._display.launch_app(command)
+        success = await self._display.launch_app(command, extra_env=extra_env)
         await self.ipc.send_to(session.id, Message(
             type=MessageType.GUI_LAUNCH_REQUEST,
             payload={"ok": success, "command": command},
             reply_to=msg.id,
         ))
+
+    async def _resolve_missing_libs(self, command: str) -> list[str]:
+        """Find host nix-store library dirs for missing shared libraries.
+
+        Runs ldd on the binary, parses 'not found' lines, then locates
+        the libs in /nix/store. Returns a list of directories to add to
+        LD_LIBRARY_PATH.
+        """
+        # Extract the binary path (first token of command)
+        binary = command.split()[0]
+        if not os.path.isfile(binary):
+            return []
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ldd", binary,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            missing = []
+            for line in stdout.decode(errors="replace").splitlines():
+                if "not found" in line:
+                    # Format: "\tlibFoo.so.0 => not found"
+                    lib_name = line.strip().split()[0]
+                    missing.append(lib_name)
+
+            if not missing:
+                return []
+
+            log.info("Missing libs for %s: %s", binary, missing)
+
+            # Search nix store for each missing lib
+            lib_dirs: list[str] = []
+            for lib in missing:
+                find_proc = await asyncio.create_subprocess_exec(
+                    "find", "/nix/store", "-maxdepth", "3",
+                    "-name", lib, "-type", "f",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await asyncio.wait_for(find_proc.communicate(), timeout=10.0)
+                paths = out.decode(errors="replace").strip().splitlines()
+                if paths:
+                    # Use the last (newest) match
+                    lib_dir = str(Path(paths[-1]).parent)
+                    if lib_dir not in lib_dirs:
+                        lib_dirs.append(lib_dir)
+                        log.debug("Found %s at %s", lib, lib_dir)
+
+            return lib_dirs
+        except Exception as e:
+            log.warning("Failed to resolve missing libs: %s", e)
+            return []
 
     async def _handle_screenshot(self, session: Session, msg: Message) -> None:
         """Handle a screenshot request — auto-approved (read-only)."""
