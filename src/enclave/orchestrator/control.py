@@ -114,6 +114,8 @@ class ControlServer:
                 await self._handle_send(req, writer, reader)
             elif action == "stop":
                 await self._handle_stop(req, writer)
+            elif action == "delete":
+                await self._handle_delete(req, writer)
             else:
                 await self._write(writer, {"ok": False, "error": f"Unknown action: {action}"})
         except asyncio.TimeoutError:
@@ -169,6 +171,34 @@ class ControlServer:
             await self._write(writer, {"ok": True, "type": "stopped"})
         else:
             await self._write(writer, {"ok": False, "error": "Failed to stop session"})
+
+    async def _handle_delete(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        session_id = req.get("session", "")
+        if not session_id:
+            await self._write(writer, {"ok": False, "error": "Missing session"})
+            return
+
+        session = self._router.containers.get_session(session_id)
+        if not session:
+            await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
+            return
+
+        log.info("Delete requested via control socket: %s", session_id)
+
+        # Send shutdown if still connected
+        if self._router.ipc.is_connected(session_id):
+            await self._router.ipc.send_to(
+                session_id,
+                Message(type=MessageType.SHUTDOWN, payload={}),
+            )
+
+        ok = await self._router.containers.remove_session(session_id, reason="control")
+        await self._router.ipc.remove_socket(session_id)
+
+        if ok:
+            await self._write(writer, {"ok": True, "type": "deleted"})
+        else:
+            await self._write(writer, {"ok": False, "error": "Failed to delete session"})
 
     async def _handle_send(
         self,

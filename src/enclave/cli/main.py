@@ -372,6 +372,88 @@ def _mark_session_status(config, session_id: str, status: str = "stopped"):
         pass
 
 
+def cmd_delete(args):
+    """Delete a session: stop, remove workspace and session data."""
+    config = _load_config()
+    sessions = _get_sessions(config)
+
+    session = None
+    for s in sessions:
+        if s.get("id") == args.session_id:
+            session = s
+            break
+
+    if session is None:
+        console.print(f"[red]Session not found:[/red] {args.session_id}")
+        sys.exit(1)
+
+    sid = args.session_id
+    ws = session.get("workspace_path", "")
+    ws_size = _workspace_size(ws) if ws else "—"
+
+    if not args.confirm:
+        console.print(f"[bold]Delete session:[/bold] {sid}")
+        console.print(f"  Name:      {session.get('name', '?')}")
+        console.print(f"  Status:    {session.get('status', '?')}")
+        console.print(f"  Workspace: {ws} ({ws_size})")
+        console.print()
+        try:
+            answer = input("Type 'yes' to confirm deletion: ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled.[/dim]")
+            return
+        if answer.strip().lower() != "yes":
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+    # Use control socket if available
+    control_sock = Path(config.data_dir) / "control.sock"
+    if control_sock.exists():
+        import socket as _socket
+        try:
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(30)
+            sock.connect(str(control_sock))
+            sock.sendall(json.dumps({"action": "delete", "session": sid}).encode() + b"\n")
+            console.print(f"[dim]Deleting {sid}...[/dim]")
+            data = sock.recv(4096)
+            sock.close()
+            resp = json.loads(data.decode().strip())
+            if resp.get("ok"):
+                console.print(f"[green]✅ Deleted session[/green] {sid}")
+                return
+            else:
+                console.print(f"[yellow]Control socket: {resp.get('error')}[/yellow]")
+        except Exception as e:
+            console.print(f"[dim]Control socket unavailable ({e}), falling back to local cleanup...[/dim]")
+
+    # Fallback: local cleanup (orchestrator not running)
+    import shutil
+    if session.get("status") in ("running", "starting"):
+        console.print("[yellow]Session may still be running — stopping first...[/yellow]")
+        subprocess.run(["podman", "stop", sid], capture_output=True, timeout=15)
+
+    if ws and Path(ws).exists():
+        shutil.rmtree(ws, ignore_errors=True)
+        console.print(f"  [green]✓[/green] Removed workspace: {ws}")
+
+    session_dir = Path(config.container.session_base) / sid
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+        console.print(f"  [green]✓[/green] Removed session dir: {session_dir}")
+
+    # Remove from sessions.json
+    sessions_file = Path(config.container.session_base) / "sessions.json"
+    try:
+        data = json.loads(sessions_file.read_text())
+        data = [s for s in data if s.get("id") != sid]
+        sessions_file.write_text(json.dumps(data, indent=2))
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    console.print(f"[green]✅ Deleted session[/green] {sid}")
+
+
 def cmd_cleanup(args):
     """List or clean up stopped sessions."""
     config = _load_config()
@@ -406,15 +488,49 @@ def cmd_cleanup(args):
         return
 
     console.print(f"Cleaning up {len(stopped)} stopped sessions...")
+    import socket as _socket
+
+    control_sock = Path(config.data_dir) / "control.sock"
+    use_control = control_sock.exists()
+
     for s in stopped:
-        cid = s.get("container_id", "")
-        if cid:
-            subprocess.run(
-                ["podman", "rm", "-f", cid],
-                capture_output=True, timeout=10,
-            )
-        console.print(f"  [green]✓[/green] {s.get('id')}")
-    console.print(f"\n[green]Cleaned up {len(stopped)} sessions.[/green]")
+        sid = s.get("id", "")
+        if use_control:
+            try:
+                sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                sock.settimeout(30)
+                sock.connect(str(control_sock))
+                sock.sendall(json.dumps({"action": "delete", "session": sid}).encode() + b"\n")
+                data = sock.recv(4096)
+                sock.close()
+                resp = json.loads(data.decode().strip())
+                if resp.get("ok"):
+                    console.print(f"  [green]✓[/green] {sid}")
+                    continue
+            except Exception:
+                pass
+
+        # Fallback: local cleanup
+        import shutil
+        ws = s.get("workspace_path", "")
+        if ws and Path(ws).exists():
+            shutil.rmtree(ws, ignore_errors=True)
+        session_dir = Path(config.container.session_base) / sid
+        if session_dir.exists():
+            shutil.rmtree(session_dir, ignore_errors=True)
+        console.print(f"  [green]✓[/green] {sid}")
+
+    # Remove all stopped entries from sessions.json
+    if not use_control:
+        sessions_file = Path(config.container.session_base) / "sessions.json"
+        try:
+            data = json.loads(sessions_file.read_text())
+            data = [s for s in data if s.get("status") != "stopped"]
+            sessions_file.write_text(json.dumps(data, indent=2))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    console.print(f"\n[green]Deleted {len(stopped)} stopped sessions.[/green]")
 
 
 def cmd_tui(args):
@@ -575,6 +691,12 @@ def main():
     stop_p = sub.add_parser("stop", help="Stop a session")
     stop_p.add_argument("session_id", help="Session ID")
 
+    # delete
+    delete_p = sub.add_parser("delete", help="Delete a session (stop + remove workspace)")
+    delete_p.add_argument("session_id", help="Session ID")
+    delete_p.add_argument("--yes", "-y", dest="confirm", action="store_true",
+                          help="Skip confirmation prompt")
+
     # cleanup
     cleanup_p = sub.add_parser("cleanup", help="Clean up stopped sessions")
     cleanup_p.add_argument("--yes", dest="confirm", action="store_true", help="Actually clean up")
@@ -602,6 +724,7 @@ def main():
         "top": cmd_top,
         "logs": cmd_logs,
         "stop": cmd_stop,
+        "delete": cmd_delete,
         "cleanup": cmd_cleanup,
         "tui": cmd_tui,
         "audit": cmd_audit,

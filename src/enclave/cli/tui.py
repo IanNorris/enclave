@@ -283,6 +283,7 @@ class EnclaveTUI(App):
         Binding("s", "focus_sessions", "Sessions"),
         Binding("l", "focus_logs", "Logs"),
         Binding("x", "stop_session", "Stop Session"),
+        Binding("d", "delete_session", "Delete Session"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -372,6 +373,62 @@ class EnclaveTUI(App):
                 self.notify(f"Stop failed: {resp.get('error')}", severity="error")
         except Exception as e:
             self.notify(f"Stop failed: {e}", severity="error")
+        self._do_refresh()
+
+    def action_delete_session(self):
+        """Delete the currently selected session (stop + remove data)."""
+        table = self.query_one("#sessions-dt", DataTable)
+        if table.cursor_row is None:
+            self.notify("No session selected", severity="warning")
+            return
+
+        sessions = _get_sessions(self._config)
+        if table.cursor_row >= len(sessions):
+            return
+
+        session = sessions[table.cursor_row]
+        sid = session.get("id", "?")
+        name = session.get("name", "?")
+        status = session.get("status", "")
+
+        if status == "running":
+            self.notify(f"Stop {sid} before deleting", severity="warning")
+            return
+
+        self._pending_delete = sid
+        self.notify(
+            f"Delete {name} ({sid})? Press 'd' again to confirm.",
+            severity="warning",
+        )
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Intercept the second 'd' press to confirm deletion."""
+        if action == "delete_session" and hasattr(self, "_pending_delete") and self._pending_delete:
+            sid = self._pending_delete
+            self._pending_delete = None
+            self.notify(f"Deleting {sid}...", severity="information")
+            self.run_worker(self._delete_via_control(sid), exclusive=True)
+            return True
+        return super().check_action(action, parameters)
+
+    async def _delete_via_control(self, session_id: str):
+        """Delete a session via the control socket (non-blocking)."""
+        import asyncio as _aio
+        control_sock = Path(self._config.data_dir) / "control.sock"
+        try:
+            reader, writer = await _aio.open_unix_connection(str(control_sock))
+            writer.write(json.dumps({"action": "delete", "session": session_id}).encode() + b"\n")
+            await writer.drain()
+            data = await _aio.wait_for(reader.readline(), timeout=30.0)
+            writer.close()
+            await writer.wait_closed()
+            resp = json.loads(data.decode().strip())
+            if resp.get("ok"):
+                self.notify(f"Deleted {session_id}", severity="information")
+            else:
+                self.notify(f"Delete failed: {resp.get('error')}", severity="error")
+        except Exception as e:
+            self.notify(f"Delete failed: {e}", severity="error")
         self._do_refresh()
 
 

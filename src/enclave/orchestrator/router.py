@@ -2605,27 +2605,28 @@ class MessageRouter:
         await self._reply_control("\n".join(lines))
 
     async def _cmd_kill(self, cmd: ParsedCommand) -> None:
-        """Handle the kill command — stop a session."""
+        """Handle the kill command — stop and delete a session."""
         if not cmd.has_args:
             await self._reply_control(
-                "Usage: `kill <session-id>` — stops and removes a session."
+                "Usage: `kill <session-id>` — stops and deletes a session."
             )
             return
 
         session_id = cmd.args[0]
 
-        await self.ipc.send_to(
-            session_id,
-            Message(type=MessageType.SHUTDOWN, payload={}),
-        )
+        if self.ipc.is_connected(session_id):
+            await self.ipc.send_to(
+                session_id,
+                Message(type=MessageType.SHUTDOWN, payload={}),
+            )
 
-        removed = await self.containers.remove_session(session_id)
+        removed = await self.containers.remove_session(session_id, reason="kill")
         await self.ipc.remove_socket(session_id)
         self._audit.log("session_killed", session_id=session_id)
 
         if removed:
             await self._reply_control(
-                f"✅ Session `{session_id}` stopped and removed."
+                f"✅ Session `{session_id}` deleted."
             )
         else:
             await self._reply_control(

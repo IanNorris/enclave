@@ -540,14 +540,40 @@ class ContainerManager:
         log.info("Session stopped: %s (reason=%s)", session_id, reason)
         return True
 
-    async def remove_session(self, session_id: str) -> bool:
-        """Remove a session entirely (stop container + clean up)."""
-        await self.stop_session(session_id, reason="remove")
-        session = self._sessions.pop(session_id, None)
-        if session:
-            log.info("Session removed: %s", session_id)
-            return True
-        return False
+    async def remove_session(self, session_id: str, *, reason: str = "remove") -> bool:
+        """Remove a session entirely: stop, clean up workspace/session dirs, persist."""
+        import shutil
+
+        session = self._sessions.get(session_id)
+        if session is None:
+            log.error("Session not found for removal: %s", session_id)
+            return False
+
+        # Stop the container/process if still running
+        if session.status in ("running", "starting"):
+            await self.stop_session(session_id, reason=reason)
+        elif session.status == "stopping":
+            # Wait for in-progress stop to finish
+            await asyncio.sleep(2)
+
+        # Clean up workspace directory
+        if session.workspace_path:
+            ws = Path(session.workspace_path)
+            if ws.exists():
+                shutil.rmtree(ws, ignore_errors=True)
+                log.info("Removed workspace: %s", ws)
+
+        # Clean up session state directory
+        session_dir = Path(self.config.session_base) / session_id
+        if session_dir.exists():
+            shutil.rmtree(session_dir, ignore_errors=True)
+            log.info("Removed session dir: %s", session_dir)
+
+        # Remove from memory and persist
+        self._sessions.pop(session_id, None)
+        self._save_sessions()
+        log.info("Session deleted: %s (reason=%s)", session_id, reason)
+        return True
 
     async def get_container_status(self, session_id: str) -> str | None:
         """Check the actual podman status of a container."""
