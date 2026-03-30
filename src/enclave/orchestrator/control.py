@@ -185,6 +185,8 @@ class ControlServer:
 
         log.info("Delete requested via control socket: %s", session_id)
 
+        room_id = session.room_id
+
         # Send shutdown if still connected
         if self._router.ipc.is_connected(session_id):
             await self._router.ipc.send_to(
@@ -194,6 +196,12 @@ class ControlServer:
 
         ok = await self._router.containers.remove_session(session_id, reason="control")
         await self._router.ipc.remove_socket(session_id)
+
+        # Leave and forget the Matrix room
+        if ok and room_id:
+            await self._router.matrix.cleanup_room(
+                room_id, reason="Session deleted"
+            )
 
         if ok:
             await self._write(writer, {"ok": True, "type": "deleted"})

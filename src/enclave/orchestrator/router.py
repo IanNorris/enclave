@@ -2613,6 +2613,8 @@ class MessageRouter:
             return
 
         session_id = cmd.args[0]
+        session = self.containers.get_session(session_id)
+        room_id = session.room_id if session else None
 
         if self.ipc.is_connected(session_id):
             await self.ipc.send_to(
@@ -2623,6 +2625,10 @@ class MessageRouter:
         removed = await self.containers.remove_session(session_id, reason="kill")
         await self.ipc.remove_socket(session_id)
         self._audit.log("session_killed", session_id=session_id)
+
+        # Leave and forget the Matrix room
+        if removed and room_id:
+            await self.matrix.cleanup_room(room_id, reason="Session deleted")
 
         if removed:
             await self._reply_control(
