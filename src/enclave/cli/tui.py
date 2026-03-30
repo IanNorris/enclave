@@ -351,45 +351,27 @@ class EnclaveTUI(App):
             self.notify(f"Session {sid} is already {status}", severity="warning")
             return
 
-        container_id = session.get("container_id", "")
-        host_pid = session.get("host_pid")
+        self.notify(f"Stopping {sid}...", severity="information")
+        self.run_worker(self._stop_via_control(sid), exclusive=True)
 
-        success = False
-        if container_id:
-            try:
-                result = subprocess.run(
-                    ["podman", "stop", container_id],
-                    capture_output=True, text=True, timeout=30,
-                )
-                success = result.returncode == 0
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-
-        # Try by container name (matches session ID)
-        if not success:
-            try:
-                result = subprocess.run(
-                    ["podman", "stop", sid],
-                    capture_output=True, text=True, timeout=30,
-                )
-                success = result.returncode == 0
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-
-        if not success and host_pid:
-            import signal
-            try:
-                os.kill(host_pid, signal.SIGTERM)
-                success = True
-            except (ProcessLookupError, PermissionError):
-                pass
-
-        if success:
-            _mark_session_stopped(self._config, sid)
-            self.notify(f"Stopped session {sid}", severity="information")
-        else:
-            self.notify(f"Failed to stop session {sid}", severity="error")
-
+    async def _stop_via_control(self, session_id: str):
+        """Stop a session via the control socket (non-blocking)."""
+        import asyncio as _aio
+        control_sock = Path(self._config.data_dir) / "control.sock"
+        try:
+            reader, writer = await _aio.open_unix_connection(str(control_sock))
+            writer.write(json.dumps({"action": "stop", "session": session_id}).encode() + b"\n")
+            await writer.drain()
+            data = await _aio.wait_for(reader.readline(), timeout=30.0)
+            writer.close()
+            await writer.wait_closed()
+            resp = json.loads(data.decode().strip())
+            if resp.get("ok"):
+                self.notify(f"Stopped {session_id}", severity="information")
+            else:
+                self.notify(f"Stop failed: {resp.get('error')}", severity="error")
+        except Exception as e:
+            self.notify(f"Stop failed: {e}", severity="error")
         self._do_refresh()
 
 
