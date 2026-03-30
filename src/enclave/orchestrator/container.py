@@ -104,6 +104,8 @@ class ContainerManager:
                 "image": s.image,
                 "user_display_name": s.user_display_name,
                 "user_pronouns": s.user_pronouns,
+                "host_pid": s.host_pid,
+                "container_id": s.container_id,
             })
         try:
             self._sessions_file.write_text(json.dumps(data, indent=2))
@@ -492,8 +494,11 @@ class ContainerManager:
         except Exception as e:
             log.error("[host:%s] Error monitoring process: %s", session.id, e)
 
-    async def stop_session(self, session_id: str) -> bool:
+    async def stop_session(self, session_id: str, *, reason: str = "unknown") -> bool:
         """Stop and remove a session's container or host process.
+
+        *reason* identifies the source of the stop request (e.g. ``tui``,
+        ``cli``, ``control``, ``idle``, ``kill``, ``health``).
 
         Returns True on success.
         """
@@ -502,6 +507,7 @@ class ContainerManager:
             log.error("Session not found: %s", session_id)
             return False
 
+        log.info("Stopping session %s (reason=%s)", session_id, reason)
         session.status = "stopping"
         self._save_sessions()
 
@@ -531,12 +537,12 @@ class ContainerManager:
 
         session.status = "stopped"
         self._save_sessions()
-        log.info("Session stopped: %s", session_id)
+        log.info("Session stopped: %s (reason=%s)", session_id, reason)
         return True
 
     async def remove_session(self, session_id: str) -> bool:
         """Remove a session entirely (stop container + clean up)."""
-        await self.stop_session(session_id)
+        await self.stop_session(session_id, reason="remove")
         session = self._sessions.pop(session_id, None)
         if session:
             log.info("Session removed: %s", session_id)

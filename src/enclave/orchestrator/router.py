@@ -450,7 +450,7 @@ class MessageRouter:
                 session.room_id,
                 "💤 Session idle — shutting down. Send a message to restart.",
             )
-            await self.containers.stop_session(sid)
+            await self.containers.stop_session(sid, reason="idle")
             self._last_activity.pop(sid, None)
 
     async def _container_has_processes(self, session_id: str) -> bool:
@@ -1867,16 +1867,21 @@ class MessageRouter:
         session = self.containers.get_session(session_id)
         if session:
             if session.status == "stopping":
+                log.info("Agent disconnected (graceful stop): %s", session_id)
                 await self.matrix.send_message(
                     session.room_id,
                     "🛑 Session stopped.",
                 )
             elif session.status == "running":
+                log.warning("Agent disconnected unexpectedly: %s", session_id)
                 await self.matrix.send_message(
                     session.room_id,
                     "⚠️ Agent disconnected unexpectedly.",
                 )
-        log.info("Agent disconnected: %s", session_id)
+            else:
+                log.info("Agent disconnected (status=%s): %s", session.status, session_id)
+        else:
+            log.info("Agent disconnected (no session): %s", session_id)
         self._audit.log("agent_disconnected", session_id=session_id)
 
     async def _start_watcher(self, session_id: str) -> None:

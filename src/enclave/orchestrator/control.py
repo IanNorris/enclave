@@ -105,6 +105,8 @@ class ControlServer:
                 return
             req = json.loads(raw.decode())
             action = req.get("action")
+            log.info("Control socket request: action=%s session=%s",
+                     action, req.get("session", "-"))
 
             if action == "list":
                 await self._handle_list(writer)
@@ -153,12 +155,14 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
             return
 
+        log.info("Stop requested via control socket: %s", session_id)
+
         # Send shutdown message to agent, then stop container
         await self._router.ipc.send_to(
             session_id,
             Message(type=MessageType.SHUTDOWN, payload={}),
         )
-        ok = await self._router.containers.stop_session(session_id)
+        ok = await self._router.containers.stop_session(session_id, reason="control")
         await self._router.ipc.remove_socket(session_id)
 
         if ok:
