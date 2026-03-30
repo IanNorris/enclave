@@ -210,7 +210,7 @@ class SessionsTable(Static):
             else:
                 status_str = f"  {status}"
 
-            cid = s.get("container_id", "")[:12]
+            cid = (s.get("container_id") or "")[:12]
             st = stats.get(cid, {})
             cpu = st.get("cpu_percent", st.get("CPU", "—"))
             mem = st.get("mem_usage", st.get("MemUsage", "—"))
