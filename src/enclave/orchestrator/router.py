@@ -1865,11 +1865,17 @@ class MessageRouter:
         await self._stop_watcher(session_id)
 
         session = self.containers.get_session(session_id)
-        if session and session.status == "running":
-            await self.matrix.send_message(
-                session.room_id,
-                "⚠️ Agent disconnected.",
-            )
+        if session:
+            if session.status == "stopping":
+                await self.matrix.send_message(
+                    session.room_id,
+                    "🛑 Session stopped.",
+                )
+            elif session.status == "running":
+                await self.matrix.send_message(
+                    session.room_id,
+                    "⚠️ Agent disconnected unexpectedly.",
+                )
         log.info("Agent disconnected: %s", session_id)
         self._audit.log("agent_disconnected", session_id=session_id)
 

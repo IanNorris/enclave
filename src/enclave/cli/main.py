@@ -287,20 +287,41 @@ def cmd_stop(args):
         console.print(f"[red]Session not found:[/red] {args.session_id}")
         sys.exit(1)
 
-    if session.get("status") != "running":
+    if session.get("status") not in ("running", "starting"):
         console.print(f"[yellow]Session is already {session.get('status')}.[/yellow]")
         return
 
-    # Mark as stopping immediately so the TUI reflects the state change
+    sid = args.session_id
+
+    # Try the control socket first (orchestrator handles graceful shutdown)
+    control_sock = Path(config.data_dir) / "control.sock"
+    if control_sock.exists():
+        import socket as _socket
+        try:
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(30)
+            sock.connect(str(control_sock))
+            sock.sendall(json.dumps({"action": "stop", "session": sid}).encode() + b"\n")
+            console.print(f"[dim]Stopping {sid}...[/dim]")
+            data = sock.recv(4096)
+            sock.close()
+            resp = json.loads(data.decode().strip())
+            if resp.get("ok"):
+                console.print(f"[green]✅ Stopped session[/green] {sid}")
+                return
+            else:
+                console.print(f"[yellow]Control socket: {resp.get('error')}[/yellow]")
+        except Exception as e:
+            console.print(f"[dim]Control socket unavailable ({e}), falling back to podman...[/dim]")
+
+    # Fallback: direct podman stop
     _mark_session_status(config, sid, "stopping")
 
     container_id = session.get("container_id", "")
     host_pid = session.get("host_pid")
-    sid = args.session_id
 
     stopped = False
 
-    # Try stopping by container ID first
     if container_id:
         result = subprocess.run(
             ["podman", "stop", container_id],
@@ -308,7 +329,6 @@ def cmd_stop(args):
         )
         stopped = result.returncode == 0
 
-    # Try stopping by container name (podman names match session ID)
     if not stopped:
         result = subprocess.run(
             ["podman", "stop", sid],
@@ -316,7 +336,6 @@ def cmd_stop(args):
         )
         stopped = result.returncode == 0
 
-    # Try host PID
     if not stopped and host_pid:
         import signal
         try:
@@ -329,7 +348,6 @@ def cmd_stop(args):
         _mark_session_status(config, sid, "stopped")
         console.print(f"[green]✅ Stopped session[/green] {sid}")
     else:
-        # Even if we can't kill it, mark it stopped to prevent auto-restore
         _mark_session_status(config, sid, "stopped")
         console.print(f"[yellow]Marked session {sid} as stopped (process may already be gone).[/yellow]")
 

@@ -25,6 +25,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from enclave.common.protocol import Message, MessageType
+
 if TYPE_CHECKING:
     from .router import MessageRouter
 
@@ -108,6 +110,8 @@ class ControlServer:
                 await self._handle_list(writer)
             elif action == "send":
                 await self._handle_send(req, writer, reader)
+            elif action == "stop":
+                await self._handle_stop(req, writer)
             else:
                 await self._write(writer, {"ok": False, "error": f"Unknown action: {action}"})
         except asyncio.TimeoutError:
@@ -137,6 +141,30 @@ class ControlServer:
                 "room_id": session.room_id,
             })
         await self._write(writer, {"ok": True, "type": "sessions", "sessions": sessions})
+
+    async def _handle_stop(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        session_id = req.get("session", "")
+        if not session_id:
+            await self._write(writer, {"ok": False, "error": "Missing session"})
+            return
+
+        session = self._router.containers.get_session(session_id)
+        if not session:
+            await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
+            return
+
+        # Send shutdown message to agent, then stop container
+        await self._router.ipc.send_to(
+            session_id,
+            Message(type=MessageType.SHUTDOWN, payload={}),
+        )
+        ok = await self._router.containers.stop_session(session_id)
+        await self._router.ipc.remove_socket(session_id)
+
+        if ok:
+            await self._write(writer, {"ok": True, "type": "stopped"})
+        else:
+            await self._write(writer, {"ok": False, "error": "Failed to stop session"})
 
     async def _handle_send(
         self,
