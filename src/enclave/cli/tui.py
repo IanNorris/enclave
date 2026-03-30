@@ -284,6 +284,7 @@ class EnclaveTUI(App):
         Binding("l", "focus_logs", "Logs"),
         Binding("x", "stop_session", "Stop Session"),
         Binding("d", "delete_session", "Delete Session"),
+        Binding("y", "confirm_delete", "Confirm Delete", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -397,19 +398,19 @@ class EnclaveTUI(App):
 
         self._pending_delete = sid
         self.notify(
-            f"Delete {name} ({sid})? Press 'd' again to confirm.",
+            f"Delete {name} ({sid})? Press 'y' to confirm.",
             severity="warning",
         )
 
-    def check_action(self, action: str, parameters: tuple) -> bool | None:
-        """Intercept the second 'd' press to confirm deletion."""
-        if action == "delete_session" and hasattr(self, "_pending_delete") and self._pending_delete:
+    def action_confirm_delete(self):
+        """Confirm a pending deletion."""
+        if hasattr(self, "_pending_delete") and self._pending_delete:
             sid = self._pending_delete
             self._pending_delete = None
             self.notify(f"Deleting {sid}...", severity="information")
             self.run_worker(self._delete_via_control(sid), exclusive=True)
-            return True
-        return super().check_action(action, parameters)
+        else:
+            self.notify("Nothing to confirm", severity="warning")
 
     async def _delete_via_control(self, session_id: str):
         """Delete a session via the control socket (non-blocking)."""
