@@ -291,6 +291,9 @@ def cmd_stop(args):
         console.print(f"[yellow]Session is already {session.get('status')}.[/yellow]")
         return
 
+    # Mark as stopping immediately so the TUI reflects the state change
+    _mark_session_status(config, sid, "stopping")
+
     container_id = session.get("container_id", "")
     host_pid = session.get("host_pid")
     sid = args.session_id
@@ -323,16 +326,16 @@ def cmd_stop(args):
             pass
 
     if stopped:
-        _mark_session_stopped(config, sid)
+        _mark_session_status(config, sid, "stopped")
         console.print(f"[green]✅ Stopped session[/green] {sid}")
     else:
         # Even if we can't kill it, mark it stopped to prevent auto-restore
-        _mark_session_stopped(config, sid)
+        _mark_session_status(config, sid, "stopped")
         console.print(f"[yellow]Marked session {sid} as stopped (process may already be gone).[/yellow]")
 
 
-def _mark_session_stopped(config, session_id: str):
-    """Update session status to stopped in sessions.json."""
+def _mark_session_status(config, session_id: str, status: str = "stopped"):
+    """Update session status in sessions.json."""
     sessions_file = Path(config.container.session_base) / "sessions.json"
     if not sessions_file.exists():
         return
@@ -342,8 +345,9 @@ def _mark_session_stopped(config, session_id: str):
             return
         for s in data:
             if s.get("id") == session_id:
-                s["status"] = "stopped"
-                s["host_pid"] = None
+                s["status"] = status
+                if status == "stopped":
+                    s["host_pid"] = None
                 break
         sessions_file.write_text(json.dumps(data, indent=2))
     except (json.JSONDecodeError, OSError):
