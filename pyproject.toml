@@ -17,6 +17,9 @@ dependencies = [
     "peewee",
     "atomicwrites",
     "pyyaml>=6.0",
+    # CLI / TUI
+    "rich>=13.0",
+    "textual>=0.40",
 ]
 
 [project.optional-dependencies]
@@ -26,10 +29,6 @@ dev = [
     "pytest-cov",
     "ruff",
     "mypy",
-]
-tui = [
-    "rich>=13.0",
-    "textual>=0.40",
 ]
 mcp = [
     "mcp[cli]>=1.0",
