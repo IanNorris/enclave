@@ -503,6 +503,7 @@ class ContainerManager:
             return False
 
         session.status = "stopping"
+        self._save_sessions()
 
         # Host mode: kill the subprocess
         if session.host_pid:
@@ -529,6 +530,7 @@ class ContainerManager:
                 log.warning("Error stopping container %s: %s", session_id, e)
 
         session.status = "stopped"
+        self._save_sessions()
         log.info("Session stopped: %s", session_id)
         return True
 

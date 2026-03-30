@@ -202,9 +202,11 @@ class SessionsTable(Static):
         for s in sessions:
             status = s.get("status", "?")
             if status == "running":
-                status_str = "● running"
+                status_str = "[green]● running[/green]"
+            elif status == "stopping":
+                status_str = "[yellow]◌ stopping[/yellow]"
             elif status == "stopped":
-                status_str = "○ stopped"
+                status_str = "[dim]○ stopped[/dim]"
             else:
                 status_str = f"  {status}"
 
@@ -295,7 +297,7 @@ class EnclaveTUI(App):
 
     def on_mount(self):
         self._config = _load_config()
-        self._refresh_timer = self.set_interval(5.0, self._auto_refresh)
+        self._refresh_timer = self.set_interval(2.0, self._auto_refresh)
         self._do_refresh()
 
     def action_refresh(self):
