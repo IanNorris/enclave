@@ -130,10 +130,9 @@ class IPCServer:
 
     async def remove_socket(self, session_id: str) -> None:
         """Remove a session's socket and close connections."""
-        if session_id in self._connections:
-            conn = self._connections[session_id]
+        conn = self._connections.pop(session_id, None)
+        if conn is not None:
             await conn.close()
-            del self._connections[session_id]
 
         if session_id in self._servers:
             self._servers[session_id].close()
@@ -218,8 +217,7 @@ class IPCServer:
             log.error("Connection error for %s: %s", session_id, e)
         finally:
             await conn.close()
-            if session_id in self._connections:
-                del self._connections[session_id]
+            self._connections.pop(session_id, None)
 
             log.info("Agent disconnected: %s", session_id)
             for cb in self._disconnect_callbacks:

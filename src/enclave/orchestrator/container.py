@@ -1,234 +1,65 @@
-"""Container manager for Enclave agent sessions.
+"""Runtime manager for Enclave agent sessions.
 
-Manages podman container lifecycle: create, start, stop, list.
-Handles workspace setup and mount propagation.
+Handles the low-level podman container and host-process operations.
+Session state and lifecycle orchestration live in SessionManager.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import os
 import signal
 import subprocess
 import sys
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 from enclave.common.config import ContainerConfig
 from enclave.common.logging import get_logger
 
+# Re-export Session so existing imports keep working
+from enclave.orchestrator.session_manager import Session  # noqa: F401
+
 log = get_logger("container")
 
 
-@dataclass
-class Session:
-    """Represents an active agent session."""
-
-    id: str
-    name: str
-    room_id: str
-    container_id: str | None = None
-    workspace_path: str = ""
-    socket_path: str = ""
-    created_at: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
-    status: str = "created"  # created, starting, running, stopping, stopped
-    profile: str = ""  # container profile name (e.g., "dev", "light")
-    image: str = ""  # resolved container image for this session
-    user_display_name: str = ""
-    user_pronouns: str = ""
-    host_pid: int | None = None  # PID for host-mode subprocess agents
-
-
 class ContainerManager:
-    """Manages podman containers for agent sessions."""
+    """Low-level runtime operations for containers and host processes.
+
+    This class knows how to start/stop podman containers and host-mode
+    subprocesses.  It does NOT own sessions or persist state — that is
+    the responsibility of SessionManager.
+    """
 
     def __init__(self, config: ContainerConfig):
         self.config = config
-        self._sessions: dict[str, Session] = {}
-        self._sessions_file = Path(config.session_base) / "sessions.json"
 
-        # Ensure base directories exist
-        Path(config.workspace_base).mkdir(parents=True, exist_ok=True)
-        Path(config.session_base).mkdir(parents=True, exist_ok=True)
-
-        # Load persisted sessions
-        self._load_sessions()
-
-    def _load_sessions(self) -> None:
-        """Load sessions from disk."""
-        if not self._sessions_file.exists():
-            return
-        try:
-            data = json.loads(self._sessions_file.read_text())
-            for s in data:
-                # Preserve the status that was saved — "was_running" means
-                # it was running when we last saved state (e.g., before reboot)
-                saved_status = s.get("status", "stopped")
-                session = Session(
-                    id=s["id"],
-                    name=s["name"],
-                    room_id=s["room_id"],
-                    workspace_path=s.get("workspace_path", ""),
-                    socket_path=s.get("socket_path", ""),
-                    created_at=s.get("created_at", ""),
-                    status="was_running" if saved_status == "running" else "stopped",
-                    profile=s.get("profile", ""),
-                    image=s.get("image", ""),
-                    user_display_name=s.get("user_display_name", ""),
-                    user_pronouns=s.get("user_pronouns", ""),
-                )
-                self._sessions[session.id] = session
-            log.info("Loaded %d persisted sessions", len(self._sessions))
-        except Exception as e:
-            log.warning("Failed to load sessions: %s", e)
-
-    def _save_sessions(self) -> None:
-        """Persist sessions to disk."""
-        data = []
-        for s in self._sessions.values():
-            data.append({
-                "id": s.id,
-                "name": s.name,
-                "room_id": s.room_id,
-                "workspace_path": s.workspace_path,
-                "socket_path": s.socket_path,
-                "created_at": s.created_at,
-                "status": s.status,
-                "profile": s.profile,
-                "image": s.image,
-                "user_display_name": s.user_display_name,
-                "user_pronouns": s.user_pronouns,
-                "host_pid": s.host_pid,
-                "container_id": s.container_id,
-            })
-        try:
-            self._sessions_file.write_text(json.dumps(data, indent=2))
-        except Exception as e:
-            log.warning("Failed to save sessions: %s", e)
-
-    def get_session(self, session_id: str) -> Session | None:
-        """Get a session by ID."""
-        return self._sessions.get(session_id)
-
-    def get_session_by_room(self, room_id: str) -> Session | None:
-        """Get a running session by its Matrix room ID."""
-        for session in self._sessions.values():
-            if session.room_id == room_id and session.status == "running":
-                return session
-        return None
-
-    def get_any_session_by_room(self, room_id: str) -> Session | None:
-        """Get any session (including stopped) by its Matrix room ID."""
-        for session in self._sessions.values():
-            if session.room_id == room_id:
-                return session
-        return None
-
-    def list_sessions(self) -> list[Session]:
-        """List all sessions."""
-        return list(self._sessions.values())
-
-    def active_sessions(self) -> list[Session]:
-        """List running sessions."""
-        return [s for s in self._sessions.values() if s.status == "running"]
-
-    def sessions_needing_restore(self) -> list[Session]:
-        """List sessions that were running before last shutdown."""
-        return [s for s in self._sessions.values() if s.status == "was_running"]
-
-    async def create_session(
-        self,
-        name: str,
-        room_id: str,
-        socket_path: str,
-        profile: str = "",
-        user_display_name: str = "",
-        user_pronouns: str = "",
-    ) -> Session:
-        """Create a new agent session with workspace and container.
-
-        Args:
-            name: Human-readable session name.
-            room_id: Matrix room ID for this session.
-            socket_path: Path to the IPC socket for this session.
-            profile: Container profile name (e.g., "dev", "light").
-                     Empty string uses the default profile.
-            user_display_name: Display name of the user who owns this session.
-            user_pronouns: Pronouns of the user (e.g., "he/him").
-
-        Returns:
-            The created Session object.
-        """
-        session_id = f"{_slugify(name)}-{uuid.uuid4().hex[:8]}"
-
-        # Resolve profile and image
-        resolved_profile = profile or self.config.default_profile
-        profile_obj = self.config.get_profile(resolved_profile)
-
-        # Create workspace directory
-        workspace = Path(self.config.workspace_base) / session_id
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        # Create session state directory
-        state_dir = Path(self.config.session_base) / session_id
-        state_dir.mkdir(parents=True, exist_ok=True)
-
-        session = Session(
-            id=session_id,
-            name=name,
-            room_id=room_id,
-            workspace_path=str(workspace),
-            socket_path=socket_path,
-            profile=resolved_profile,
-            image=profile_obj.image,
-            user_display_name=user_display_name,
-            user_pronouns=user_pronouns,
-        )
-
-        self._sessions[session_id] = session
-        self._save_sessions()
-        log.info("Session created: %s (%s) profile=%s image=%s",
-                 session_id, name, resolved_profile, profile_obj.image)
-        return session
-
-    async def start_session(self, session_id: str) -> tuple[bool, str]:
-        """Start the podman container for a session.
+    async def start_session(self, session: Session) -> tuple[bool, str]:
+        """Start the runtime for a session (container or host process).
 
         Returns (success, error_detail) tuple.
         """
-        session = self._sessions.get(session_id)
-        if session is None:
-            log.error("Session not found: %s", session_id)
-            return False, "Session not found"
-
         session.status = "starting"
         socket_dir = str(Path(session.socket_path).parent)
 
-        # Resolve profile settings for this session
         profile = self.config.get_profile(session.profile)
 
-        # ── Host mode: spawn subprocess instead of container ──
-        # An explicit empty image in the profile means host mode (no container).
+        # Host mode: spawn subprocess instead of container
         if profile.image == "":
             return await self._start_host_session(session, profile)
 
         # Clean up any leftover container with the same name
-        log.info("[start:%s] Cleaning up old container...", session_id)
+        log.info("[start:%s] Cleaning up old container...", session.id)
         stop_result = await _run_command(
-            [self.config.runtime, "stop", "-t", "5", session_id], timeout=15.0
+            [self.config.runtime, "stop", "-t", "5", session.id], timeout=15.0
         )
         log.debug("stop result: rc=%d stderr=%s", stop_result.returncode, stop_result.stderr[:100])
         rm_result = await _run_command(
-            [self.config.runtime, "rm", "-f", session_id], timeout=10.0
+            [self.config.runtime, "rm", "-f", session.id], timeout=10.0
         )
         log.debug("rm result: rc=%d stderr=%s", rm_result.returncode, rm_result.stderr[:100])
-        log.info("[start:%s] Cleanup done, building run command...", session_id)
+        log.info("[start:%s] Cleanup done, building run command...", session.id)
 
         # Select network mode:
         # - Copilot SDK containers need network for API access
@@ -243,14 +74,14 @@ class ContainerManager:
             self.config.runtime, "run",
             "--detach",
             "--rm",
-            "--name", session_id,
+            "--name", session.id,
             "--userns", self.config.userns,
             "--network", network,
             # Workspace with rslave propagation so host-side mounts appear in container
             "-v", f"{session.workspace_path}:/workspace:rslave",
             "-v", f"{socket_dir}:/socket:Z",
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
-            "-e", f"SESSION_ID={session_id}",
+            "-e", f"SESSION_ID={session.id}",
             "-e", f"SESSION_NAME={session.name}",
         ]
 
@@ -278,12 +109,12 @@ class ContainerManager:
                     "-e", f"WAYLAND_DISPLAY={wayland}",
                     "-e", f"XDG_RUNTIME_DIR=/run/user/1000",
                 ])
-                log.info("[start:%s] Wayland socket mounted: %s", session_id, wayland)
+                log.info("[start:%s] Wayland socket mounted: %s", session.id, wayland)
             # GPU device for hardware-accelerated rendering
             dri = Path("/dev/dri")
             if dri.exists():
                 cmd.extend(["--device", "/dev/dri"])
-                log.info("[start:%s] GPU device mounted", session_id)
+                log.info("[start:%s] GPU device mounted", session.id)
             # NixOS GPU driver stack (Mesa, EGL, Vulkan)
             opengl_driver = Path("/run/opengl-driver")
             if opengl_driver.exists():
@@ -294,14 +125,14 @@ class ContainerManager:
                     "-e", "__EGL_VENDOR_LIBRARY_DIRS=/run/opengl-driver/share/glvnd/egl_vendor.d",
                 ])
                 ld_paths = ["/run/opengl-driver/lib"]
-                log.info("[start:%s] NixOS GPU drivers mounted: %s", session_id, real_driver)
+                log.info("[start:%s] NixOS GPU drivers mounted: %s", session.id, real_driver)
                 # libglvnd provides the GL dispatch layer (libEGL.so.1, libGL.so.1)
                 # that apps link against — Mesa only has vendor libs (libEGL_mesa.so)
                 glvnd_path = self._find_libglvnd(real_driver)
                 if glvnd_path:
                     cmd.extend(["-v", f"{glvnd_path}:/run/libglvnd:ro"])
                     ld_paths.insert(0, "/run/libglvnd/lib")
-                    log.info("[start:%s] libglvnd mounted: %s", session_id, glvnd_path)
+                    log.info("[start:%s] libglvnd mounted: %s", session.id, glvnd_path)
                 cmd.extend(["-e", f"LD_LIBRARY_PATH={':'.join(ld_paths)}"])
 
         # Build PATH — include nix and host dirs only when enabled
@@ -360,7 +191,7 @@ class ContainerManager:
 
         log.debug("Container cmd: %s", " ".join(cmd[:8]) + " ...")
         log.info("[start:%s] Executing podman run (profile=%s image=%s)...",
-                 session_id, session.profile, image)
+                 session.id, session.profile, image)
 
         try:
             # First container run after image build can take ~35s (overlay setup).
@@ -374,7 +205,7 @@ class ContainerManager:
                 session.status = "running"
                 log.info(
                     "[start:%s] Container ready (id: %s)",
-                    session_id,
+                    session.id,
                     container_id[:12],
                 )
                 return True, ""
@@ -383,13 +214,13 @@ class ContainerManager:
                 stderr = result.stderr.strip()
                 log.error(
                     "[start:%s] Container start failed: %s",
-                    session_id,
+                    session.id,
                     stderr,
                 )
                 return False, _classify_container_error(stderr, image)
         except Exception as e:
             session.status = "stopped"
-            log.error("[start:%s] Exception starting container: %s", session_id, e)
+            log.error("[start:%s] Exception starting container: %s", session.id, e)
             return False, f"Exception: {e}"
 
     @staticmethod
@@ -494,86 +325,44 @@ class ContainerManager:
         except Exception as e:
             log.error("[host:%s] Error monitoring process: %s", session.id, e)
 
-    async def stop_session(self, session_id: str, *, reason: str = "unknown") -> bool:
-        """Stop and remove a session's container or host process.
+    async def stop_runtime(self, session: Session) -> None:
+        """Stop the runtime (container or host process) for a session.
 
-        *reason* identifies the source of the stop request (e.g. ``tui``,
-        ``cli``, ``control``, ``idle``, ``kill``, ``health``).
-
-        Returns True on success.
+        Does NOT update session status — that is SessionManager's job.
         """
-        session = self._sessions.get(session_id)
-        if session is None:
-            log.error("Session not found: %s", session_id)
-            return False
-
-        log.info("Stopping session %s (reason=%s)", session_id, reason)
-        session.status = "stopping"
-        self._save_sessions()
-
-        # Host mode: kill the subprocess
         if session.host_pid:
             try:
                 os.kill(session.host_pid, signal.SIGTERM)
-                # Wait briefly for graceful shutdown
                 await asyncio.sleep(2)
                 try:
-                    os.kill(session.host_pid, 0)  # Check if still alive
+                    os.kill(session.host_pid, 0)
                     os.kill(session.host_pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    pass  # Already exited
+                    pass
             except ProcessLookupError:
-                pass  # Already dead
+                pass
             except Exception as e:
                 log.warning("Error stopping host process %d: %s", session.host_pid, e)
             session.host_pid = None
         elif session.container_id:
             try:
                 await _run_command(
-                    [self.config.runtime, "stop", "-t", "10", session_id]
+                    [self.config.runtime, "stop", "-t", "10", session.id]
                 )
             except Exception as e:
-                log.warning("Error stopping container %s: %s", session_id, e)
+                log.warning("Error stopping container %s: %s", session.id, e)
 
-        session.status = "stopped"
-        self._save_sessions()
-        log.info("Session stopped: %s (reason=%s)", session_id, reason)
-        return True
+    async def is_alive(self, session: Session) -> bool:
+        """Check whether a session's runtime is still running."""
+        if session.host_pid:
+            try:
+                os.kill(session.host_pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
 
-    async def remove_session(self, session_id: str, *, reason: str = "remove") -> bool:
-        """Remove a session entirely: stop, clean up workspace/session dirs, persist."""
-        import shutil
-
-        session = self._sessions.get(session_id)
-        if session is None:
-            log.error("Session not found for removal: %s", session_id)
-            return False
-
-        # Stop the container/process if still running
-        if session.status in ("running", "starting"):
-            await self.stop_session(session_id, reason=reason)
-        elif session.status == "stopping":
-            # Wait for in-progress stop to finish
-            await asyncio.sleep(2)
-
-        # Clean up workspace directory
-        if session.workspace_path:
-            ws = Path(session.workspace_path)
-            if ws.exists():
-                shutil.rmtree(ws, ignore_errors=True)
-                log.info("Removed workspace: %s", ws)
-
-        # Clean up session state directory
-        session_dir = Path(self.config.session_base) / session_id
-        if session_dir.exists():
-            shutil.rmtree(session_dir, ignore_errors=True)
-            log.info("Removed session dir: %s", session_dir)
-
-        # Remove from memory and persist
-        self._sessions.pop(session_id, None)
-        self._save_sessions()
-        log.info("Session deleted: %s (reason=%s)", session_id, reason)
-        return True
+        actual = await self.get_container_status(session.id)
+        return actual in ("running", "created")
 
     async def get_container_status(self, session_id: str) -> str | None:
         """Check the actual podman status of a container."""
@@ -589,44 +378,25 @@ class ContainerManager:
             pass
         return None
 
-    async def check_health(self) -> list[Session]:
-        """Check all 'running' sessions and mark crashed ones as stopped.
-
-        Returns a list of sessions that were found to be crashed.
-        """
-        crashed: list[Session] = []
-        for session in list(self._sessions.values()):
-            if session.status != "running":
-                continue
-
-            # Host mode: check if PID is still alive
-            if session.host_pid:
-                try:
-                    os.kill(session.host_pid, 0)
-                except ProcessLookupError:
-                    log.warning(
-                        "Session %s host process (pid %d) no longer running — "
-                        "marking stopped",
-                        session.id, session.host_pid,
-                    )
-                    session.status = "stopped"
-                    session.host_pid = None
-                    crashed.append(session)
-                continue
-
-            actual = await self.get_container_status(session.id)
-            if actual is None or actual not in ("running", "created"):
-                log.warning(
-                    "Session %s marked running but container status is %s — "
-                    "marking stopped",
-                    session.id,
-                    actual,
-                )
-                session.status = "stopped"
-                crashed.append(session)
-        if crashed:
-            self._save_sessions()
-        return crashed
+    async def container_has_processes(self, session_id: str) -> bool:
+        """Check if a container has non-trivial running processes."""
+        try:
+            result = await asyncio.create_subprocess_exec(
+                self.config.runtime, "top", session_id,
+                "--format", "{{.Command}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(result.communicate(), timeout=5.0)
+            lines = stdout.decode().strip().splitlines()
+            skip = {"python", "python3", "node", "sleep", "bash", "sh", "tini"}
+            for line in lines[1:]:  # skip header
+                cmd = line.strip().split("/")[-1].split()[0]
+                if cmd and cmd not in skip:
+                    return True
+        except Exception:
+            pass
+        return False
 
 
 @dataclass
@@ -661,17 +431,6 @@ async def _run_command(cmd: list[str], timeout: float = 30.0) -> CommandResult:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, functools.partial(_run_command_sync, cmd, timeout)
-    )
-
-
-def _slugify(name: str) -> str:
-    """Convert a name to a filesystem/container-safe slug."""
-    return (
-        name.lower()
-        .replace(" ", "-")
-        .replace("_", "-")
-        .replace(".", "-")
-        .strip("-")[:32]
     )
 
 

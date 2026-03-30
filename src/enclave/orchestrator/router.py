@@ -28,6 +28,7 @@ from enclave.orchestrator.commands import (
     parse_command,
 )
 from enclave.orchestrator.container import ContainerManager, Session
+from enclave.orchestrator.session_manager import SessionManager
 from enclave.orchestrator.ipc import IPCServer
 from enclave.orchestrator.matrix_client import EnclaveMatrixClient
 from enclave.orchestrator.permissions import (
@@ -70,7 +71,7 @@ class MessageRouter:
         self,
         matrix: EnclaveMatrixClient,
         ipc: IPCServer,
-        containers: ContainerManager,
+        sessions: SessionManager,
         control_room_id: str,
         space_id: str | None = None,
         allowed_users: list[str] | None = None,
@@ -83,7 +84,9 @@ class MessageRouter:
     ):
         self.matrix = matrix
         self.ipc = ipc
-        self.containers = containers
+        self.sessions = sessions
+        # Backward-compat alias — used by ControlServer and a few internal spots
+        self.containers = sessions
         self.control_room_id = control_room_id
         self.space_id = space_id
         self.allowed_users = allowed_users
@@ -172,7 +175,6 @@ class MessageRouter:
         self._display.detect_session()
 
         # ── Idle timeout ──
-        self._last_activity: dict[str, float] = {}  # session_id → monotonic timestamp
         self._idle_timeout = idle_timeout  # seconds, 0 = disabled
 
         # ── Memory stores (per user) ──
@@ -182,6 +184,9 @@ class MessageRouter:
 
         # ── Audit log ──
         self._audit = AuditLog(self._data_dir)
+
+        # Wire audit into SessionManager
+        self.sessions.audit = self._audit
 
         # ── Cost / token tracking ──
         self._cost = CostTracker(self._data_dir)
@@ -234,8 +239,8 @@ class MessageRouter:
 
     async def stop(self) -> None:
         """Clean up — save session state for restore on next start."""
-        # Save current session state so we know what was running
-        self.containers._save_sessions()
+        self.sessions._shutting_down = True
+        self.sessions.save_sessions()
         log.info("Session state saved for restore")
 
         if hasattr(self, "_health_task") and not self._health_task.done():
@@ -365,7 +370,7 @@ class MessageRouter:
                 except Exception:
                     pass
 
-                crashed = await self.containers.check_health()
+                crashed = await self.sessions.check_health()
                 for session in crashed:
                     await self.matrix.send_message(
                         session.room_id,
@@ -377,7 +382,7 @@ class MessageRouter:
                 for sid, start in list(self._turn_start_time.items()):
                     elapsed = now - start
                     if elapsed > self._STALL_THRESHOLD:
-                        session = self.containers.get_session(sid)
+                        session = self.sessions.get_session(sid)
                         if session:
                             log.warning(
                                 "Agent %s turn stalled (%.0fs)", sid, elapsed
@@ -395,7 +400,7 @@ class MessageRouter:
                     await self._check_idle_sessions()
 
                 # Periodically persist session state (crash recovery)
-                self.containers._save_sessions()
+                self.sessions.save_sessions()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -403,43 +408,36 @@ class MessageRouter:
 
     def _touch_activity(self, session_id: str) -> None:
         """Record that a session had activity (prevents idle shutdown)."""
-        self._last_activity[session_id] = time.monotonic()
+        self.sessions.touch_activity(session_id)
 
     async def _check_idle_sessions(self) -> None:
-        """Stop sessions that have been idle beyond the timeout.
-
-        A session is idle if:
-        - No user/agent messages within idle_timeout seconds
-        - Not currently in a turn (no active _turn_start_time)
-        - Container has no busy subprocesses (via podman top)
-        """
+        """Stop sessions that have been idle beyond the timeout."""
         if self._idle_timeout <= 0:
             return
         now = time.monotonic()
-        for session in self.containers.active_sessions():
+        for session in self.sessions.active_sessions():
             sid = session.id
 
             # Skip sessions in active turns
             if sid in self._turn_start_time:
                 continue
 
-            last = self._last_activity.get(sid)
-            if last is None:
+            idle = self.sessions.get_idle_seconds(sid)
+            if idle is None:
                 # First check — set the timestamp and skip
-                self._last_activity[sid] = now
+                self.sessions.touch_activity(sid)
                 continue
 
-            elapsed = now - last
-            if elapsed < self._idle_timeout:
+            if idle < self._idle_timeout:
                 continue
 
             # Check if the container has busy processes
-            if await self._container_has_processes(sid):
+            if await self.sessions.runtime.container_has_processes(sid):
                 log.debug("Session %s idle but has running processes", sid)
                 continue
 
             log.info(
-                "Session %s idle for %.0fs — shutting down", sid, elapsed
+                "Session %s idle for %.0fs — shutting down", sid, idle
             )
 
             # Trigger auto-dreaming before shutdown if enabled
@@ -450,26 +448,8 @@ class MessageRouter:
                 session.room_id,
                 "💤 Session idle — shutting down. Send a message to restart.",
             )
-            await self.containers.stop_session(sid, reason="idle")
-            self._last_activity.pop(sid, None)
-
-    async def _container_has_processes(self, session_id: str) -> bool:
-        """Check if a container has non-trivial running processes."""
-        try:
-            result = await asyncio.create_subprocess_exec(
-                self.containers.config.runtime, "top", session_id,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(result.communicate(), timeout=5)
-            if result.returncode != 0:
-                return False
-            lines = stdout.decode().strip().split("\n")
-            # podman top output: header + one line per process
-            # If more than 2 processes (init + agent), something is running
-            return len(lines) > 3
-        except Exception:
-            return False
+            await self.sessions.stop_session(sid, reason="idle")
+            self.sessions.clear_activity(sid)
 
     # ------------------------------------------------------------------
     # Memory store helpers
@@ -1864,25 +1844,8 @@ class MessageRouter:
         # Stop file watcher
         await self._stop_watcher(session_id)
 
-        session = self.containers.get_session(session_id)
-        if session:
-            if session.status == "stopping":
-                log.info("Agent disconnected (graceful stop): %s", session_id)
-                await self.matrix.send_message(
-                    session.room_id,
-                    "🛑 Session stopped.",
-                )
-            elif session.status == "running":
-                log.warning("Agent disconnected unexpectedly: %s", session_id)
-                await self.matrix.send_message(
-                    session.room_id,
-                    "⚠️ Agent disconnected unexpectedly.",
-                )
-            else:
-                log.info("Agent disconnected (status=%s): %s", session.status, session_id)
-        else:
-            log.info("Agent disconnected (no session): %s", session_id)
-        self._audit.log("agent_disconnected", session_id=session_id)
+        # Delegate disconnect handling (Matrix notifications, audit) to SessionManager
+        await self.sessions.on_agent_disconnect(session_id)
 
     async def _start_watcher(self, session_id: str) -> None:
         """Start a file watcher for a session's workspace."""
@@ -2613,22 +2576,8 @@ class MessageRouter:
             return
 
         session_id = cmd.args[0]
-        session = self.containers.get_session(session_id)
-        room_id = session.room_id if session else None
-
-        if self.ipc.is_connected(session_id):
-            await self.ipc.send_to(
-                session_id,
-                Message(type=MessageType.SHUTDOWN, payload={}),
-            )
-
-        removed = await self.containers.remove_session(session_id, reason="kill")
-        await self.ipc.remove_socket(session_id)
+        removed = await self.sessions.delete_session(session_id, reason="kill")
         self._audit.log("session_killed", session_id=session_id)
-
-        # Leave and forget the Matrix room
-        if removed and room_id:
-            await self.matrix.cleanup_room(room_id, reason="Session deleted")
 
         if removed:
             await self._reply_control(
@@ -2703,17 +2652,9 @@ class MessageRouter:
 
     async def _cleanup_session_room(self, session: Session) -> bool:
         """Clean up a single stopped session: kick users, leave room, remove session."""
-        # Find which users are in this room
-        room_id = session.room_id
-        reason = f"Session '{session.name}' archived by Enclave"
-
-        # Kick all users we know about
-        user_ids = list(self._user_mappings.keys())
-        ok = await self.matrix.cleanup_room(room_id, user_ids=user_ids, reason=reason)
-
-        # Remove session from container manager
-        await self.containers.remove_session(session.id)
-        await self.ipc.remove_socket(session.id)
-
-        log.info("Cleaned up session %s (room: %s)", session.id, room_id)
-        return ok
+        try:
+            await self.sessions.delete_session(session.id, reason="cleanup")
+            return True
+        except Exception as e:
+            log.error("Failed to clean up session %s: %s", session.id, e)
+            return False

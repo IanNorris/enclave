@@ -16,10 +16,10 @@ import yaml
 
 from enclave.common.config import load_config
 from enclave.common.logging import get_logger, setup_logging
-from enclave.orchestrator.container import ContainerManager
 from enclave.orchestrator.ipc import IPCServer
 from enclave.orchestrator.matrix_client import EnclaveMatrixClient
 from enclave.orchestrator.router import MessageRouter
+from enclave.orchestrator.session_manager import SessionManager
 
 log = get_logger("main")
 
@@ -127,15 +127,19 @@ async def run() -> None:
     # IPC server
     ipc = IPCServer(socket_dir=config.container.socket_dir)
 
-    # Container manager
-    containers = ContainerManager(config=config.container)
+    # Session manager (owns sessions, coordinates all subsystems)
+    sessions = SessionManager(
+        config=config.container,
+        matrix=matrix,
+        ipc=ipc,
+    )
 
     # Message router
     allowed = [u.matrix_id for u in config.users] if config.users else None
     router = MessageRouter(
         matrix=matrix,
         ipc=ipc,
-        containers=containers,
+        sessions=sessions,
         control_room_id=config.matrix.control_room_id,
         space_id=config.matrix.space_id,
         allowed_users=allowed,

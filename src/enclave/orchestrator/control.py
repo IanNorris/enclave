@@ -25,8 +25,6 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from enclave.common.protocol import Message, MessageType
-
 if TYPE_CHECKING:
     from .router import MessageRouter
 
@@ -152,20 +150,13 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": "Missing session"})
             return
 
-        session = self._router.containers.get_session(session_id)
+        session = self._router.sessions.get_session(session_id)
         if not session:
             await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
             return
 
         log.info("Stop requested via control socket: %s", session_id)
-
-        # Send shutdown message to agent, then stop container
-        await self._router.ipc.send_to(
-            session_id,
-            Message(type=MessageType.SHUTDOWN, payload={}),
-        )
-        ok = await self._router.containers.stop_session(session_id, reason="control")
-        await self._router.ipc.remove_socket(session_id)
+        ok = await self._router.sessions.stop_session(session_id, reason="control")
 
         if ok:
             await self._write(writer, {"ok": True, "type": "stopped"})
@@ -178,30 +169,13 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": "Missing session"})
             return
 
-        session = self._router.containers.get_session(session_id)
+        session = self._router.sessions.get_session(session_id)
         if not session:
             await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
             return
 
         log.info("Delete requested via control socket: %s", session_id)
-
-        room_id = session.room_id
-
-        # Send shutdown if still connected
-        if self._router.ipc.is_connected(session_id):
-            await self._router.ipc.send_to(
-                session_id,
-                Message(type=MessageType.SHUTDOWN, payload={}),
-            )
-
-        ok = await self._router.containers.remove_session(session_id, reason="control")
-        await self._router.ipc.remove_socket(session_id)
-
-        # Leave and forget the Matrix room
-        if ok and room_id:
-            await self._router.matrix.cleanup_room(
-                room_id, reason="Session deleted"
-            )
+        ok = await self._router.sessions.delete_session(session_id, reason="control")
 
         if ok:
             await self._write(writer, {"ok": True, "type": "deleted"})
