@@ -112,6 +112,8 @@ class ControlServer:
                 await self._handle_send(req, writer, reader)
             elif action == "stop":
                 await self._handle_stop(req, writer)
+            elif action == "start":
+                await self._handle_start(req, writer)
             elif action == "delete":
                 await self._handle_delete(req, writer)
             else:
@@ -162,6 +164,29 @@ class ControlServer:
             await self._write(writer, {"ok": True, "type": "stopped"})
         else:
             await self._write(writer, {"ok": False, "error": "Failed to stop session"})
+
+    async def _handle_start(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        session_id = req.get("session", "")
+        if not session_id:
+            await self._write(writer, {"ok": False, "error": "Missing session"})
+            return
+
+        session = self._router.sessions.get_session(session_id)
+        if not session:
+            await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
+            return
+
+        if session.status == "running":
+            await self._write(writer, {"ok": True, "type": "already_running"})
+            return
+
+        log.info("Start requested via control socket: %s", session_id)
+        ok, error = await self._router.sessions.restore_session(session_id)
+
+        if ok:
+            await self._write(writer, {"ok": True, "type": "started"})
+        else:
+            await self._write(writer, {"ok": False, "error": error or "Failed to start session"})
 
     async def _handle_delete(self, req: dict, writer: asyncio.StreamWriter) -> None:
         session_id = req.get("session", "")
