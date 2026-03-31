@@ -327,8 +327,15 @@ async def handle_user_message(
         err_str = str(e)
         print(f"[agent] SDK send() error: {e}", file=sys.stderr)
 
-        # Session lost — recover from .copilot-state/ checkpoint
-        if "Session not found" in err_str:
+        # Recoverable errors: session lost, or SDK subprocess died
+        _recoverable = (
+            "Session not found" in err_str
+            or "Broken pipe" in err_str
+            or "BrokenPipeError" in type(e).__name__
+            or isinstance(e, (BrokenPipeError, ConnectionError, OSError))
+        )
+
+        if _recoverable:
             recovered = await _recover_sdk_session(state)
             if recovered:
                 # Notify user about the recovery
