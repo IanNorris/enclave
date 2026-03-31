@@ -359,9 +359,14 @@ class MessageRouter:
 
     async def _health_check_loop(self) -> None:
         """Periodically check container health and notify on crashes/stalls."""
+        # Backup every N ticks (interval × ticks = backup period)
+        backup_ticks = self.sessions._BACKUP_INTERVAL // self._HEALTH_INTERVAL
+        tick = 0
+
         while True:
             try:
                 await asyncio.sleep(self._HEALTH_INTERVAL)
+                tick += 1
 
                 # Notify systemd watchdog that the event loop is alive
                 try:
@@ -401,6 +406,12 @@ class MessageRouter:
 
                 # Periodically persist session state (crash recovery)
                 self.sessions.save_sessions()
+
+                # Periodic SDK state backups
+                if tick % backup_ticks == 0:
+                    count = await self.sessions.backup_all_running()
+                    if count:
+                        log.info("SDK state backed up for %d session(s)", count)
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -761,6 +772,10 @@ class MessageRouter:
             elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
             log.info("Agent %s turn ended (%.1fs)", session.id, elapsed)
             self._control.notify_turn_end(session.id)
+            # Snapshot SDK state after every interaction
+            asyncio.create_task(
+                asyncio.to_thread(self.sessions.backup_sdk_state, session)
+            )
         elif msg.type == MessageType.STATUS_UPDATE:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:

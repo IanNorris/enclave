@@ -280,6 +280,9 @@ class SessionManager:
         session.status = "stopping"
         self.save_sessions()
 
+        # Snapshot SDK state before tearing down the runtime
+        await asyncio.to_thread(self.backup_sdk_state, session)
+
         # Send SHUTDOWN to agent if connected
         if self.ipc and self.ipc.is_connected(session_id):
             from enclave.orchestrator.ipc import Message, MessageType
@@ -417,3 +420,61 @@ class SessionManager:
 
         if self.audit:
             self.audit.log("agent_disconnected", session_id=session_id)
+
+    # ── SDK state backups ─────────────────────────────────────────────
+
+    _BACKUP_INTERVAL = 900  # 15 minutes
+    _BACKUP_KEEP = 3        # rolling window
+    _BACKUP_MIN_GAP = 30    # don't backup more often than this (seconds)
+
+    def backup_sdk_state(self, session: Session, *, periodic: bool = False) -> bool:
+        """Snapshot .copilot-state/ for a session. Runs in-thread (sync I/O).
+
+        Returns True if a backup was created, False if skipped/failed.
+        """
+        ws = Path(session.workspace_path)
+        src = ws / ".copilot-state"
+        if not src.exists():
+            return False
+
+        backup_root = ws / ".copilot-backups"
+        backup_root.mkdir(exist_ok=True)
+
+        # Skip if the newest backup is very recent
+        existing = sorted(backup_root.iterdir(), reverse=True) if backup_root.exists() else []
+        if existing:
+            newest_age = time.time() - existing[0].stat().st_mtime
+            if newest_age < self._BACKUP_MIN_GAP:
+                return False
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = backup_root / stamp
+
+        try:
+            shutil.copytree(src, dest)
+            label = "periodic" if periodic else "turn-end"
+            log.info("SDK state backed up (%s): %s → %s", label, session.id, dest.name)
+        except Exception as e:
+            log.error("SDK backup failed for %s: %s", session.id, e)
+            return False
+
+        # Prune old backups (keep newest N)
+        backups = sorted(backup_root.iterdir(), reverse=True)
+        for old in backups[self._BACKUP_KEEP:]:
+            shutil.rmtree(old, ignore_errors=True)
+            log.debug("Pruned old backup: %s", old.name)
+
+        return True
+
+    async def backup_all_running(self) -> int:
+        """Backup SDK state for all running sessions. Returns count."""
+        count = 0
+        for session in self.active_sessions():
+            if not session.workspace_path:
+                continue
+            ok = await asyncio.to_thread(
+                self.backup_sdk_state, session, periodic=True,
+            )
+            if ok:
+                count += 1
+        return count
