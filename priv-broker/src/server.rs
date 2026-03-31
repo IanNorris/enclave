@@ -19,6 +19,23 @@ pub async fn run(cfg: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let perms = std::fs::Permissions::from_mode(cfg.socket_mode);
     std::fs::set_permissions(&cfg.socket_path, perms)?;
 
+    // Set socket group ownership so non-root users can connect
+    if let Some(ref group_name) = cfg.socket_group {
+        match nix::unistd::Group::from_name(group_name)? {
+            Some(group) => {
+                nix::unistd::chown(
+                    cfg.socket_path.as_str(),
+                    None,
+                    Some(group.gid),
+                )?;
+                info!(group = %group_name, gid = %group.gid, "Socket group set");
+            }
+            None => {
+                error!(group = %group_name, "Socket group not found — non-root access will fail");
+            }
+        }
+    }
+
     info!(path = %cfg.socket_path, "Listening for connections");
 
     loop {

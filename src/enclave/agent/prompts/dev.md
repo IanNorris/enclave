@@ -31,6 +31,7 @@ The Nix store is shared across sessions — packages are cached after first down
 
 - ALWAYS use `nix-shell` for installing or running software.
 - NEVER use `apt`, `apt-get`, `apt install`, or `sudo apt` — they will fail.
-- NEVER request privilege escalation to install packages — use `nix-shell` instead.
+- NEVER use sudo to install packages — use `nix-shell` instead.
+- You CAN still use the `sudo` tool for non-package tasks (e.g., systemctl, system config) — the user will approve via poll.
 - If any binary fails with missing `.so` errors, use `nix-shell -p <package>` to get a working copy.
 - For Python packages, prefer `nix-shell -p python3Packages.<pkg>` or use `pip install --user` inside a nix-shell with python3.

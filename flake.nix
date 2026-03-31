@@ -152,7 +152,7 @@
           cfg = config.services.enclave;
           brokerCfg = cfg.broker;
           tomlFormat = pkgs.formats.toml { };
-          brokerConfigFile = tomlFormat.generate "priv-broker.toml" {
+          brokerConfigFile = tomlFormat.generate "priv-broker.toml" ({
             socket_path = brokerCfg.socketPath;
             socket_mode = brokerCfg.socketMode;
             allowed_user = brokerCfg.allowedUser;
@@ -160,7 +160,9 @@
             denied_commands = brokerCfg.deniedCommands;
             allowed_mount_paths = brokerCfg.allowedMountPaths;
             denied_mount_paths = brokerCfg.deniedMountPaths;
-          };
+          } // lib.optionalAttrs (brokerCfg.socketGroup != null) {
+            socket_group = brokerCfg.socketGroup;
+          });
         in {
           options.services.enclave = {
             enable = lib.mkEnableOption "Enclave AI agent orchestrator";
@@ -189,6 +191,12 @@
                 type = lib.types.int;
                 default = 432; # 0o660
                 description = "Socket file permissions as a decimal integer (432 = octal 0660).";
+              };
+
+              socketGroup = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = "users";
+                description = "Group to own the broker socket (allows non-root access). Set to null to skip.";
               };
 
               allowedUser = lib.mkOption {

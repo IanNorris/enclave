@@ -13,6 +13,10 @@ pub struct BrokerConfig {
     #[serde(default = "default_socket_mode")]
     pub socket_mode: u32,
 
+    /// Group name to own the socket (allows non-root access)
+    #[serde(default)]
+    pub socket_group: Option<String>,
+
     /// Allowed user/group to connect
     #[serde(default = "default_allowed_user")]
     pub allowed_user: String,
@@ -76,6 +80,7 @@ impl Default for BrokerConfig {
         Self {
             socket_path: default_socket_path(),
             socket_mode: default_socket_mode(),
+            socket_group: None,
             allowed_user: default_allowed_user(),
             timeout_secs: default_timeout(),
             allowed_commands: vec![],
