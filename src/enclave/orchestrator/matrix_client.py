@@ -199,6 +199,14 @@ class EnclaveMatrixClient:
         await self.client.sync(timeout=10000, full_state=True)
         await self._trust_all_devices()
 
+        # Invalidate all outbound Megolm sessions so the next send creates
+        # fresh ones and shares keys with every currently-trusted device.
+        # Without this, a restart can leave stale sessions that exclude
+        # devices added since the session was first created.
+        for room_id in list(self.client.rooms):
+            self.client.invalidate_outbound_session(room_id)
+        log.info("Invalidated outbound Megolm sessions for %d rooms", len(self.client.rooms))
+
         # Auto-join any pending invites from before we started syncing
         for room_id in list(self.client.invited_rooms):
             log.info("Pending invite for %s — joining", room_id)
@@ -294,15 +302,34 @@ class EnclaveMatrixClient:
             return None
 
     async def _ensure_keys_for_room(self, room_id: str) -> None:
-        """Query keys and trust devices for a room before sending."""
+        """Query keys and trust new devices for a room before sending.
+
+        If any untrusted device is found, trust it and invalidate the outbound
+        Megolm session so the next room_send creates a fresh one that includes
+        the new device.
+        """
         try:
             await self.client.keys_query()
         except Exception:
             pass  # "No key query required" is normal
-        try:
-            await self._trust_devices_in_room(room_id)
-        except Exception as e:
-            log.warning("Trust failed for %s: %s", room_id, e)
+
+        room = self.client.rooms.get(room_id)
+        if not room:
+            return
+
+        new_device = False
+        for user_id in room.users:
+            for device_id, device in self.client.device_store[user_id].items():
+                if device.deleted:
+                    continue
+                if device.trust_state != TrustState.verified:
+                    self.client.verify_device(device)
+                    log.info("Trusted new device %s for %s", device_id, user_id)
+                    new_device = True
+
+        if new_device:
+            self.client.invalidate_outbound_session(room_id)
+            log.info("Rotated outbound Megolm session for %s (new device)", room_id)
 
     async def send_reaction(
         self, room_id: str, event_id: str, emoji: str
