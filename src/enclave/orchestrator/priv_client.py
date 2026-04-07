@@ -64,19 +64,42 @@ class PrivBrokerClient:
         return self._writer is not None
 
     async def _send(self, request: dict[str, Any]) -> PrivBrokerResult:
-        """Send a request and read the response."""
-        if not self._writer or not self._reader:
-            return PrivBrokerResult({"error": "Not connected"})
+        """Send a request and read the response.
 
-        data = json.dumps(request) + "\n"
-        self._writer.write(data.encode())
-        await self._writer.drain()
+        Auto-reconnects once if the connection is stale (e.g. broker restarted).
+        """
+        for attempt in range(2):
+            if not self._writer or not self._reader:
+                if attempt == 0:
+                    # Try to reconnect
+                    if not await self.connect():
+                        return PrivBrokerResult({"error": "Not connected"})
+                else:
+                    return PrivBrokerResult({"error": "Not connected"})
 
-        line = await asyncio.wait_for(self._reader.readline(), timeout=60.0)
-        if not line:
-            return PrivBrokerResult({"error": "Connection closed"})
+            try:
+                data = json.dumps(request) + "\n"
+                self._writer.write(data.encode())
+                await self._writer.drain()
 
-        return PrivBrokerResult(json.loads(line.decode().strip()))
+                line = await asyncio.wait_for(
+                    self._reader.readline(), timeout=60.0,
+                )
+                if not line:
+                    raise ConnectionError("Connection closed")
+
+                return PrivBrokerResult(json.loads(line.decode().strip()))
+            except (
+                ConnectionError, BrokenPipeError, OSError,
+                asyncio.TimeoutError,
+            ) as e:
+                log.warning("Priv broker send failed (attempt %d): %s", attempt + 1, e)
+                await self.disconnect()
+                if attempt == 0:
+                    continue
+                return PrivBrokerResult({"error": f"Connection lost: {e}"})
+
+        return PrivBrokerResult({"error": "Send failed"})
 
     async def ping(self) -> bool:
         """Check if the broker is alive."""
