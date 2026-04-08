@@ -1340,6 +1340,13 @@ class MessageRouter:
                 reply_to=msg.id,
             )
 
+        # Translate container path → host path
+        # Agent sees /workspace/... but host stores at session.workspace_path/...
+        if dest.startswith("/workspace/") and session.workspace_path:
+            dest = os.path.join(
+                session.workspace_path, dest[len("/workspace/"):]
+            )
+
         if url.startswith("mxc://"):
             success = await self.matrix.download_media(
                 url, dest, encryption=encryption,
