@@ -293,6 +293,72 @@ def setup_session_listener(
     return unsubscribe
 
 
+async def _download_attachments(
+    state: AgentState,
+    attachments: list[dict],
+) -> list[dict]:
+    """Download Matrix media attachments and convert to SDK attachment format.
+
+    For images, returns BlobAttachment (base64 inline data).
+    For other files, downloads to /workspace/.attachments/ and returns FileAttachment.
+    """
+    import base64
+
+    sdk_attachments: list[dict] = []
+    attach_dir = Path("/workspace/.attachments")
+
+    for att in attachments:
+        url = att.get("url", "")
+        filename = att.get("filename", "attachment")
+        content_type = att.get("content_type", "")
+        encryption = att.get("encryption")
+
+        if not url:
+            continue
+
+        # Download via orchestrator (handles mxc:// + E2EE decryption)
+        dest = attach_dir / filename
+        resp = await state.ipc.request(Message(
+            type=MessageType.DOWNLOAD_REQUEST,
+            payload={
+                "url": url,
+                "dest": str(dest),
+                "encryption": encryption,
+            },
+        ), timeout=30.0)
+
+        if not resp.payload.get("downloaded"):
+            print(f"[agent] Failed to download attachment: {filename}", file=sys.stderr)
+            continue
+
+        # Read the downloaded file
+        try:
+            data = dest.read_bytes()
+        except OSError as e:
+            print(f"[agent] Failed to read downloaded file {dest}: {e}", file=sys.stderr)
+            continue
+
+        if content_type.startswith("image/"):
+            # Inline as BlobAttachment for the model to see
+            sdk_attachments.append({
+                "type": "blob",
+                "data": base64.b64encode(data).decode("ascii"),
+                "mimeType": content_type,
+                "displayName": filename,
+            })
+            print(f"[agent] Image attachment ready: {filename} ({len(data)} bytes)", file=sys.stderr)
+        else:
+            # Keep as file reference
+            sdk_attachments.append({
+                "type": "file",
+                "path": str(dest),
+                "displayName": filename,
+            })
+            print(f"[agent] File attachment ready: {filename} ({len(data)} bytes)", file=sys.stderr)
+
+    return sdk_attachments
+
+
 async def handle_user_message(
     state: AgentState,
     msg: Message,
@@ -300,6 +366,7 @@ async def handle_user_message(
     """Handle a user message — stream events back via IPC."""
     content = msg.payload.get("content", "")
     timestamp = msg.payload.get("timestamp", "")
+    raw_attachments = msg.payload.get("attachments") or []
 
     # Prepend current time context so the agent knows when the message was sent
     if timestamp:
@@ -313,13 +380,20 @@ async def handle_user_message(
         ))
         return
 
+    # Download any media attachments from Matrix
+    sdk_attachments = None
+    if raw_attachments:
+        sdk_attachments = await _download_attachments(state, raw_attachments)
+        if not sdk_attachments:
+            sdk_attachments = None
+
     # Point the persistent listener at this message
     if state.listener_ctl and hasattr(state.listener_ctl, "set_current_msg"):
         state.listener_ctl.set_current_msg(msg.id)
 
     try:
         print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
-        await state.sdk_session.send(content)
+        await state.sdk_session.send(content, attachments=sdk_attachments)
         print(f"[agent] SDK send() returned", file=sys.stderr)
         # Don't wait for SESSION_IDLE here — the persistent listener handles
         # all responses including those from background sub-agents.
@@ -355,7 +429,7 @@ async def handle_user_message(
                 if state.listener_ctl and hasattr(state.listener_ctl, "set_current_msg"):
                     state.listener_ctl.set_current_msg(msg.id)
                 try:
-                    await state.sdk_session.send(content)
+                    await state.sdk_session.send(content, attachments=sdk_attachments)
                     return
                 except Exception as retry_err:
                     print(f"[agent] Retry after recovery failed: {retry_err}", file=sys.stderr)

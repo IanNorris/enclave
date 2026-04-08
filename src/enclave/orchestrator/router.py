@@ -1331,6 +1331,7 @@ class MessageRouter:
         """Handle a file download request from an agent."""
         url = msg.payload.get("url", "")
         dest = msg.payload.get("dest", "")
+        encryption = msg.payload.get("encryption")
 
         if not url or not dest:
             return Message(
@@ -1340,7 +1341,9 @@ class MessageRouter:
             )
 
         if url.startswith("mxc://"):
-            success = await self.matrix.download_media(url, dest)
+            success = await self.matrix.download_media(
+                url, dest, encryption=encryption,
+            )
             return Message(
                 type=MessageType.AGENT_RESPONSE,
                 payload={"downloaded": success, "path": dest},

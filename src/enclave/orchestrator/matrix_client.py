@@ -800,12 +800,19 @@ class EnclaveMatrixClient:
             except Exception as e:
                 log.error("Message handler error (media): %s", e)
 
-    async def download_media(self, mxc_url: str, dest: str | Path) -> bool:
+    async def download_media(
+        self,
+        mxc_url: str,
+        dest: str | Path,
+        encryption: dict[str, Any] | None = None,
+    ) -> bool:
         """Download a file from the Matrix content repository.
 
         Args:
             mxc_url: The mxc:// URL of the file.
             dest: Local path to save the file to.
+            encryption: Optional E2EE decryption info (key, iv, hashes)
+                        from the ``file`` field of an encrypted media event.
 
         Returns:
             True if downloaded successfully.
@@ -816,9 +823,25 @@ class EnclaveMatrixClient:
         try:
             resp = await self.client.download(mxc_url)
             if isinstance(resp, DownloadResponse):
+                data = resp.body
+                # Decrypt if encryption info was provided (E2EE rooms)
+                if encryption:
+                    try:
+                        from nio.crypto import decrypt_attachment
+                        key_obj = encryption.get("key", {})
+                        k = key_obj.get("k", "") if isinstance(key_obj, dict) else ""
+                        iv = encryption.get("iv", "")
+                        hashes = encryption.get("hashes", {})
+                        sha256 = hashes.get("sha256", "")
+                        if k and iv and sha256:
+                            data = decrypt_attachment(data, k, sha256, iv)
+                            log.debug("Decrypted attachment: %d bytes", len(data))
+                    except Exception as e:
+                        log.error("Failed to decrypt attachment: %s", e)
+                        return False
                 with open(dest, "wb") as f:
-                    f.write(resp.body)
-                log.info("Downloaded %s → %s (%d bytes)", mxc_url, dest, len(resp.body))
+                    f.write(data)
+                log.info("Downloaded %s → %s (%d bytes)", mxc_url, dest, len(data))
                 return True
             else:
                 log.error("Download failed for %s: %s", mxc_url, resp)
