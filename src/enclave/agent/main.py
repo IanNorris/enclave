@@ -590,7 +590,10 @@ def _request_permission_sync(
     this actually returns a coroutine despite the name.  Kept as a regular
     function that returns an awaitable for compatibility.
     """
-    from copilot import PermissionRequestResult
+    try:
+        from copilot import PermissionRequestResult
+    except ImportError:
+        from copilot.session import PermissionRequestResult
 
     if not ipc or not ipc.is_connected:
         return PermissionRequestResult(
@@ -643,13 +646,17 @@ async def try_init_copilot(
     Returns (client, session) tuple or None if SDK unavailable.
     """
     try:
-        from copilot import (
-            CopilotClient,
-            PermissionRequestResult,
-            SubprocessConfig,
-            SystemMessageAppendConfig,
-        )
-        from copilot.types import Tool, ToolResult
+        from copilot import CopilotClient, SubprocessConfig
+        # Tool/ToolResult moved from copilot.types to copilot.tools in newer SDK
+        try:
+            from copilot.types import Tool, ToolResult
+        except ImportError:
+            from copilot.tools import Tool, ToolResult
+        # PermissionRequestResult/SystemMessageAppendConfig moved to copilot.session
+        try:
+            from copilot import PermissionRequestResult, SystemMessageAppendConfig
+        except ImportError:
+            from copilot.session import PermissionRequestResult, SystemMessageAppendConfig
     except ImportError:
         return None
 
