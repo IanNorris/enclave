@@ -383,8 +383,12 @@ async def handle_user_message(
     # Download any media attachments from Matrix
     sdk_attachments = None
     if raw_attachments:
-        sdk_attachments = await _download_attachments(state, raw_attachments)
-        if not sdk_attachments:
+        try:
+            sdk_attachments = await _download_attachments(state, raw_attachments)
+            if not sdk_attachments:
+                sdk_attachments = None
+        except Exception as e:
+            print(f"[agent] Attachment download failed: {e}", file=sys.stderr)
             sdk_attachments = None
 
     # Point the persistent listener at this message

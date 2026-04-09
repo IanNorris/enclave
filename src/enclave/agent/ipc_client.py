@@ -102,16 +102,28 @@ class IPCClient:
                     self._pending[msg.reply_to].set_result(msg)
                     continue
 
-                # Route to type-specific handler
+                # Dispatch handler as a task so the listen loop keeps reading.
+                # This prevents deadlock when a handler does ipc.request()
+                # (which needs the listen loop to read the reply).
                 handler = self._handlers.get(msg.type)
                 if handler:
-                    response = await handler(msg)
-                    if response is not None:
-                        response.reply_to = msg.id
-                        await self.send(response)
+                    asyncio.create_task(self._dispatch(msg, handler))
         except asyncio.CancelledError:
             pass
         except Exception:
             pass
         finally:
             self._connected = False
+
+    async def _dispatch(
+        self, msg: Message, handler: IncomingHandler,
+    ) -> None:
+        """Run a handler and send back any response."""
+        try:
+            response = await handler(msg)
+            if response is not None:
+                response.reply_to = msg.id
+                await self.send(response)
+        except Exception as e:
+            import sys
+            print(f"[ipc] Handler error: {e}", file=sys.stderr)
