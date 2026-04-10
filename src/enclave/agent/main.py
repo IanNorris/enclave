@@ -31,6 +31,7 @@ class AgentState:
     __slots__ = (
         "sdk_client", "sdk_session", "listener_ctl",
         "ipc", "loop", "working_directory",
+        "turn_active", "turn_phase",
     )
 
     def __init__(self) -> None:
@@ -40,12 +41,16 @@ class AgentState:
         self.ipc: IPCClient | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.working_directory: str = "/workspace"
+        # Turn tracking for smart message injection
+        self.turn_active: bool = False
+        self.turn_phase: str = "idle"  # idle | thinking | tool | responding
 
 
 def setup_session_listener(
     ipc: IPCClient,
     sdk_session: _CopilotSession,
     loop: asyncio.AbstractEventLoop,
+    agent_state: AgentState | None = None,
 ) -> callable:
     """Register a persistent event listener on the SDK session.
 
@@ -79,7 +84,14 @@ def setup_session_listener(
         etype_str = getattr(etype, "value", str(etype)) if etype else "None"
         print(f"[agent] Event: {etype_str}", file=sys.stderr)
 
+        def _set_phase(phase: str, active: bool | None = None) -> None:
+            if agent_state is not None:
+                agent_state.turn_phase = phase
+                if active is not None:
+                    agent_state.turn_active = active
+
         if etype == SessionEventType.ASSISTANT_MESSAGE_DELTA:
+            _set_phase("responding")
             delta = getattr(data, "delta_content", None) or getattr(data, "content", None) or ""
             if delta:
                 accumulated_content.append(delta)
@@ -112,6 +124,7 @@ def setup_session_listener(
                 )))
 
         elif etype == SessionEventType.ASSISTANT_REASONING_DELTA:
+            _set_phase("thinking")
             delta = getattr(data, "delta_content", None) or ""
             if delta:
                 _fire_and_forget(ipc.send(Message(
@@ -138,6 +151,7 @@ def setup_session_listener(
                 )))
 
         elif etype == SessionEventType.TOOL_EXECUTION_START:
+            _set_phase("tool")
             tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
             args = getattr(data, "arguments", None) or {}
             if isinstance(args, str):
@@ -159,6 +173,7 @@ def setup_session_listener(
             )))
 
         elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
+            _set_phase("thinking")  # back to thinking between tools
             tool_name = getattr(data, "tool_name", None) or getattr(data, "name", None) or "unknown"
             success = getattr(data, "success", True)
             result = getattr(data, "result", None)
@@ -203,6 +218,7 @@ def setup_session_listener(
             )))
 
         elif etype == SessionEventType.ASSISTANT_TURN_START:
+            _set_phase("thinking", active=True)
             turn_id = getattr(data, "turn_id", None) or getattr(data, "turnId", "")
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.TURN_START,
@@ -211,6 +227,7 @@ def setup_session_listener(
             )))
 
         elif etype == SessionEventType.ASSISTANT_TURN_END:
+            _set_phase("idle")
             turn_id = getattr(data, "turn_id", None) or getattr(data, "turnId", "")
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.TURN_END,
@@ -278,7 +295,9 @@ def setup_session_listener(
                             "model": model or "",
                         },
                     )))
-            elif etype_str not in ("session.idle",):
+            elif etype_str == "session.idle":
+                _set_phase("idle", active=False)
+            else:
                 # Log truly unhandled events for diagnostics
                 print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
 
@@ -396,8 +415,22 @@ async def handle_user_message(
         state.listener_ctl.set_current_msg(msg.id)
 
     try:
-        print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
-        await state.sdk_session.send(content, attachments=sdk_attachments)
+        # Smart message injection: interrupt thinking, enqueue during tools
+        if state.turn_active:
+            if state.turn_phase == "thinking":
+                print(f"[agent] Aborting thinking to inject message", file=sys.stderr)
+                try:
+                    await state.sdk_session.abort()
+                except Exception as e:
+                    print(f"[agent] Abort failed (non-fatal): {e}", file=sys.stderr)
+                print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
+                await state.sdk_session.send(content, attachments=sdk_attachments)
+            else:
+                print(f"[agent] Enqueuing message (turn in {state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
+                await state.sdk_session.send(content, attachments=sdk_attachments, mode="enqueue")
+        else:
+            print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
+            await state.sdk_session.send(content, attachments=sdk_attachments)
         print(f"[agent] SDK send() returned", file=sys.stderr)
         # Don't wait for SESSION_IDLE here — the persistent listener handles
         # all responses including those from background sub-agents.
@@ -480,7 +513,7 @@ async def _recover_sdk_session(state: AgentState) -> bool:
             if result:
                 state.sdk_client, state.sdk_session = result
                 state.listener_ctl = setup_session_listener(
-                    state.ipc, state.sdk_session, state.loop,
+                    state.ipc, state.sdk_session, state.loop, state,
                 )
                 print(
                     f"[agent] Recovered on existing client: "
@@ -507,7 +540,7 @@ async def _recover_sdk_session(state: AgentState) -> bool:
         if result:
             state.sdk_client, state.sdk_session = result
             state.listener_ctl = setup_session_listener(
-                state.ipc, state.sdk_session, state.loop,
+                state.ipc, state.sdk_session, state.loop, state,
             )
             print(
                 f"[agent] Recovered with new client: "
@@ -632,6 +665,19 @@ def _request_permission_sync(
             )
 
     return _ask()  # Returns a coroutine (Awaitable) — SDK will await it
+
+
+_TARGET_MODEL = "claude-opus-4.6"
+_REASONING_EFFORT = "medium"
+
+
+async def _configure_model(session: _CopilotSession) -> None:
+    """Switch to the preferred model with reasoning enabled."""
+    try:
+        await session.set_model(_TARGET_MODEL, reasoning_effort=_REASONING_EFFORT)
+        print(f"[agent] Model set to {_TARGET_MODEL} (reasoning={_REASONING_EFFORT})", file=sys.stderr)
+    except Exception as e:
+        print(f"[agent] set_model failed (non-fatal): {e}", file=sys.stderr)
 
 
 async def try_init_copilot(
@@ -2233,6 +2279,7 @@ async def try_init_copilot(
                     infinite_sessions=infinite_sessions_config,
                 )
                 print(f"[agent] Session resumed: {last_id}", file=sys.stderr)
+                await _configure_model(session)
                 return (client, session)
         except Exception as e:
             print(f"[agent] Session resume failed ({e}), creating new session", file=sys.stderr)
@@ -2245,6 +2292,7 @@ async def try_init_copilot(
             tools=custom_tools,
             infinite_sessions=infinite_sessions_config,
         )
+        await _configure_model(session)
         return (client, session)
     except Exception as e:
         print(f"[agent] Copilot SDK init failed: {e}", file=sys.stderr)
@@ -2294,7 +2342,7 @@ async def main() -> None:
         print("[agent] Copilot SDK initialized", file=sys.stderr)
         # Register persistent event listener (handles background agents too)
         try:
-            state.listener_ctl = setup_session_listener(ipc, state.sdk_session, loop)
+            state.listener_ctl = setup_session_listener(ipc, state.sdk_session, loop, state)
             print("[agent] Persistent event listener registered", file=sys.stderr)
         except ImportError:
             print("[agent] SessionEventType not available, running in echo mode", file=sys.stderr)
