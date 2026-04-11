@@ -4,7 +4,7 @@
 A system where AI agent instances run on a Linux PC, controlled via Matrix/Element,
 powered by the GitHub Copilot SDK (Python). Each agent is sandboxed in a podman
 container with explicitly approved permissions. A host-level orchestrator manages
-the agents, handles Matrix communication, and brokers privilege escalation.
+the agents, handles Matrix communication, and manages permissions.
 
 ## Constraints & Decisions
 - **Language:** Python (Copilot SDK support, Linux ecosystem, user familiarity)
@@ -45,18 +45,18 @@ the agents, handles Matrix communication, and brokers privilege escalation.
    Unix Socket    Unix Socket    Unix Socket
         │              │              │
         ▼              ▼              ▼
-┌──────────┐    ┌──────────┐    ┌──────────────┐
-│ Agent    │    │ Agent    │    │ Priv Broker  │
-│ Pod #1   │    │ Pod #2   │    │ (root svc)   │
-│ Project A│    │ Project B│    │ systemd unit │
-│ (podman) │    │ (podman) │    └──────────────┘
+┌──────────┐    ┌──────────┐
+│ Agent    │    │ Agent    │
+│ Pod #1   │    │ Pod #2   │
+│ Project A│    │ Project B│
+│ (podman) │    │ (podman) │
 └──────────┘    └──────────┘
 ```
 
-### The Three Trust Zones
+### The Two Trust Zones
 
 1. **User Zone** — Element client, E2EE, full trust
-2. **Orchestrator Zone** — Runs on host as unprivileged `aeon` user
+2. **Orchestrator Zone** — Runs on host as unprivileged user
    - Manages Matrix connection
    - Spawns/destroys agent containers
    - Routes messages
@@ -65,8 +65,6 @@ the agents, handles Matrix communication, and brokers privilege escalation.
    - Has Copilot SDK + custom tools
    - Can ONLY see files explicitly mounted by orchestrator
    - Communicates with orchestrator via Unix socket
-4. **Privileged Zone** — Root broker daemon (systemd)
-   - Only acts on orchestrator requests + user approval via Matrix
 
 ---
 
@@ -81,7 +79,6 @@ The central coordinator. Runs as a systemd user service.
 - Spawns podman containers for agent sessions
 - Routes Matrix messages ↔ agent containers
 - Manages the "workspace" directories (what files each agent can see)
-- Forwards privilege requests to the root broker
 - Detects Hyprland session for GUI app launching
 
 **NOT responsible for:** AI reasoning (that's the Copilot SDK inside the container)
@@ -117,32 +114,25 @@ User: "new session for project-foo"
 
 ### 3. Permission Controller (the sandboxing secret sauce)
 
-**Validated approach: Shared mount propagation + bind mounts.**
+**Approach: Extra mounts via container restart.**
 
-The workspace directory is mounted into the container with `bind-propagation=shared`.
-The orchestrator can then `mount --bind` paths into the workspace at runtime, and
-`umount` to revoke — all without restarting the container.
-
-**How it works:**
-1. On host: `sudo mount --bind <workspace> <workspace> && sudo mount --make-shared <workspace>`
-2. Container starts with: `--mount type=bind,src=<workspace>,dst=/workspace,bind-propagation=shared`
-3. To grant access: `sudo mount --bind /home/ian/projects/foo <workspace>/foo`
-4. To revoke: `sudo umount <workspace>/foo`
-5. Changes are **instant** — container sees new mounts appear/disappear in real time
+When an agent needs access to a host directory, it requests a mount via the
+orchestrator. After user approval (reaction-based poll in Matrix), the
+orchestrator adds the path to the session's `extra_mounts` list, stops the
+container, and restarts it with the new volume. The agent resumes from its
+SDK checkpoint after restart.
 
 **Flow:**
 - Agent requests access via socket: `{"request": "mount", "path": "/home/ian/projects/foo"}`
 - Orchestrator posts reaction-based approval to Matrix
-- User approves → orchestrator asks **priv broker** to do the bind mount (requires root)
-- Agent can now see it at `/workspace/foo`
-- Revocation: orchestrator asks priv broker to umount — files vanish instantly
+- User approves → orchestrator adds mount to session config → restarts container
+- Agent can now see it at `/workspace/foo` (read-only)
 
-**Why this is better than the original approaches:**
-- No container restart needed (unlike Approach C)
-- No FUSE complexity (unlike Approach B)
-- Real file access, not copies — changes reflect both ways
-- Revocation is instant and complete
-- Uses the priv broker we're already building
+**Why container restart:**
+- No root access needed — podman rootless handles all mounts
+- No privilege broker required — the orchestrator runs as the host user
+- Simple and auditable — mounts are declared in session config
+- Security: mounts are read-only by default
 
 **Critical design principle:** All permissions are managed by the **orchestrator**
 (external to the container), never by the agent itself. The orchestrator maintains
@@ -182,40 +172,7 @@ with a custom pattern.
 - `!rules add <pattern> <scope>` — add a rule without a request
 - `!rules rm <id>` — remove a rule
 
-### 4. Privilege Broker (root daemon)
-
-Separate systemd service running as root.
-
-```
-[Unit]
-Description=Aeon Privilege Broker
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/aeon-priv-broker
-User=root
-RuntimeDirectory=aeon-priv
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Flow:**
-1. Agent (in container) → orchestrator socket: "I need to run `pacman -Syu`"
-2. Orchestrator → priv broker (Unix socket at `/run/aeon-priv/broker.sock`)
-3. Broker → Matrix (via its own socket to orchestrator): approval request
-4. User approves in Element
-5. Broker executes, returns stdout/stderr/exit code
-6. Result flows back through to the agent
-
-**Security:**
-- Socket permissions: only `aeon` user can connect
-- Command allowlist/denylist in `/etc/aeon/priv-broker.conf`
-- All executions logged to journald with full context
-- 5-minute approval timeout
-- Rate limiting
-
-### 5. Display Manager
+### 4. Display Manager
 
 Runs inside the orchestrator. Detects and bridges to the desktop.
 
@@ -230,7 +187,7 @@ Runs inside the orchestrator. Detects and bridges to the desktop.
 - Or in a tmux session managed by the orchestrator
 - Optional: headless Wayland compositor (cage/weston) for apps requiring a display
 
-### 6. Matrix Room Model
+### 5. Matrix Room Model
 
 **Bot-managed rooms** — the bot owns the room lifecycle. On first startup,
 bot creates a Space and control room, invites the user. Project rooms are
@@ -241,7 +198,7 @@ Using **Spaces + Rooms + Threads**:
 ```
 📁 Space: "Enclave"
    ├── 🔧 #control          — commands only (agent spawning, system mgmt)
-   ├── 🔐 #approvals        — permission/privilege requests with reactions
+   ├── 🔐 #approvals        — permission requests with reactions
    ├── 📂 #project-foo      — agent session for project foo
    │     ├── Thread: "refactor auth module"
    │     └── Thread: "debug CI pipeline"
@@ -305,7 +262,6 @@ response = await session.prompt(user_message)
 - `read_file`, `write_file`, `list_directory` — scoped to /workspace
 - `shell_exec` — runs commands inside the container
 - `request_permission` — asks orchestrator for file/directory access
-- `request_privilege` — asks for root execution via broker
 - `launch_gui` — requests GUI app launch on desktop
 - `screenshot` — requests desktop screenshot
 - `send_file` — sends a file to the Matrix room
@@ -322,7 +278,7 @@ response = await session.prompt(user_message)
 | **Maubot** | Plugin architecture idea; our "tools" serve the same role |
 | **matrix-commander** | Reference for matrix-nio E2EE patterns |
 | **XMPP_Shell_Bot** | Validates the concept; we improve with sandboxing + approval |
-| **polkit** | Inspiration for the priv broker approval model |
+| **polkit** | Inspiration for the approval model |
 | **Copilot CLI** | Proven agentic runtime; we embed it via SDK |
 
 Nothing existing combines: **AI agent + chat control + sandboxed containers + approval-based permissions + desktop integration**. This is novel.
@@ -331,11 +287,11 @@ Nothing existing combines: **AI agent + chat control + sandboxed containers + ap
 
 ## Tech Stack Summary
 
-- **Python 3.12+** — everything except priv broker
+- **Python 3.12+** — orchestrator + agent
 - **github-copilot-sdk** — AI agent runtime
 - **matrix-nio[e2ee]** — Matrix E2EE client
 - **podman** — rootless container sandboxing
-- **systemd** — service management (orchestrator + priv broker)
+- **systemd** — service management (orchestrator)
 - **Conduit** — lightweight Matrix homeserver (Rust)
 - **SQLite** — session persistence, permission state
 - **hyprctl / grim / wl-clipboard** — desktop integration
@@ -344,8 +300,7 @@ Nothing existing combines: **AI agent + chat control + sandboxed containers + ap
 
 ## Resolved Decisions
 
-1. **Priv broker:** Rust (safer for a root daemon, smaller attack surface)
-2. **Container networking:** Denied by default, request-based. Web search is always
+1. **Container networking:** Denied by default, request-based. Web search is always
    allowed but runs in a **separate search agent** to prevent prompt injection
    (see Search Isolation below).
 3. **Multi-user:** Designed in from the start, single-user first pass.
@@ -355,20 +310,18 @@ Nothing existing combines: **AI agent + chat control + sandboxed containers + ap
    Conversation history + workspace state saved to disk.
 6. **MCP servers:** Host-level pass-through per user + local to container.
    Usage expected to be minimal.
-7. **Priv broker approval:** Per-user. If user has sudo, they can approve
-   their own requests.
-8. **Permission requests:** Per-user. One Matrix user = one Linux user.
-9. **Container image strategy:** Hybrid — base image + optional per-project
+7. **Permission requests:** Per-user. One Matrix user = one Linux user.
+8. **Container image strategy:** Hybrid — base image + optional per-project
    layers (see Container Image Strategy below).
-10. **Approval UI:** Reaction-based (not polls). Bot seeds emoji options,
+9. **Approval UI:** Reaction-based (not polls). Bot seeds emoji options,
     user taps to choose. Polls (MSC3381) unreliable in E2EE rooms.
-11. **Room lifecycle:** Bot-managed. Bot creates Space + rooms, invites users.
+10. **Room lifecycle:** Bot-managed. Bot creates Space + rooms, invites users.
     No manual room setup required.
-12. **Command prefix:** Both `!command` and bare `command` accepted.
+11. **Command prefix:** Both `!command` and bare `command` accepted.
     Control room is commands-only.
-13. **Permission storage:** External to container. Orchestrator maintains
+12. **Permission storage:** External to container. Orchestrator maintains
     permission DB per-session. Can add/revoke at any time without container restart.
-14. **Per-user homeserver:** Bot supports different Matrix servers per user
+13. **Per-user homeserver:** Bot supports different Matrix servers per user
     via federation.
 
 ---
@@ -451,12 +404,10 @@ users:
     linux_user: ian
     allowed_rooms: ["#project-*:aeon.local", "#control:aeon.local"]
     max_sessions: 5
-    can_approve_privilege: true
   "@alice:aeon.local":
     linux_user: alice
     allowed_rooms: ["#project-alice-*:aeon.local"]
     max_sessions: 3
-    can_approve_privilege: false  # only ian can approve root ops
 ```
 
 ---

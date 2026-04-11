@@ -74,14 +74,10 @@ users:
     display_name: ""                        # Friendly name (optional)
     pronouns: ""                            # Pronouns (optional, shared with agents)
     max_sessions: 10                        # Max concurrent agent sessions
-    can_approve_privilege: true              # Can approve sudo requests
     allowed_rooms: ["*"]                    # Room restrictions ("*" = all)
 
-# ── Privilege Broker ──
-# Connects to the enclave-priv-broker daemon for controlled sudo access.
-priv_broker:
-  socket_path: "/run/enclave-priv/broker.sock"
-  timeout: 300.0                            # Approval timeout in seconds (5 min)
+# Approval timeout for mount requests and GUI launches (seconds).
+approval_timeout: 300.0
 
 # ── Memory ──
 # Cross-session memory — agents remember facts across conversations.

@@ -782,8 +782,7 @@ async def try_init_copilot(
             if not is_host:
                 return PermissionRequestResult(kind="approved")
 
-            # YOLO mode: auto-approve all SDK tools (sudo still goes through
-            # its own IPC approval flow since it's a custom tool)
+            # YOLO mode: auto-approve all SDK tools
             if is_yolo:
                 return PermissionRequestResult(kind="approved")
 
@@ -918,110 +917,6 @@ async def try_init_copilot(
 
         custom_tools = [send_file_tool]
 
-        # Custom tool: sudo — request privileged command execution
-        async def _sudo_handler(invocation: object) -> ToolResult:
-            args = getattr(invocation, "arguments", {}) or {}
-            command = args.get("command", "")
-            cmd_args = args.get("args", [])
-            reason = args.get("reason", "")
-            suggested_pattern = args.get("suggested_pattern", "")
-            if not command:
-                return ToolResult(
-                    text_result_for_llm="Error: 'command' parameter is required",
-                    result_type="error",
-                )
-            if not ipc or not ipc.is_connected:
-                return ToolResult(
-                    text_result_for_llm="Error: not connected to orchestrator",
-                    result_type="error",
-                )
-            try:
-                payload = {
-                    "command": command,
-                    "args": cmd_args,
-                    "reason": reason,
-                }
-                if suggested_pattern:
-                    payload["suggested_pattern"] = suggested_pattern
-                response = await ipc.request(
-                    Message(
-                        type=MessageType.PRIVILEGE_REQUEST,
-                        payload=payload,
-                    ),
-                    timeout=360.0,  # 6 min — user needs time to vote
-                )
-                payload = response.payload
-                if not payload.get("approved"):
-                    return ToolResult(
-                        text_result_for_llm=(
-                            f"Privilege request denied: {payload.get('error', 'unknown')}"
-                        ),
-                        result_type="error",
-                    )
-                exit_code = payload.get("exit_code", -1)
-                stdout = payload.get("stdout", "")
-                stderr = payload.get("stderr", "")
-                error = payload.get("error", "")
-                parts = []
-                if stdout:
-                    parts.append(f"stdout:\n{stdout}")
-                if stderr:
-                    parts.append(f"stderr:\n{stderr}")
-                if error:
-                    parts.append(f"error: {error}")
-                result_text = "\n".join(parts) or "(no output)"
-                return ToolResult(
-                    text_result_for_llm=(
-                        f"Command exited with code {exit_code}\n{result_text}"
-                    ),
-                )
-            except asyncio.TimeoutError:
-                return ToolResult(
-                    text_result_for_llm="Privilege request timed out (no approval received)",
-                    result_type="error",
-                )
-
-        sudo_tool = Tool(
-            name="sudo",
-            description=(
-                "Execute a command as root on the HOST system. The user approves via a poll. "
-                "Use ONLY for operations that need root: package installation (apt), "
-                "service management (systemctl), editing system config files, etc. "
-                "Do NOT use sudo to run regular programs — host binaries are mounted "
-                "read-only in your container at /host/usr/ and are in your PATH. "
-                "After `sudo apt install figlet`, just run `figlet Hello` directly. "
-                "Suggest a regex pattern for repeated command categories. "
-                "Example: sudo(command='apt-get', args=['install', '-y', 'nginx'], "
-                "reason='Install nginx', suggested_pattern='^apt-get\\s+')."
-            ),
-            handler=_sudo_handler,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The command to execute (e.g., 'apt', 'systemctl')",
-                    },
-                    "args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Command arguments (e.g., ['install', '-y', 'nginx'])",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Why this privileged command is needed (shown to user for approval)",
-                    },
-                    "suggested_pattern": {
-                        "type": "string",
-                        "description": "Optional regex pattern to suggest for blanket approval (e.g., '^apt\\s+' for all apt commands)",
-                    },
-                },
-                "required": ["command", "reason"],
-            },
-            skip_permission=True,
-        )
-        custom_tools.append(sudo_tool)
-
         # Custom tool: request_mount — request a host path be mounted into container
         async def _mount_handler(invocation: object) -> ToolResult:
             args = getattr(invocation, "arguments", {}) or {}
@@ -1083,8 +978,10 @@ async def try_init_copilot(
             name="request_mount",
             description=(
                 "Request a host directory be mounted into your container. "
-                "The user must approve via a poll. Once approved, the path appears "
-                "at /workspace/<mount-name> and is accessible immediately. "
+                "The user must approve via a poll. Once approved, the container "
+                "will RESTART to apply the mount — your session state is preserved "
+                "and you will resume automatically. The mounted path appears read-only "
+                "at /workspace/<mount-name>. "
                 "Use for: accessing project directories, data files, config dirs, etc. "
                 "Example: request_mount(source_path='/home/ian/projects/myapp', "
                 "reason='Access project source code')."

@@ -29,7 +29,6 @@ class PermissionType(str, Enum):
 
     FILESYSTEM = "filesystem"   # Access to a file/directory
     NETWORK = "network"         # Access to a network endpoint
-    PRIVILEGE = "privilege"     # Root command execution
 
 
 class RequestStatus(str, Enum):

@@ -169,7 +169,7 @@ class TestApprovalFlow:
 
         task = asyncio.create_task(approve())
         status, scope, pattern = await mgr.request_permission(
-            "s1", "Test", "p", PermissionType.PRIVILEGE, "apt install foo",
+            "s1", "Test", "p", PermissionType.FILESYSTEM, "apt install foo",
             room_id="!room:test",
         )
         await task
@@ -234,7 +234,7 @@ class TestApprovalFlow:
 
         task = asyncio.create_task(custom_flow())
         status, scope, pattern = await mgr.request_permission(
-            "s1", "Test", "p", PermissionType.PRIVILEGE, "apt install foo",
+            "s1", "Test", "p", PermissionType.FILESYSTEM, "apt install foo",
             room_id="!room:test",
         )
         await task

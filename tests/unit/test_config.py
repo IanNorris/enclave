@@ -22,7 +22,6 @@ class TestDefaultConfig:
         assert config.matrix.device_name == "Enclave Bot"
         assert config.container.network == "none"
         assert config.container.userns == "keep-id"
-        assert config.priv_broker.timeout == 300.0
 
     def test_default_container_image(self) -> None:
         config = EnclaveConfig()
@@ -49,7 +48,6 @@ class TestYamlLoading:
         assert config.users[0].matrix_id == "@alice:test.com"
         assert config.users[0].linux_user == "alice"
         assert config.users[0].max_sessions == 3
-        assert config.users[1].can_approve_privilege is False
 
     def test_load_container_config(self, config_yaml: Path) -> None:
         config = load_config(config_yaml)
@@ -118,7 +116,6 @@ class TestUserMapping:
     def test_user_defaults(self) -> None:
         user = UserMapping(matrix_id="@test:test.com", linux_user="test")
         assert user.max_sessions == 5
-        assert user.can_approve_privilege is True
         assert user.allowed_rooms == ["*"]
 
 

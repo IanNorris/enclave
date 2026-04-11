@@ -37,7 +37,6 @@ from enclave.orchestrator.permissions import (
     PermissionType,
     RequestStatus,
 )
-from enclave.orchestrator.priv_client import PrivBrokerClient
 from enclave.orchestrator.scheduler import Scheduler, ScheduleEntry, TimerEntry
 from enclave.orchestrator.display import DisplayManager
 from enclave.orchestrator.memory import MemoryStore
@@ -77,7 +76,7 @@ class MessageRouter:
         allowed_users: list[str] | None = None,
         user_mappings: list[UserMapping] | None = None,
         data_dir: str = "",
-        priv_broker_socket: str = "/run/enclave-priv/broker.sock",
+        priv_broker_socket: str = "",  # Deprecated — ignored
         approval_timeout: float = 300.0,
         idle_timeout: int = 7200,
         memory_config: Any | None = None,
@@ -154,8 +153,6 @@ class MessageRouter:
             timeout=approval_timeout,
         )
 
-        self._priv_client = PrivBrokerClient(socket_path=priv_broker_socket)
-
         # Scheduler for cron jobs and timers
         scheduler_dir = os.path.join(
             data_dir or os.path.expanduser("~/.local/share/enclave"),
@@ -166,9 +163,6 @@ class MessageRouter:
             on_schedule_fire=self._on_schedule_fire,
             on_timer_fire=self._on_timer_fire,
         )
-
-        # Track workspaces that have shared mount propagation set up
-        self._propagation_ready: set[str] = set()
 
         # Display manager for desktop interaction
         self._display = DisplayManager()
@@ -217,12 +211,6 @@ class MessageRouter:
                 "🏰 Enclave orchestrator online. Type `help` for commands.",
             )
 
-        # Connect to privilege broker (non-blocking — broker may not be running)
-        if not await self._priv_client.connect():
-            log.warning("Privilege broker not available — sudo requests will fail")
-        else:
-            log.info("Connected to privilege broker")
-
         # Start periodic health check
         self._health_task = asyncio.create_task(self._health_check_loop())
 
@@ -251,7 +239,6 @@ class MessageRouter:
                 pass
         await self._scheduler.stop()
         await self._control.stop()
-        await self._priv_client.disconnect()
         self._perm_db.close()
         log.info("Router stopped")
 
@@ -315,9 +302,6 @@ class MessageRouter:
                 # Create IPC socket
                 socket_path = await self.ipc.create_socket(session.id)
                 session.socket_path = str(socket_path)
-
-                # Set up shared propagation
-                await self._ensure_propagation(session)
 
                 # Start the container
                 started, error = await self.containers.start_session(session.id)
@@ -789,8 +773,6 @@ class MessageRouter:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
             await self._handle_permission_request(session, msg)
-        elif msg.type == MessageType.PRIVILEGE_REQUEST:
-            await self._handle_privilege_request(session, msg)
         elif msg.type == MessageType.MOUNT_REQUEST:
             await self._handle_mount_request(session, msg)
         elif msg.type == MessageType.FILE_SEND:
@@ -1610,144 +1592,14 @@ class MessageRouter:
         )
         await self.ipc.send_to(session.id, response)
 
-    async def _handle_privilege_request(
-        self, session: Session, msg: Message
-    ) -> None:
-        """Handle a privilege escalation request from an agent.
-
-        Flow: check DB → post poll in project room → wait for vote →
-        if approved, execute via priv broker → return result.
-        """
-        command = msg.payload.get("command", "")
-        args = msg.payload.get("args", [])
-        reason = msg.payload.get("reason", "")
-        suggested_pattern = msg.payload.get("suggested_pattern")
-        full_cmd = f"{command} {' '.join(args)}".strip() if args else command
-
-        log.info(
-            "Privilege request from %s: %s (%s)",
-            session.id, full_cmd, reason,
-        )
-        self._audit.log(
-            "privilege_request", session_id=session.id,
-            command=full_cmd, reason=reason,
-        )
-
-        # Fast reject if privilege broker is not available (user has no sudo)
-        if not self._priv_client.is_connected:
-            if not await self._priv_client.connect():
-                log.info("Auto-rejecting privilege request — no priv broker")
-                response = Message(
-                    type=MessageType.PRIVILEGE_RESPONSE,
-                    payload={
-                        "approved": False,
-                        "command": command,
-                        "error": (
-                            "Sudo is not available — the host user does not have "
-                            "privilege escalation configured. The privilege broker "
-                            "is not running."
-                        ),
-                    },
-                    reply_to=msg.id,
-                )
-                await self.ipc.send_to(session.id, response)
-                return
-
-        # Ask for approval via poll in the project room
-        status, scope, pattern = await self._approval.request_permission(
-            session_id=session.id,
-            session_name=session.name,
-            project_name=session.name,
-            perm_type=PermissionType.PRIVILEGE,
-            target=full_cmd,
-            reason=reason,
-            room_id=session.room_id,
-            suggested_pattern=suggested_pattern,
-        )
-
-        if status != RequestStatus.APPROVED:
-            self._audit.log(
-                "privilege_denied", session_id=session.id, command=full_cmd,
-            )
-            response = Message(
-                type=MessageType.PRIVILEGE_RESPONSE,
-                payload={
-                    "approved": False,
-                    "command": command,
-                    "error": f"Request {status.value}",
-                },
-                reply_to=msg.id,
-            )
-            await self.ipc.send_to(session.id, response)
-            return
-
-        # If scope was set, create a grant for future requests
-        if scope:
-            self._perm_db.add_grant(
-                session_id=session.id,
-                project_name=session.name,
-                perm_type=PermissionType.PRIVILEGE,
-                target=pattern or full_cmd,
-                scope=scope,
-                granted_by="approval",
-                pattern=pattern,
-            )
-            self._audit.log(
-                "privilege_granted", session_id=session.id,
-                command=full_cmd, scope=scope.value,
-            )
-
-        # Execute via privilege broker
-        if not self._priv_client.is_connected:
-            if not await self._priv_client.connect():
-                response = Message(
-                    type=MessageType.PRIVILEGE_RESPONSE,
-                    payload={
-                        "approved": True,
-                        "command": command,
-                        "error": "Privilege broker not available",
-                        "stdout": "",
-                        "stderr": "",
-                        "exit_code": -1,
-                    },
-                    reply_to=msg.id,
-                )
-                await self.ipc.send_to(session.id, response)
-                return
-
-        result = await self._priv_client.exec_command(
-            session_id=session.id,
-            command=command,
-            args=args,
-        )
-        self._audit.log(
-            "privilege_executed", session_id=session.id,
-            command=full_cmd, exit_code=result.exit_code,
-            success=result.success,
-        )
-
-        response = Message(
-            type=MessageType.PRIVILEGE_RESPONSE,
-            payload={
-                "approved": True,
-                "command": command,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "exit_code": result.exit_code,
-                "error": result.error if not result.success else "",
-            },
-            reply_to=msg.id,
-        )
-        await self.ipc.send_to(session.id, response)
-
     async def _handle_mount_request(
         self, session: Session, msg: Message
     ) -> None:
         """Handle a dynamic mount request from an agent.
 
-        Flow: post approval poll → if approved, set up propagation (if needed)
-        → bind-mount source into workspace via priv broker → agent sees it at
-        /workspace/<mount_name>.
+        Flow: post approval poll → if approved, add mount to session config
+        → restart container so podman picks up the new -v flag → agent
+        resumes from SDK checkpoint with mount available.
         """
         source_path = msg.payload.get("source_path", "")
         reason = msg.payload.get("reason", "")
@@ -1762,6 +1614,31 @@ class MessageRouter:
             source_path=source_path, reason=reason,
         )
 
+        # Validate source path exists on host and user has access
+        if not os.path.exists(source_path):
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.MOUNT_RESPONSE,
+                payload={
+                    "approved": False,
+                    "source_path": source_path,
+                    "error": f"Path does not exist on host: {source_path}",
+                },
+                reply_to=msg.id,
+            ))
+            return
+
+        if not os.access(source_path, os.R_OK):
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.MOUNT_RESPONSE,
+                payload={
+                    "approved": False,
+                    "source_path": source_path,
+                    "error": f"No read access to: {source_path}",
+                },
+                reply_to=msg.id,
+            ))
+            return
+
         # Ask for approval via poll in the project room
         status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,
@@ -1775,7 +1652,7 @@ class MessageRouter:
         )
 
         if status != RequestStatus.APPROVED:
-            response = Message(
+            await self.ipc.send_to(session.id, Message(
                 type=MessageType.MOUNT_RESPONSE,
                 payload={
                     "approved": False,
@@ -1783,8 +1660,7 @@ class MessageRouter:
                     "error": f"Request {status.value}",
                 },
                 reply_to=msg.id,
-            )
-            await self.ipc.send_to(session.id, response)
+            ))
             return
 
         # Record grant if scoped
@@ -1799,39 +1675,6 @@ class MessageRouter:
                 pattern=pattern,
             )
 
-        # Ensure priv broker is connected
-        if not self._priv_client.is_connected:
-            if not await self._priv_client.connect():
-                response = Message(
-                    type=MessageType.MOUNT_RESPONSE,
-                    payload={
-                        "approved": True,
-                        "source_path": source_path,
-                        "error": "Privilege broker not available",
-                    },
-                    reply_to=msg.id,
-                )
-                await self.ipc.send_to(session.id, response)
-                return
-
-        workspace = session.workspace_path
-
-        # Set up shared mount propagation on workspace (once per workspace)
-        if workspace not in self._propagation_ready:
-            result = await self._priv_client.make_shared(
-                session_id=session.id, path=workspace,
-            )
-            if result.success:
-                self._propagation_ready.add(workspace)
-                log.info("Shared propagation set up: %s", workspace)
-            else:
-                log.warning(
-                    "Failed to set up propagation for %s: %s",
-                    workspace, result.error,
-                )
-                # Continue anyway — mount may still work if propagation was
-                # already set up from a previous run
-
         # Create mount name from source path
         mount_name = (
             source_path.strip("/")
@@ -1839,43 +1682,49 @@ class MessageRouter:
             .replace(" ", "-")
             .replace("..", "")[:64]
         )
-        target = f"{workspace}/{mount_name}"
+        container_path = f"/workspace/{mount_name}"
 
-        # Bind-mount via priv broker (runs as root)
-        result = await self._priv_client.mount(
-            session_id=session.id,
-            source=source_path,
-            target=target,
+        # Add mount to session config (persisted across restarts)
+        mount_entry = {"source": source_path, "mount_name": mount_name}
+        if mount_entry not in session.extra_mounts:
+            session.extra_mounts.append(mount_entry)
+            self.sessions.save_sessions()
+
+        # Notify agent — the session will restart to apply the mount
+        await self.ipc.send_to(session.id, Message(
+            type=MessageType.MOUNT_RESPONSE,
+            payload={
+                "approved": True,
+                "source_path": source_path,
+                "container_path": container_path,
+                "mount_name": mount_name,
+                "restarting": True,
+            },
+            reply_to=msg.id,
+        ))
+
+        await self.matrix.send_message(
+            session.room_id,
+            f"📂 Mount approved: `{source_path}` → `{container_path}`\n"
+            f"🔄 Restarting container to apply mount...",
         )
 
-        if result.success:
-            container_path = f"/workspace/{mount_name}"
-            response = Message(
-                type=MessageType.MOUNT_RESPONSE,
-                payload={
-                    "approved": True,
-                    "source_path": source_path,
-                    "container_path": container_path,
-                    "mount_name": mount_name,
-                },
-                reply_to=msg.id,
-            )
+        # Restart the container — agent will resume from SDK checkpoint
+        log.info("Restarting session %s to apply mount: %s", session.id, source_path)
+        await self.sessions.stop_session(session.id, reason="mount_added")
+        socket_path = await self.ipc.create_socket(session.id)
+        session.socket_path = str(socket_path)
+        started, error = await self.sessions.start_session(session.id)
+        if started:
             await self.matrix.send_message(
                 session.room_id,
-                f"📂 Mounted `{source_path}` → `{container_path}`",
+                f"✅ Container restarted with `{container_path}` mounted.",
             )
         else:
-            response = Message(
-                type=MessageType.MOUNT_RESPONSE,
-                payload={
-                    "approved": True,
-                    "source_path": source_path,
-                    "error": result.error or "Mount failed",
-                },
-                reply_to=msg.id,
+            await self.matrix.send_message(
+                session.room_id,
+                f"❌ Failed to restart container: {error}",
             )
-
-        await self.ipc.send_to(session.id, response)
 
     # ------------------------------------------------------------------
     # Matrix poll/reaction → approval flow
@@ -1969,38 +1818,6 @@ class MessageRouter:
         await self._reply_control(f"✅ Revoked grant `{gid}`.")
 
     # ------------------------------------------------------------------
-    # Mount propagation
-    # ------------------------------------------------------------------
-
-    async def _ensure_propagation(self, session: Session) -> None:
-        """Set up shared mount propagation on a session's workspace.
-
-        This makes it so bind-mounts added to the workspace directory on the
-        host are visible inside the running container. Must be called before
-        container start and requires the priv broker.
-        """
-        workspace = session.workspace_path
-        if workspace in self._propagation_ready:
-            return
-
-        if not self._priv_client.is_connected:
-            if not await self._priv_client.connect():
-                log.warning("Priv broker unavailable — skipping propagation setup")
-                return
-
-        result = await self._priv_client.make_shared(
-            session_id=session.id, path=workspace,
-        )
-        if result.success:
-            self._propagation_ready.add(workspace)
-            log.info("Shared propagation set up: %s", workspace)
-        else:
-            log.warning(
-                "Failed to set up propagation for %s: %s",
-                workspace, result.error,
-            )
-
-    # ------------------------------------------------------------------
     # Session restoration
     # ------------------------------------------------------------------
 
@@ -2016,9 +1833,6 @@ class MessageRouter:
 
             socket_path = await self.ipc.create_socket(session.id)
             session.socket_path = str(socket_path)
-
-            # Set up shared propagation before starting container
-            await self._ensure_propagation(session)
 
             started, error = await self.containers.start_session(session.id)
             if started:
@@ -2312,11 +2126,6 @@ class MessageRouter:
         socket_path = await self.ipc.create_socket(session.id)
         session.socket_path = str(socket_path)
 
-        # Set up shared propagation before starting container
-        log.info("[project:%s] Setting up mount propagation...", project_name)
-        await self._ensure_propagation(session)
-        log.info("[project:%s] Mount propagation done", project_name)
-
         log.info("[project:%s] Starting container...", project_name)
         started, error = await self.containers.start_session(session.id)
         log.info("[project:%s] Container start result: %s", project_name, started)
@@ -2516,12 +2325,12 @@ class MessageRouter:
                 )
                 log.info("Added LD_LIBRARY_PATH for GUI: %s", extra_env["LD_LIBRARY_PATH"])
 
-        # Require approval like sudo
+        # Require approval for GUI launches
         status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,
             session_name=session.name,
             project_name=session.name,
-            perm_type=PermissionType.PRIVILEGE,
+            perm_type=PermissionType.FILESYSTEM,
             target=f"GUI: {command}",
             reason=reason or f"Launch GUI application: {command}",
             room_id=session.room_id,

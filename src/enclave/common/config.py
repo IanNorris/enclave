@@ -117,16 +117,7 @@ class UserMapping:
     display_name: str = ""
     pronouns: str = ""
     max_sessions: int = 5
-    can_approve_privilege: bool = True
     allowed_rooms: list[str] = field(default_factory=lambda: ["*"])
-
-
-@dataclass
-class PrivBrokerConfig:
-    """Privilege broker connection settings."""
-
-    socket_path: str = "/run/enclave-priv/broker.sock"
-    timeout: float = 300.0  # 5 minute approval timeout
 
 
 @dataclass
@@ -144,8 +135,8 @@ class EnclaveConfig:
 
     matrix: MatrixConfig = field(default_factory=MatrixConfig)
     container: ContainerConfig = field(default_factory=ContainerConfig)
-    priv_broker: PrivBrokerConfig = field(default_factory=PrivBrokerConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    approval_timeout: float = 300.0  # 5 minute approval timeout
     users: list[UserMapping] = field(default_factory=list)
     log_level: str = "INFO"
     data_dir: str = str(Path.home() / ".local" / "share" / "enclave")
@@ -192,7 +183,6 @@ def _parse_user_mapping(data: dict[str, Any]) -> UserMapping:
         display_name=data.get("display_name", ""),
         pronouns=data.get("pronouns", ""),
         max_sessions=data.get("max_sessions", 5),
-        can_approve_privilege=data.get("can_approve_privilege", True),
         allowed_rooms=data.get("allowed_rooms", ["*"]),
     )
 
@@ -269,13 +259,6 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 **({"profiles": profiles} if profiles else {}),
             )
 
-        if "priv_broker" in data:
-            p = data["priv_broker"]
-            config.priv_broker = PrivBrokerConfig(
-                socket_path=p.get("socket_path", config.priv_broker.socket_path),
-                timeout=p.get("timeout", config.priv_broker.timeout),
-            )
-
         if "users" in data:
             config.users = [_parse_user_mapping(u) for u in data["users"]]
 
@@ -290,6 +273,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
         config.log_level = data.get("log_level", config.log_level)
         config.data_dir = data.get("data_dir", config.data_dir)
         config.idle_timeout = data.get("idle_timeout", config.idle_timeout)
+        config.approval_timeout = data.get("approval_timeout", config.approval_timeout)
 
     _apply_env_overrides(config)
     return config

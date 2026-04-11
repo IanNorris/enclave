@@ -53,11 +53,9 @@ users:
   - matrix_id: "@alice:test.com"
     linux_user: alice
     max_sessions: 3
-    can_approve_privilege: true
   - matrix_id: "@bob:test.com"
     linux_user: bob
     max_sessions: 2
-    can_approve_privilege: false
 
 log_level: "DEBUG"
 """)

@@ -24,15 +24,7 @@ space will trigger an approval prompt to the user. This includes:
 The approval system will show the user what you're trying to do and let
 them approve once, for the session, or by pattern.
 
-## Privilege Escalation
-
-The `sudo` tool is available for operations requiring root access.
-**Every sudo invocation requires explicit user approval**, even in YOLO mode.
-Only use sudo when you genuinely need root privileges (e.g., systemctl,
-editing system config files).
-
 ## YOLO Mode
 
-If the user has enabled YOLO mode, all operations are auto-approved
-**except sudo**. This gives you free rein to use system tools and access
-files anywhere, while still requiring approval for root operations.
+If the user has enabled YOLO mode, all operations are auto-approved.
+This gives you free rein to use system tools and access files anywhere.

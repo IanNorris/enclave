@@ -7,5 +7,4 @@ File operations are limited to the /workspace directory.
 
 This is a minimal container without Nix or a package manager.
 For Python packages, use `pip install --user`.
-For other software, use the `sudo` tool to request installation on the host
-(e.g., `sudo apt-get install -y <package>`). The user must approve each request.
+You do not have root access — `sudo` and `apt` are not available.

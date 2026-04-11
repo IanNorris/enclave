@@ -4,7 +4,6 @@
 # Usage:
 #   ./install.sh           # Install everything
 #   ./install.sh orchestrator  # Install orchestrator only
-#   ./install.sh broker    # Install priv broker only
 #   ./install.sh image     # Build container image only
 
 set -euo pipefail
@@ -107,81 +106,6 @@ WRAPPER
     info "Orchestrator installed and started"
 }
 
-# ── Privilege Broker (system-level install, requires root) ─────
-
-install_broker() {
-    info "Installing Enclave privilege broker..."
-
-    # On NixOS, system services must be declared via the NixOS module
-    if [ -f /etc/NIXOS ]; then
-        warn "NixOS detected — use the NixOS module for the privilege broker."
-        warn "Add to your NixOS configuration:"
-        warn ""
-        warn "  services.enclave.enable = true;"
-        warn "  services.enclave.broker.allowedUser = \"$USER\";"
-        warn ""
-        warn "Then run: sudo nixos-rebuild switch"
-        return 0
-    fi
-
-    # Build as current user (needs cargo/rustup), then install as root.
-    # This avoids requiring rustup to be configured for the root user.
-    if ! command -v cargo &>/dev/null; then
-        error "cargo not found — install Rust toolchain first"
-        return 1
-    fi
-
-    # Verify cargo is actually usable (rustup may be present without a toolchain)
-    if ! cargo --version &>/dev/null; then
-        error "cargo is installed but no Rust toolchain is configured."
-        error "Run: rustup default stable"
-        return 1
-    fi
-
-    info "Building priv-broker with cargo..."
-    (cd "$SCRIPT_DIR/priv-broker" && cargo build --release)
-
-    local binary="$SCRIPT_DIR/priv-broker/target/release/enclave-priv-broker"
-    if [ ! -f "$binary" ]; then
-        error "Build succeeded but binary not found at $binary"
-        return 1
-    fi
-
-    # Elevate to root only for installation
-    local SUDO=""
-    if [ "$EUID" -ne 0 ]; then
-        if ! command -v sudo &>/dev/null; then
-            error "Installation requires root. Run the install step with sudo."
-            return 1
-        fi
-        SUDO="sudo"
-    fi
-
-    local install_dir="/usr/local/bin"
-    [ -d "$install_dir" ] || install_dir="/usr/bin"
-    $SUDO cp "$binary" "$install_dir/enclave-priv-broker"
-    $SUDO chmod 755 "$install_dir/enclave-priv-broker"
-    info "Binary installed to $install_dir/enclave-priv-broker"
-
-    # Install config
-    $SUDO mkdir -p /etc/enclave
-    if [ ! -f /etc/enclave/priv-broker.toml ]; then
-        $SUDO cp "$SCRIPT_DIR/priv-broker/config/priv-broker.toml" /etc/enclave/
-        warn "Config created at /etc/enclave/priv-broker.toml — edit before starting!"
-    fi
-
-    # Install systemd service (patch binary path to match install location)
-    local service_tmp
-    service_tmp="$(mktemp)"
-    sed "s|ExecStart=/usr/local/bin/enclave-priv-broker|ExecStart=$install_dir/enclave-priv-broker|" \
-        "$SCRIPT_DIR/priv-broker/config/enclave-priv-broker.service" > "$service_tmp"
-    $SUDO cp "$service_tmp" /etc/systemd/system/enclave-priv-broker.service
-    rm -f "$service_tmp"
-    $SUDO systemctl daemon-reload
-    $SUDO systemctl enable --now enclave-priv-broker
-    info "Privilege broker installed and started"
-}
-
 # ── Container Image ────────────────────────────────────────────
 
 build_image() {
@@ -198,20 +122,17 @@ build_image() {
 
 case "${1:-all}" in
     orchestrator) install_orchestrator ;;
-    broker)       install_broker ;;
     image)        build_image ;;
     all)
         install_orchestrator
         build_image
-        install_broker 2>/dev/null || warn "Skipped broker (needs root). Run: sudo $0 broker"
         echo
         info "Installation complete!"
         info "  1. Edit ~/.config/enclave/enclave.yaml"
         info "  2. systemctl --user enable --now enclave"
-        info "  3. sudo systemctl enable --now enclave-priv-broker"
         ;;
     *)
-        echo "Usage: $0 [orchestrator|broker|image|all]"
+        echo "Usage: $0 [orchestrator|image|all]"
         exit 1
         ;;
 esac

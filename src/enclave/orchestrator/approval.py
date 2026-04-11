@@ -143,7 +143,6 @@ class ApprovalManager:
         type_icon = {
             PermissionType.FILESYSTEM: "📂",
             PermissionType.NETWORK: "🌐",
-            PermissionType.PRIVILEGE: "🔐",
         }.get(perm_type, "❓")
 
         question = (

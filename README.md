@@ -22,14 +22,12 @@ Matrix Homeserver (Conduit)
 Orchestrator (host, unprivileged)
     │ Unix sockets
     ├── Agent Pod #1 (podman, sandboxed)
-    ├── Agent Pod #2 (podman, sandboxed)
-    └── Priv Broker (root, systemd)
+    └── Agent Pod #2 (podman, sandboxed)
 ```
 
-**Three trust zones:**
+**Two trust zones:**
 - **Orchestrator** — manages Matrix, spawns containers, controls file access
 - **Agent containers** — Copilot SDK + custom tools, sandboxed, no host access
-- **Privilege broker** — Rust daemon, approval-based root operations via Matrix
 
 See [docs/design.md](docs/design.md) for the full design document.
 
@@ -42,7 +40,6 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 
 - **Sandboxed agents** — each runs in a podman container with explicit permissions
 - **Profile system** — dev (Nix), light (minimal), host (direct) profiles
-- **Privilege escalation** — sudo via Matrix approval polls, with pattern-based grants
 - **Dynamic mounts** — request host directories at runtime, approved via chat
 - **Scheduling** — cron-like recurring callbacks and one-shot timers
 - **Session persistence** — conversation history survives container restarts
@@ -72,7 +69,6 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 - **github-copilot-sdk** — AI agent runtime
 - **matrix-nio[e2ee]** — Matrix E2EE client
 - **podman** — rootless container sandboxing
-- **Rust** — privilege broker
 - **Conduit** — Matrix homeserver
 - **systemd** — service management
 - **Nix** — reproducible builds and dev environment
@@ -81,11 +77,6 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 
 - **Python 3.12+**
 - **Podman** (or Docker)
-- **Rust toolchain** (for the privilege broker):
-  ```bash
-  # If using rustup, ensure a toolchain is installed:
-  rustup default stable
-  ```
 - **Nix** (optional but recommended — `nix develop` provides everything above)
 
 ## Installation
@@ -103,38 +94,26 @@ nano ~/.config/enclave/enclave.yaml
 
 # Build container image
 ./install.sh image
-
-# Install privilege broker — builds, installs, and enables the system service
-./install.sh broker
 ```
 
 ### NixOS
 
-On NixOS, the privilege broker is managed as a NixOS module. Add the flake
-input and enable the service in your `configuration.nix`:
+On NixOS, install the orchestrator as a user service:
+
+```bash
+./install.sh orchestrator
+```
+
+Optionally, add the flake to your system configuration for development tooling:
 
 ```nix
 # flake.nix
 {
   inputs.enclave.url = "github:icstatic/enclave";
-
-  outputs = { nixpkgs, enclave, ... }: {
-    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-      modules = [
-        enclave.nixosModules.default
-        {
-          services.enclave.enable = true;
-          services.enclave.broker.allowedUser = "ian";
-        }
-      ];
-    };
-  };
 }
 ```
 
-Then rebuild: `sudo nixos-rebuild switch`
-
-The orchestrator is still installed as a user service via `./install.sh orchestrator`.
+The orchestrator is installed as a user service via `./install.sh orchestrator`.
 
 ## Development (Nix)
 

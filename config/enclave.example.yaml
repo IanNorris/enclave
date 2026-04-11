@@ -19,7 +19,6 @@ users:
     pronouns: "he/him"
     allowed_rooms: ["#project-*:example.com", "#enclave-control:example.com"]
     max_sessions: 10
-    can_approve_privilege: true
 
 containers:
   runtime: podman
@@ -29,18 +28,6 @@ containers:
   # Where session workspaces live on the host
   workspace_root: "/home/aeon/workspaces"
   session_root: "/home/aeon/sessions"
-
-privilege_broker:
-  socket: "/run/aeon-priv/broker.sock"
-  approval_timeout_seconds: 300
-  # Commands that are always denied
-  denylist:
-    - "rm -rf /"
-    - "dd if=/dev/zero"
-  # Commands that skip approval (auto-approved)
-  allowlist:
-    - "pacman -Qi *"
-    - "systemctl status *"
 
 display:
   compositor: hyprland

@@ -77,8 +77,8 @@ class ContainerManager:
             "--name", session.id,
             "--userns", self.config.userns,
             "--network", network,
-            # Workspace with rslave propagation so host-side mounts appear in container
-            "-v", f"{session.workspace_path}:/workspace:rslave",
+            # Workspace mount
+            "-v", f"{session.workspace_path}:/workspace",
             "-v", f"{socket_dir}:/socket:Z",
             "-e", f"IPC_SOCKET=/socket/{Path(session.socket_path).name}",
             "-e", f"SESSION_ID={session.id}",
@@ -90,6 +90,14 @@ class ContainerManager:
             nix_store = Path(self.config.nix_store)
             nix_store.mkdir(parents=True, exist_ok=True)
             cmd.extend(["-v", f"{nix_store}:/nix"])
+
+        # Extra mounts requested by the agent (approved by user)
+        for mount in getattr(session, "extra_mounts", []):
+            source = mount.get("source", "")
+            mount_name = mount.get("mount_name", "")
+            if source and mount_name and Path(source).exists():
+                cmd.extend(["-v", f"{source}:/workspace/{mount_name}:ro"])
+                log.info("[start:%s] Extra mount: %s → /workspace/%s", session.id, source, mount_name)
 
         # Bind-mount host paths read-only at /host/<path> (only for profiles that use host mounts)
         if profile.host_mounts:
