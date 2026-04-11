@@ -60,6 +60,9 @@ class MessageType(str, Enum):
     # Token/cost tracking
     USAGE_REPORT = "usage_report"
 
+    # Environment management
+    NIX_SHELL_REQUEST = "nix_shell_request"
+
 
 @dataclass
 class Message:

@@ -75,10 +75,26 @@ RUN pip install --no-cache-dir /build && rm -rf /build
 WORKDIR /workspace
 
 # Entrypoint: install Nix on first run (if profile uses it), then start agent
+# If ENCLAVE_NIX_SHELL is set, wrap execution in nix-shell for that environment.
+# On nix-shell failure, falls back to running without it and sets error env vars.
 RUN printf '#!/bin/bash\n\
 if [ "${ENCLAVE_NIX_STORE:-0}" = "1" ]; then\n\
   source /usr/local/bin/nix-env-setup.sh\n\
 fi\n\
+\n\
+if [ -n "${ENCLAVE_NIX_SHELL:-}" ]; then\n\
+  NIX_SHELL_LOG="/workspace/.nix-shell.log"\n\
+  echo "[entrypoint] Testing nix-shell: $ENCLAVE_NIX_SHELL" > "$NIX_SHELL_LOG" 2>&1\n\
+  if nix-shell "$ENCLAVE_NIX_SHELL" --run "echo nix-shell-ok" >> "$NIX_SHELL_LOG" 2>&1; then\n\
+    echo "[entrypoint] nix-shell OK, launching agent under nix-shell" >> "$NIX_SHELL_LOG"\n\
+    exec nix-shell "$ENCLAVE_NIX_SHELL" --command "python3 -m enclave.agent.main $*"\n\
+  else\n\
+    echo "[entrypoint] nix-shell FAILED (exit $?), falling back to plain exec" >> "$NIX_SHELL_LOG"\n\
+    export ENCLAVE_NIX_SHELL_FAILED=1\n\
+    export ENCLAVE_NIX_SHELL_LOG="$NIX_SHELL_LOG"\n\
+  fi\n\
+fi\n\
+\n\
 exec python3 -m enclave.agent.main "$@"\n\
 ' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 

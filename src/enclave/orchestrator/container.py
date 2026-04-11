@@ -187,6 +187,11 @@ class ContainerManager:
         if session.user_pronouns:
             cmd.extend(["-e", f"ENCLAVE_USER_PRONOUNS={session.user_pronouns}"])
 
+        # Nix-shell wrapping: agent requested a specific nix environment
+        if session.nix_shell_path:
+            # Path is stored as the container-relative path (e.g. /workspace/shell.nix)
+            cmd.extend(["-e", f"ENCLAVE_NIX_SHELL={session.nix_shell_path}"])
+
         cmd.append(image)
 
         log.debug("Container cmd: %s", " ".join(cmd[:8]) + " ...")

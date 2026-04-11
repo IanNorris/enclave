@@ -710,6 +710,15 @@ class MessageRouter:
             self._thread_events[f"{session.id}:event_id"] = event_id
             self._thread_events[f"{session.id}:room_id"] = room_id
 
+        # Pre-download attachments so they're available on disk immediately.
+        # The agent can read them at any point during the session without
+        # needing a blocking IPC round-trip back to the orchestrator.
+        resolved_attachments = attachments or []
+        if resolved_attachments and session.workspace_path:
+            resolved_attachments = await self._predownload_attachments(
+                session, resolved_attachments
+            )
+
         msg = Message(
             type=MessageType.USER_MESSAGE,
             payload={
@@ -717,7 +726,7 @@ class MessageRouter:
                 "sender": sender,
                 "room_id": room_id,
                 "thread_id": thread_id,
-                "attachments": attachments or [],
+                "attachments": resolved_attachments,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -820,6 +829,8 @@ class MessageRouter:
                 total_tokens=msg.payload.get("total_tokens", 0),
                 model=msg.payload.get("model", ""),
             )
+        elif msg.type == MessageType.NIX_SHELL_REQUEST:
+            await self._handle_nix_shell_request(session, msg)
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -1240,6 +1251,12 @@ class MessageRouter:
                     "Sending queued message to %s: %s",
                     session.id, queued["body"][:60],
                 )
+                # Pre-download any attachments before sending
+                raw_atts = queued.get("attachments") or []
+                if raw_atts and session.workspace_path:
+                    raw_atts = await self._predownload_attachments(
+                        session, raw_atts
+                    )
                 # Send directly via IPC — do NOT re-enter
                 # _handle_project_message which could trigger another restore
                 flush_msg = Message(
@@ -1249,7 +1266,7 @@ class MessageRouter:
                         "sender": queued["sender"],
                         "room_id": queued["room_id"],
                         "thread_id": queued.get("thread_id"),
-                        "attachments": queued.get("attachments") or [],
+                        "attachments": raw_atts,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
                 )
@@ -1283,6 +1300,43 @@ class MessageRouter:
             await self._update_activity(
                 session, f"🗜️ Compacted: {detail}", thread_id,
             )
+
+        elif status == "nix_shell_active":
+            nix_path = msg.payload.get("path", "?")
+            log.info("Agent %s: running under nix-shell %s", session.id, nix_path)
+            await self.matrix.send_message(
+                session.room_id,
+                f"✅ Nix environment active: `{nix_path}`",
+            )
+
+        elif status == "nix_shell_failed":
+            nix_path = msg.payload.get("path", "?")
+            log_path = msg.payload.get("log", "")
+            log_content = msg.payload.get("log_content", "")
+            log.warning(
+                "Agent %s: nix-shell failed for %s", session.id, nix_path,
+            )
+            fail_msg = f"⚠️ Nix-shell failed for `{nix_path}` — running without it."
+            if log_path:
+                fail_msg += f"\nLog: `{log_path}`"
+            if log_content:
+                # Truncate to avoid huge messages
+                preview = log_content.strip()[-500:]
+                fail_msg += f"\n```\n{preview}\n```"
+            await self.matrix.send_message(session.room_id, fail_msg)
+            # Also inform the SDK session so the agent LLM knows
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.USER_MESSAGE,
+                payload={
+                    "content": (
+                        f"[System] The nix-shell switch to `{nix_path}` failed. "
+                        f"You are running without the nix environment. "
+                        f"Check `{log_path}` for details. "
+                        "You can fix the nix expression and try `enter_nix_shell` again."
+                    ),
+                    "sender": "system",
+                },
+            ))
 
     async def _handle_file_send(
         self, session: Session, msg: Message
@@ -1325,6 +1379,63 @@ class MessageRouter:
             reply_to=msg.id,
         )
 
+    async def _predownload_attachments(
+        self, session: Session, attachments: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Pre-download attachments to the session workspace.
+
+        Downloads each attachment eagerly so the agent can access them
+        directly from disk without a blocking IPC round-trip.  Returns
+        a new attachment list with ``local_path`` set (container-relative)
+        for each successfully downloaded file.
+        """
+        attach_dir = Path(session.workspace_path) / ".attachments"
+        attach_dir.mkdir(parents=True, exist_ok=True)
+
+        resolved: list[dict[str, Any]] = []
+        for att in attachments:
+            url = att.get("url", "")
+            filename = att.get("filename", "attachment")
+            encryption = att.get("encryption")
+
+            if not url or not url.startswith("mxc://"):
+                resolved.append(att)
+                continue
+
+            # Use a unique name so concurrent/sequential uploads don't collide
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            stem = Path(filename).stem
+            suffix = Path(filename).suffix or ".bin"
+            unique_name = f"{stem}-{ts}{suffix}"
+            host_path = attach_dir / unique_name
+
+            try:
+                success = await self.matrix.download_media(
+                    url, str(host_path), encryption=encryption,
+                )
+            except Exception as e:
+                log.error("Pre-download failed for %s: %s", filename, e)
+                resolved.append(att)
+                continue
+
+            if success:
+                # Container sees /workspace/.attachments/<unique_name>
+                container_path = f"/workspace/.attachments/{unique_name}"
+                resolved.append({
+                    **att,
+                    "local_path": container_path,
+                    "host_path": str(host_path),
+                })
+                log.info(
+                    "Pre-downloaded %s → %s (%s)",
+                    filename, host_path, att.get("content_type", ""),
+                )
+            else:
+                log.warning("Pre-download failed for %s (mxc download returned false)", filename)
+                resolved.append(att)
+
+        return resolved
+
     async def _handle_download_request(
         self, session: Session, msg: Message
     ) -> Message | None:
@@ -1362,6 +1473,75 @@ class MessageRouter:
                 type=MessageType.AGENT_RESPONSE,
                 payload={"error": "Only mxc:// URLs supported for download"},
                 reply_to=msg.id,
+            )
+
+    async def _handle_nix_shell_request(
+        self, session: Session, msg: Message,
+    ) -> None:
+        """Handle an agent's request to restart under a nix-shell environment.
+
+        The agent sends a container-relative path (e.g. /workspace/shell.nix).
+        We verify the file exists on the host, store the config, then restart
+        the session.  The entrypoint will wrap execution in ``nix-shell``.
+        """
+        container_path = msg.payload.get("path", "")
+        if not container_path:
+            log.warning("nix_shell_request from %s: missing path", session.id)
+            return
+
+        # Map container path → host path for validation
+        host_path = container_path
+        if container_path.startswith("/workspace/") and session.workspace_path:
+            host_path = os.path.join(
+                session.workspace_path,
+                container_path[len("/workspace/"):],
+            )
+
+        if not os.path.isfile(host_path):
+            log.warning(
+                "nix_shell_request from %s: file not found: %s (host: %s)",
+                session.id, container_path, host_path,
+            )
+            # Inform the agent via Matrix (agent is about to die anyway on restart,
+            # but if the file doesn't exist we skip the restart entirely)
+            await self.matrix.send_message(
+                session.room_id,
+                f"⚠️ Nix shell file not found: `{container_path}`",
+            )
+            return
+
+        log.info(
+            "nix_shell_request from %s: %s → restarting under nix-shell",
+            session.id, container_path,
+        )
+
+        # Persist the nix shell path (container-relative, used by entrypoint)
+        session.nix_shell_path = container_path
+        self.sessions.save_sessions()
+
+        # Notify via Matrix so the user sees what's happening
+        await self.matrix.send_message(
+            session.room_id,
+            f"🔄 Restarting under `nix-shell {container_path}` …",
+        )
+
+        # Stop → start cycle (SDK resumes from checkpoint)
+        await self.sessions.stop_session(session.id, reason="nix_shell_switch")
+
+        # Create new IPC socket for the restarted container
+        if self.ipc:
+            socket_path = await self.ipc.create_socket(session.id)
+            session.socket_path = str(socket_path)
+
+        ok, error = await self.sessions.start_session(session.id)
+        if not ok:
+            log.error(
+                "Failed to restart %s under nix-shell: %s",
+                session.id, error,
+            )
+            await self.matrix.send_message(
+                session.room_id,
+                f"❌ Restart failed: {error}",
             )
 
     async def _handle_permission_request(

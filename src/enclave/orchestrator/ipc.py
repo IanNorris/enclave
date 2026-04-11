@@ -33,15 +33,17 @@ class IPCConnection:
         self.reader = reader
         self.writer = writer
         self._closed = False
+        self._write_lock = asyncio.Lock()
 
     async def send(self, msg: Message) -> None:
-        """Send a message to the agent."""
+        """Send a message to the agent (serialised via write lock)."""
         if self._closed:
             log.warning("Attempted send on closed connection: %s", self.session_id)
             return
-        data = msg.to_json() + "\n"
-        self.writer.write(data.encode())
-        await self.writer.drain()
+        async with self._write_lock:
+            data = msg.to_json() + "\n"
+            self.writer.write(data.encode())
+            await self.writer.drain()
 
     async def recv(self, timeout: float | None = 30.0) -> Message | None:
         """Receive a message from the agent."""
@@ -201,18 +203,13 @@ class IPCServer:
                 log.debug("Received from %s: %s", session_id, msg.type.value)
 
                 if self._handler:
-                    try:
-                        response = await self._handler(session_id, msg)
-                        if response is not None:
-                            await conn.send(response)
-                    except Exception as e:
-                        log.error("Handler error for %s: %s", session_id, e)
-                        error_msg = Message(
-                            type=MessageType.SHUTDOWN,
-                            payload={"error": str(e)},
-                            reply_to=msg.id,
-                        )
-                        await conn.send(error_msg)
+                    # Dispatch as a task so the read loop isn't blocked by
+                    # slow handlers (e.g. Matrix API calls for tool events).
+                    # This prevents request-type messages (like download_request)
+                    # from timing out behind a queue of fire-and-forget events.
+                    asyncio.create_task(
+                        self._dispatch(conn, session_id, msg)
+                    )
         except Exception as e:
             log.error("Connection error for %s: %s", session_id, e)
         finally:
@@ -225,3 +222,20 @@ class IPCServer:
                     await cb(session_id)
                 except Exception as e:
                     log.error("Disconnect callback error: %s", e)
+
+    async def _dispatch(
+        self, conn: IPCConnection, session_id: str, msg: Message
+    ) -> None:
+        """Run a handler and send back any response."""
+        try:
+            response = await self._handler(session_id, msg)  # type: ignore[misc]
+            if response is not None:
+                await conn.send(response)
+        except Exception as e:
+            log.error("Handler error for %s: %s", session_id, e)
+            error_msg = Message(
+                type=MessageType.SHUTDOWN,
+                payload={"error": str(e)},
+                reply_to=msg.id,
+            )
+            await conn.send(error_msg)

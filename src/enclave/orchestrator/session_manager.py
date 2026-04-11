@@ -53,6 +53,7 @@ class Session:
     user_display_name: str = ""
     user_pronouns: str = ""
     host_pid: int | None = None  # PID for host-mode subprocess agents
+    nix_shell_path: str = ""  # path to shell.nix/flake.nix for nix-shell wrapping
 
 
 def _slugify(name: str) -> str:
@@ -131,6 +132,7 @@ class SessionManager:
                     image=s.get("image", ""),
                     user_display_name=s.get("user_display_name", ""),
                     user_pronouns=s.get("user_pronouns", ""),
+                    nix_shell_path=s.get("nix_shell_path", ""),
                 )
                 self._sessions[session.id] = session
             log.info("Loaded %d persisted sessions", len(self._sessions))
@@ -155,6 +157,7 @@ class SessionManager:
                 "user_pronouns": s.user_pronouns,
                 "host_pid": s.host_pid,
                 "container_id": s.container_id,
+                "nix_shell_path": s.nix_shell_path,
             })
         try:
             self._sessions_file.write_text(json.dumps(data, indent=2))

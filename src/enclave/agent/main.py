@@ -316,10 +316,14 @@ async def _download_attachments(
     state: AgentState,
     attachments: list[dict],
 ) -> list[dict]:
-    """Download Matrix media attachments and convert to SDK attachment format.
+    """Resolve media attachments into SDK attachment format.
+
+    If the orchestrator pre-downloaded the file (``local_path`` present),
+    reads directly from disk — no IPC round-trip needed.  Falls back to
+    an IPC download request for backwards compatibility.
 
     For images, returns BlobAttachment (base64 inline data).
-    For other files, downloads to /workspace/.attachments/ and returns FileAttachment.
+    For other files, returns FileAttachment with a path reference.
     """
     import base64
 
@@ -331,24 +335,47 @@ async def _download_attachments(
         filename = att.get("filename", "attachment")
         content_type = att.get("content_type", "")
         encryption = att.get("encryption")
+        local_path = att.get("local_path")
 
-        if not url:
+        if not url and not local_path:
             continue
 
-        # Download via orchestrator (handles mxc:// + E2EE decryption)
-        dest = attach_dir / filename
-        resp = await state.ipc.request(Message(
-            type=MessageType.DOWNLOAD_REQUEST,
-            payload={
-                "url": url,
-                "dest": str(dest),
-                "encryption": encryption,
-            },
-        ), timeout=30.0)
+        # Fast path: orchestrator already downloaded the file
+        if local_path:
+            dest = Path(local_path)
+            if dest.exists():
+                print(f"[agent] Using pre-downloaded attachment: {dest}", file=sys.stderr)
+            else:
+                print(f"[agent] Pre-downloaded path missing, falling back to IPC: {dest}", file=sys.stderr)
+                local_path = None  # fall through to IPC download
 
-        if not resp.payload.get("downloaded"):
-            print(f"[agent] Failed to download attachment: {filename}", file=sys.stderr)
-            continue
+        # Slow path: IPC download request (with retries)
+        if not local_path:
+            dest = attach_dir / filename
+            downloaded = False
+            for attempt in range(3):
+                try:
+                    resp = await state.ipc.request(Message(
+                        type=MessageType.DOWNLOAD_REQUEST,
+                        payload={
+                            "url": url,
+                            "dest": str(dest),
+                            "encryption": encryption,
+                        },
+                    ), timeout=30.0)
+                    if resp.payload.get("downloaded"):
+                        downloaded = True
+                        break
+                    else:
+                        print(f"[agent] Download attempt {attempt + 1}/3 failed for {filename}", file=sys.stderr)
+                except asyncio.TimeoutError:
+                    print(f"[agent] Download attempt {attempt + 1}/3 timed out for {filename}", file=sys.stderr)
+                if attempt < 2:
+                    await asyncio.sleep(2)
+
+            if not downloaded:
+                print(f"[agent] Failed to download attachment: {filename}", file=sys.stderr)
+                continue
 
         # Read the downloaded file
         try:
@@ -2242,6 +2269,62 @@ async def try_init_copilot(
         )
         custom_tools.append(system_status_tool)
 
+        # Custom tool: enter_nix_shell — restart under a nix-shell environment
+        async def _enter_nix_shell_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            nix_path = args.get("path", "")
+            if not nix_path:
+                return ToolResult(
+                    text_result_for_llm="Error: 'path' parameter is required (e.g. /workspace/shell.nix)",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+            # Check if already running under this nix-shell
+            current = os.environ.get("ENCLAVE_NIX_SHELL", "")
+            if current == nix_path and not os.environ.get("ENCLAVE_NIX_SHELL_FAILED"):
+                return ToolResult(
+                    text_result_for_llm=f"Already running under nix-shell {nix_path}",
+                )
+            await ipc.send(Message(
+                type=MessageType.NIX_SHELL_REQUEST,
+                payload={"path": nix_path},
+            ))
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Nix-shell switch to {nix_path} requested. "
+                    "The session will restart momentarily and resume from checkpoint. "
+                    "All subsequent commands will run in the nix-shell environment."
+                ),
+            )
+
+        nix_shell_tool = Tool(
+            name="enter_nix_shell",
+            description=(
+                "Restart the session under a nix-shell environment. "
+                "This makes all nix packages from the specified shell.nix or "
+                "default.nix available for subsequent commands without needing "
+                "to prefix them with 'nix-shell --run'. The session restarts "
+                "but conversation history is preserved via checkpoints. "
+                "Use this when you need to repeatedly use tools from a nix expression."
+            ),
+            handler=_enter_nix_shell_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the nix file (e.g. /workspace/shell.nix, /workspace/default.nix)",
+                    },
+                },
+                "required": ["path"],
+            },
+        )
+        custom_tools.append(nix_shell_tool)
+
         # ── Load plugin tools ──
         try:
             from enclave.agent.plugins import discover_plugins
@@ -2359,6 +2442,39 @@ async def main() -> None:
             "copilot_available": state.sdk_session is not None,
         },
     ))
+
+    # Report nix-shell status if one was requested
+    nix_shell_requested = os.environ.get("ENCLAVE_NIX_SHELL", "")
+    nix_shell_failed = os.environ.get("ENCLAVE_NIX_SHELL_FAILED", "")
+    nix_shell_log = os.environ.get("ENCLAVE_NIX_SHELL_LOG", "")
+    if nix_shell_requested:
+        if nix_shell_failed:
+            print(f"[agent] nix-shell FAILED for {nix_shell_requested}", file=sys.stderr)
+            # Read the log so the SDK has context about what went wrong
+            log_content = ""
+            if nix_shell_log:
+                try:
+                    log_content = Path(nix_shell_log).read_text()[-2000:]
+                except Exception:
+                    log_content = "(could not read log)"
+            await ipc.send(Message(
+                type=MessageType.STATUS_UPDATE,
+                payload={
+                    "status": "nix_shell_failed",
+                    "path": nix_shell_requested,
+                    "log": nix_shell_log,
+                    "log_content": log_content,
+                },
+            ))
+        else:
+            print(f"[agent] Running under nix-shell: {nix_shell_requested}", file=sys.stderr)
+            await ipc.send(Message(
+                type=MessageType.STATUS_UPDATE,
+                payload={
+                    "status": "nix_shell_active",
+                    "path": nix_shell_requested,
+                },
+            ))
 
     # Register message handlers
     async def on_user_message(msg: Message) -> Message | None:
