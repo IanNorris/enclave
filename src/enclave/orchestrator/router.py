@@ -1303,8 +1303,8 @@ class MessageRouter:
             )
 
         elif status == "compaction_complete":
-            msgs = msg.payload.get("messages_removed", "?")
-            tokens = msg.payload.get("tokens_removed", "?")
+            msgs = msg.payload.get("messages_removed")
+            tokens = msg.payload.get("tokens_removed")
             pre = msg.payload.get("pre_compaction_tokens")
             post = msg.payload.get("post_compaction_tokens")
             log.info(
@@ -1312,10 +1312,16 @@ class MessageRouter:
                 session.id, msgs, tokens, pre, post,
             )
             thread_id = self._thread_events.get(session.id)
-            if pre and post:
-                detail = f"{int(pre):,} → {int(post):,} tokens ({msgs} messages removed)"
-            else:
+            if pre is not None and post is not None:
+                detail = f"{int(pre):,} → {int(post):,} tokens"
+                if msgs is not None:
+                    detail += f" ({msgs} messages removed)"
+            elif pre is not None:
+                detail = f"from {int(pre):,} tokens"
+            elif msgs is not None and tokens is not None:
                 detail = f"{msgs} messages, {tokens} tokens freed"
+            else:
+                detail = "context compacted"
             await self._update_activity(
                 session, f"🗜️ Compacted: {detail}", thread_id,
             )
