@@ -688,8 +688,11 @@ class MessageRouter:
             await self.matrix.redact_event(room_id, eyes_eid)
         await self.matrix.set_typing(room_id, True)
 
-        # Store context for routing the response back
-        if thread_id:
+        # Store context for routing the response back.
+        # Don't update if the user replied inside a sub-agent thread —
+        # that would permanently redirect all responses into the sub-agent
+        # thread even after it completes.
+        if thread_id and thread_id not in self._subagent_threads.values():
             self._thread_events[session.id] = thread_id
         # Store the user's event_id so we can ✅ it when the agent responds
         if event_id:
@@ -986,8 +989,12 @@ class MessageRouter:
         agent_name = msg.payload.get("agent_name", "sub-agent")
         success = msg.payload.get("success", True)
         log.info("Sub-agent completed for %s: %s (success=%s)", session.id, agent_name, success)
-        # Clear the sub-agent thread so further events go to the main thread
-        self._subagent_threads.pop(session.id, None)
+        # Clear the sub-agent thread so further events go to the main thread.
+        # Also clear _thread_events if a user reply inside the sub-agent thread
+        # polluted it — otherwise all future responses stay trapped in the thread.
+        sub_thread = self._subagent_threads.pop(session.id, None)
+        if sub_thread and self._thread_events.get(session.id) == sub_thread:
+            self._thread_events.pop(session.id, None)
         # Clear any lingering activity message reference
         self._activity_msg.pop(session.id, None)
         self._activity_lines.pop(session.id, None)
