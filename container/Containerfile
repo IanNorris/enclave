@@ -83,11 +83,12 @@ if [ "${ENCLAVE_NIX_STORE:-0}" = "1" ]; then\n\
 fi\n\
 \n\
 if [ -n "${ENCLAVE_NIX_SHELL:-}" ]; then\n\
+  ENCLAVE_PYTHON="$(which python3)"\n\
   NIX_SHELL_LOG="/workspace/.nix-shell.log"\n\
   echo "[entrypoint] Testing nix-shell: $ENCLAVE_NIX_SHELL" > "$NIX_SHELL_LOG" 2>&1\n\
   if nix-shell "$ENCLAVE_NIX_SHELL" --run "echo nix-shell-ok" >> "$NIX_SHELL_LOG" 2>&1; then\n\
     echo "[entrypoint] nix-shell OK, launching agent under nix-shell" >> "$NIX_SHELL_LOG"\n\
-    exec nix-shell "$ENCLAVE_NIX_SHELL" --command "python3 -m enclave.agent.main $*"\n\
+    exec nix-shell "$ENCLAVE_NIX_SHELL" --command "$ENCLAVE_PYTHON -m enclave.agent.main $*"\n\
   else\n\
     echo "[entrypoint] nix-shell FAILED (exit $?), falling back to plain exec" >> "$NIX_SHELL_LOG"\n\
     export ENCLAVE_NIX_SHELL_FAILED=1\n\
