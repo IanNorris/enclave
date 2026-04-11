@@ -105,6 +105,8 @@ class MessageRouter:
         self._activity_msg: dict[str, str] = {}  # session_id → Matrix event_id
         # Accumulated activity lines per session (appended, not replaced)
         self._activity_lines: dict[str, list[str]] = {}  # session_id → list of lines
+        # All activity event IDs per session (for redaction after response)
+        self._activity_event_ids: dict[str, list[str]] = {}  # session_id → [event_ids]
 
         # Sub-agent thread tracking
         # session_id → event_id of the message that starts the sub-agent thread
@@ -989,6 +991,12 @@ class MessageRouter:
         # Clear any lingering activity message reference
         self._activity_msg.pop(session.id, None)
         self._activity_lines.pop(session.id, None)
+        # Redact sub-agent activity messages
+        activity_ids = self._activity_event_ids.pop(session.id, [])
+        if activity_ids:
+            asyncio.ensure_future(
+                self._redact_activity(session.room_id, activity_ids)
+            )
 
     async def _handle_sub_agent_request(
         self, session: Session, msg: Message
@@ -1113,7 +1121,7 @@ class MessageRouter:
         Lines accumulate in a single message (edited in-place) until
         the combined text exceeds _MAX_ACTIVITY_LEN, at which point the
         current message is finalised and a new one is started.  Activity
-        messages are **not** deleted — they stay in the chat history.
+        messages are redacted when the final agent response arrives.
         """
         lines = self._activity_lines.setdefault(session.id, [])
         lines.append((text, html or text))
@@ -1138,6 +1146,7 @@ class MessageRouter:
             )
             if event_id:
                 self._activity_msg[session.id] = event_id
+                self._activity_event_ids.setdefault(session.id, []).append(event_id)
         else:
             # No existing message — create one
             event_id = await self.matrix.send_message(
@@ -1146,7 +1155,19 @@ class MessageRouter:
             )
             if event_id:
                 self._activity_msg[session.id] = event_id
+                self._activity_event_ids.setdefault(session.id, []).append(event_id)
         await self.matrix.set_typing(session.room_id, True)
+
+    async def _redact_activity(
+        self, room_id: str, event_ids: list[str]
+    ) -> None:
+        """Redact accumulated activity messages to keep rooms lightweight."""
+        for eid in event_ids:
+            try:
+                await self.matrix.redact_event(room_id, eid, reason="activity cleanup")
+            except Exception:
+                log.debug("Failed to redact activity event %s", eid)
+            await asyncio.sleep(0.15)  # gentle rate limit
 
     async def _handle_agent_response(
         self, session: Session, msg: Message
@@ -1165,10 +1186,13 @@ class MessageRouter:
             session.room_id, thread_id, content[:80],
         )
 
-        # Stop typing and detach activity status (keep it in chat history)
+        # Stop typing and detach activity status
         await self.matrix.set_typing(session.room_id, False)
         self._activity_msg.pop(session.id, None)
         self._activity_lines.pop(session.id, None)
+
+        # Collect activity event IDs to redact after sending the response
+        activity_ids = self._activity_event_ids.pop(session.id, [])
 
         # If we have a streaming message, edit it with final content.
         # Otherwise, send a new message.
@@ -1200,6 +1224,12 @@ class MessageRouter:
                 await self.matrix.redact_event(user_room_id, thinking_eid)
             await self.matrix.send_reaction(
                 user_room_id, user_event_id, "✅"
+            )
+
+        # Redact activity messages in background to keep rooms clean
+        if activity_ids:
+            asyncio.ensure_future(
+                self._redact_activity(session.room_id, activity_ids)
             )
 
     async def _handle_agent_status(
@@ -1859,6 +1889,9 @@ class MessageRouter:
         """Called when an agent disconnects."""
         # Clean up streaming state
         self._streaming.pop(session_id, None)
+        self._activity_msg.pop(session_id, None)
+        self._activity_lines.pop(session_id, None)
+        self._activity_event_ids.pop(session_id, None)
 
         # Stop file watcher
         await self._stop_watcher(session_id)
