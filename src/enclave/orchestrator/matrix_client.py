@@ -118,6 +118,9 @@ class EnclaveMatrixClient:
         self._seen_events: dict[str, None] = {}
         self._seen_events_max = 1000
 
+        # Per-room event counter for volume-based purge triggers
+        self._event_counts: dict[str, int] = {}  # room_id → events sent since reset
+
         # Register internal callbacks
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(
@@ -296,6 +299,7 @@ class EnclaveMatrixClient:
 
         if isinstance(resp, RoomSendResponse):
             log.debug("Sent to %s: %s", room_id, resp.event_id)
+            self._event_counts[room_id] = self._event_counts.get(room_id, 0) + 1
             return resp.event_id
         else:
             log.error("Failed to send to %s: %s", room_id, resp)
@@ -495,6 +499,7 @@ class EnclaveMatrixClient:
         )
 
         if isinstance(resp, RoomSendResponse):
+            self._event_counts[room_id] = self._event_counts.get(room_id, 0) + 1
             return resp.event_id
         else:
             log.error("Failed to edit message %s: %s", event_id, resp)
@@ -512,6 +517,95 @@ class EnclaveMatrixClient:
         except Exception as e:
             log.debug("Redact failed for %s: %s", event_id, e)
             return False
+
+    def get_event_count(self, room_id: str) -> int:
+        """Return number of events sent to a room since last reset."""
+        return self._event_counts.get(room_id, 0)
+
+    def reset_event_count(self, room_id: str) -> None:
+        """Reset the event counter for a room (after purge)."""
+        self._event_counts.pop(room_id, None)
+
+    async def purge_room_history(
+        self, room_id: str, keep_events: int = 200
+    ) -> int:
+        """Purge old room history via Synapse admin API, keeping last N events.
+
+        Uses the admin room messages endpoint to find the cutoff event,
+        then calls purge_history to remove everything older.
+
+        Returns approximate number of events that existed beyond the keep
+        window, or -1 on error.
+        """
+        import aiohttp
+
+        if not self.client.access_token:
+            log.error("No access token — cannot purge room history")
+            return -1
+
+        base = self.homeserver.rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {self.client.access_token}",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as http:
+                # Fetch the last `keep_events` messages to find the cutoff
+                async with http.get(
+                    f"{base}/_synapse/admin/v1/rooms/{room_id}/messages",
+                    headers=headers,
+                    params={"dir": "b", "limit": str(keep_events)},
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        log.error(
+                            "Failed to fetch room messages for purge: %s %s",
+                            resp.status, text,
+                        )
+                        return -1
+                    data = await resp.json()
+
+                chunk = data.get("chunk", [])
+                if len(chunk) < keep_events:
+                    log.debug(
+                        "Room %s has %d events (< %d keep) — no purge needed",
+                        room_id, len(chunk), keep_events,
+                    )
+                    return 0
+
+                # The last event in the chunk is the oldest to keep
+                cutoff_event_id = chunk[-1]["event_id"]
+                log.info(
+                    "Purging room %s history before event %s (keeping %d)",
+                    room_id, cutoff_event_id, keep_events,
+                )
+
+                async with http.post(
+                    f"{base}/_synapse/admin/v1/purge_history/{room_id}",
+                    headers=headers,
+                    json={
+                        "purge_up_to_event_id": cutoff_event_id,
+                        "delete_local_events": True,
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        purge_id = result.get("purge_id", "?")
+                        log.info(
+                            "Room purge started: %s (purge_id=%s)",
+                            room_id, purge_id,
+                        )
+                        return keep_events  # approximate
+                    else:
+                        text = await resp.text()
+                        log.error(
+                            "Purge failed for %s: %s %s",
+                            room_id, resp.status, text,
+                        )
+                        return -1
+        except Exception as e:
+            log.error("Room purge error for %s: %s", room_id, e)
+            return -1
 
     async def create_room(
         self,

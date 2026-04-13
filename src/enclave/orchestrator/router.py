@@ -51,6 +51,13 @@ _EDIT_THROTTLE = 1.5
 # Max length for accumulated activity messages before starting a new one
 _MAX_ACTIVITY_LEN = 3500
 
+# Minimum interval between activity message flushes to Matrix (seconds)
+_ACTIVITY_THROTTLE = 3.0
+
+# Volume-based room history purge: trigger when event count exceeds threshold
+_ROOM_PURGE_THRESHOLD = 500
+_ROOM_PURGE_KEEP = 200
+
 
 def _html_escape(text: str) -> str:
     """Escape text for safe inclusion in HTML."""
@@ -105,8 +112,12 @@ class MessageRouter:
         self._activity_msg: dict[str, str] = {}  # session_id → Matrix event_id
         # Accumulated activity lines per session (appended, not replaced)
         self._activity_lines: dict[str, list[str]] = {}  # session_id → list of lines
-        # All activity event IDs per session (for redaction after response)
+        # All activity event IDs per session (tracked for purge, no longer redacted)
         self._activity_event_ids: dict[str, list[str]] = {}  # session_id → [event_ids]
+        # Activity throttling state
+        self._activity_last_flush: dict[str, float] = {}  # session_id → monotonic time
+        self._activity_flush_tasks: dict[str, asyncio.Task] = {}  # session_id → pending flush
+        self._activity_thread_ids: dict[str, str | None] = {}  # session_id → thread for flush
 
         # Sub-agent thread tracking
         # session_id → event_id of the message that starts the sub-agent thread
@@ -347,6 +358,7 @@ class MessageRouter:
         """Periodically check container health and notify on crashes/stalls."""
         # Backup every N ticks (interval × ticks = backup period)
         backup_ticks = self.sessions._BACKUP_INTERVAL // self._HEALTH_INTERVAL
+        purge_ticks = 300 // self._HEALTH_INTERVAL  # check every ~5 minutes
         tick = 0
 
         while True:
@@ -398,6 +410,10 @@ class MessageRouter:
                     count = await self.sessions.backup_all_running()
                     if count:
                         log.info("SDK state backed up for %d session(s)", count)
+
+                # Volume-based room history purge (check every ~5 minutes)
+                if tick % purge_ticks == 0:
+                    await self._check_room_purge()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -447,6 +463,26 @@ class MessageRouter:
             )
             await self.sessions.stop_session(sid, reason="idle")
             self.sessions.clear_activity(sid)
+
+    async def _check_room_purge(self) -> None:
+        """Purge room history when event counts exceed the threshold."""
+        for session in self.sessions.active_sessions():
+            count = self.matrix.get_event_count(session.room_id)
+            if count >= _ROOM_PURGE_THRESHOLD:
+                log.info(
+                    "Room %s has %d events since reset — triggering purge (keep %d)",
+                    session.room_id, count, _ROOM_PURGE_KEEP,
+                )
+                result = await self.matrix.purge_room_history(
+                    session.room_id, keep_events=_ROOM_PURGE_KEEP,
+                )
+                if result >= 0:
+                    self.matrix.reset_event_count(session.room_id)
+                    if result > 0:
+                        await self.matrix.send_message(
+                            session.room_id,
+                            f"🗑️ Room history trimmed (keeping last ~{_ROOM_PURGE_KEEP} events).",
+                        )
 
     # ------------------------------------------------------------------
     # Memory store helpers
@@ -869,7 +905,10 @@ class MessageRouter:
         self, session: Session, msg: Message
     ) -> None:
         """Handle an intent/thinking/reasoning update — show as status message."""
-        thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
+        # Skip activity in sub-agent threads (high volume, rarely useful to user)
+        if session.id in self._subagent_threads:
+            return
+        thread_id = self._thread_events.get(session.id)
 
         # Short intent (e.g. "Exploring the codebase")
         intent = msg.payload.get("intent", "")
@@ -936,7 +975,10 @@ class MessageRouter:
             "tool_start", session_id=session.id,
             tool=tool_name, description=description,
         )
-        thread_id = self._subagent_threads.get(session.id) or self._thread_events.get(session.id)
+        # Skip activity in sub-agent threads (high volume, rarely useful to user)
+        if session.id in self._subagent_threads:
+            return
+        thread_id = self._thread_events.get(session.id)
 
         label = self._TOOL_LABELS.get(tool_name, tool_name)
         if description:
@@ -995,15 +1037,15 @@ class MessageRouter:
         sub_thread = self._subagent_threads.pop(session.id, None)
         if sub_thread and self._thread_events.get(session.id) == sub_thread:
             self._thread_events.pop(session.id, None)
-        # Clear any lingering activity message reference
+        # Cancel any pending flush and detach activity tracking
+        task = self._activity_flush_tasks.pop(session.id, None)
+        if task and not task.done():
+            task.cancel()
         self._activity_msg.pop(session.id, None)
         self._activity_lines.pop(session.id, None)
-        # Redact sub-agent activity messages
-        activity_ids = self._activity_event_ids.pop(session.id, [])
-        if activity_ids:
-            asyncio.ensure_future(
-                self._redact_activity(session.room_id, activity_ids)
-            )
+        self._activity_event_ids.pop(session.id, None)
+        self._activity_last_flush.pop(session.id, None)
+        self._activity_thread_ids.pop(session.id, None)
 
     async def _handle_sub_agent_request(
         self, session: Session, msg: Message
@@ -1123,22 +1165,58 @@ class MessageRouter:
         self, session: Session, text: str, thread_id: str | None,
         html: str | None = None,
     ) -> None:
-        """Append a line to the activity status message.
+        """Buffer an activity line and schedule a throttled flush to Matrix.
 
-        Lines accumulate in a single message (edited in-place) until
-        the combined text exceeds _MAX_ACTIVITY_LEN, at which point the
-        current message is finalised and a new one is started.  Activity
-        messages are redacted when the final agent response arrives.
+        Lines accumulate and are sent/edited as a batch no more often than
+        _ACTIVITY_THROTTLE seconds. This dramatically reduces Matrix event
+        volume while keeping the activity log readable.
         """
         lines = self._activity_lines.setdefault(session.id, [])
         lines.append((text, html or text))
+        self._activity_thread_ids[session.id] = thread_id
+
+        now = time.monotonic()
+        last = self._activity_last_flush.get(session.id, 0.0)
+
+        if now - last >= _ACTIVITY_THROTTLE:
+            await self._flush_activity(session)
+        elif session.id not in self._activity_flush_tasks:
+            delay = _ACTIVITY_THROTTLE - (now - last)
+            task = asyncio.create_task(
+                self._delayed_activity_flush(session.id, delay)
+            )
+            self._activity_flush_tasks[session.id] = task
+
+    async def _delayed_activity_flush(
+        self, session_id: str, delay: float
+    ) -> None:
+        """Sleep then flush buffered activity lines."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        self._activity_flush_tasks.pop(session_id, None)
+        session = self.sessions.get_session(session_id)
+        if session and session_id in self._activity_lines:
+            await self._flush_activity(session)
+
+    async def _flush_activity(self, session: Session) -> None:
+        """Send or edit the accumulated activity lines to Matrix."""
+        lines = self._activity_lines.get(session.id, [])
+        if not lines:
+            return
+
+        # Cancel any pending delayed flush (we're flushing now)
+        task = self._activity_flush_tasks.pop(session.id, None)
+        if task and not task.done():
+            task.cancel()
+
+        thread_id = self._activity_thread_ids.get(session.id)
         combined_plain = "\n".join(t for t, _ in lines)
         combined_html = "<br/>".join(h for _, h in lines)
-
         existing = self._activity_msg.get(session.id)
 
         if existing and len(combined_plain) <= _MAX_ACTIVITY_LEN:
-            # Still fits — edit the existing message
             await self.matrix.edit_message(
                 session.room_id, existing, combined_plain,
                 html_body=combined_html,
@@ -1146,16 +1224,16 @@ class MessageRouter:
         elif existing:
             # Over the limit — finalise current message and start a new one
             self._activity_msg.pop(session.id, None)
-            self._activity_lines[session.id] = [(text, html or text)]
+            last_text, last_html = lines[-1]
+            self._activity_lines[session.id] = [(last_text, last_html)]
             event_id = await self.matrix.send_message(
-                session.room_id, text, html_body=html or text,
+                session.room_id, last_text, html_body=last_html,
                 thread_event_id=thread_id,
             )
             if event_id:
                 self._activity_msg[session.id] = event_id
                 self._activity_event_ids.setdefault(session.id, []).append(event_id)
         else:
-            # No existing message — create one
             event_id = await self.matrix.send_message(
                 session.room_id, combined_plain, html_body=combined_html,
                 thread_event_id=thread_id,
@@ -1163,18 +1241,9 @@ class MessageRouter:
             if event_id:
                 self._activity_msg[session.id] = event_id
                 self._activity_event_ids.setdefault(session.id, []).append(event_id)
-        await self.matrix.set_typing(session.room_id, True)
 
-    async def _redact_activity(
-        self, room_id: str, event_ids: list[str]
-    ) -> None:
-        """Redact accumulated activity messages to keep rooms lightweight."""
-        for eid in event_ids:
-            try:
-                await self.matrix.redact_event(room_id, eid, reason="activity cleanup")
-            except Exception:
-                log.debug("Failed to redact activity event %s", eid)
-            await asyncio.sleep(0.15)  # gentle rate limit
+        self._activity_last_flush[session.id] = time.monotonic()
+        await self.matrix.set_typing(session.room_id, True)
 
     async def _handle_agent_response(
         self, session: Session, msg: Message
@@ -1193,13 +1262,20 @@ class MessageRouter:
             session.room_id, thread_id, content[:80],
         )
 
-        # Stop typing and detach activity status
+        # Stop typing and flush any remaining buffered activity
         await self.matrix.set_typing(session.room_id, False)
+        task = self._activity_flush_tasks.pop(session.id, None)
+        if task and not task.done():
+            task.cancel()
+        if self._activity_lines.get(session.id):
+            await self._flush_activity(session)
+
+        # Detach activity tracking (keep messages — volume purge handles cleanup)
         self._activity_msg.pop(session.id, None)
         self._activity_lines.pop(session.id, None)
-
-        # Collect activity event IDs to redact after sending the response
-        activity_ids = self._activity_event_ids.pop(session.id, [])
+        self._activity_event_ids.pop(session.id, None)
+        self._activity_last_flush.pop(session.id, None)
+        self._activity_thread_ids.pop(session.id, None)
 
         # If we have a streaming message, edit it with final content.
         # Otherwise, send a new message.
@@ -1231,12 +1307,6 @@ class MessageRouter:
                 await self.matrix.redact_event(user_room_id, thinking_eid)
             await self.matrix.send_reaction(
                 user_room_id, user_event_id, "✅"
-            )
-
-        # Redact activity messages in background to keep rooms clean
-        if activity_ids:
-            asyncio.ensure_future(
-                self._redact_activity(session.room_id, activity_ids)
             )
 
     async def _handle_agent_status(
@@ -1902,9 +1972,15 @@ class MessageRouter:
         """Called when an agent disconnects."""
         # Clean up streaming state
         self._streaming.pop(session_id, None)
+        # Cancel pending activity flush and clean up tracking
+        task = self._activity_flush_tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
         self._activity_msg.pop(session_id, None)
         self._activity_lines.pop(session_id, None)
         self._activity_event_ids.pop(session_id, None)
+        self._activity_last_flush.pop(session_id, None)
+        self._activity_thread_ids.pop(session_id, None)
 
         # Stop file watcher
         await self._stop_watcher(session_id)
