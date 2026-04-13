@@ -123,6 +123,11 @@ class ContainerManager:
             if dri.exists():
                 cmd.extend(["--device", "/dev/dri"])
                 log.info("[start:%s] GPU device mounted", session.id)
+            # KVM device for hardware-accelerated virtualisation (QEMU etc.)
+            kvm = Path("/dev/kvm")
+            if kvm.exists():
+                cmd.extend(["--device", "/dev/kvm"])
+                log.info("[start:%s] KVM device mounted", session.id)
             # NixOS GPU driver stack (Mesa, EGL, Vulkan)
             opengl_driver = Path("/run/opengl-driver")
             if opengl_driver.exists():
