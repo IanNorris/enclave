@@ -149,6 +149,9 @@ class MessageRouter:
         # Turn timing — detect stalled turns
         self._turn_start_time: dict[str, float] = {}
 
+        # Periodic typing indicator refresh (Matrix typing expires after 30s)
+        self._typing_tasks: dict[str, asyncio.Task] = {}
+
         # ── Privilege & permission system ──
         import os
         db_path = os.path.join(
@@ -802,9 +805,11 @@ class MessageRouter:
             log.info("Agent %s turn started", session.id)
             self._turn_start_time[session.id] = time.monotonic()
             self._control.cancel_turn_end(session.id)
+            self._start_typing_refresh(session)
         elif msg.type == MessageType.TURN_END:
             elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
             log.info("Agent %s turn ended (%.1fs)", session.id, elapsed)
+            self._stop_typing_refresh(session.id)
             self._control.notify_turn_end(session.id)
             # Snapshot SDK state after every interaction
             asyncio.create_task(
@@ -1037,6 +1042,28 @@ class MessageRouter:
         )
         # Keep typing indicator while more work may come
         await self.matrix.set_typing(session.room_id, True)
+
+    # ── Typing indicator refresh ──
+
+    def _start_typing_refresh(self, session: Session) -> None:
+        """Start periodic typing indicator refresh for a session's turn."""
+        self._stop_typing_refresh(session.id)
+
+        async def _refresh_loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(20)
+                    await self.matrix.set_typing(session.room_id, True)
+            except asyncio.CancelledError:
+                pass
+
+        self._typing_tasks[session.id] = asyncio.create_task(_refresh_loop())
+
+    def _stop_typing_refresh(self, session_id: str) -> None:
+        """Cancel the typing refresh task for a session."""
+        task = self._typing_tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
 
     async def _handle_subagent_started(
         self, session: Session, msg: Message
@@ -1296,6 +1323,7 @@ class MessageRouter:
         )
 
         # Stop typing and flush any remaining buffered activity
+        self._stop_typing_refresh(session.id)
         await self.matrix.set_typing(session.room_id, False)
         task = self._activity_flush_tasks.pop(session.id, None)
         if task and not task.done():
