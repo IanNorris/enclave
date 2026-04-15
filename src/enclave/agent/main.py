@@ -2658,6 +2658,99 @@ async def try_init_copilot(
         )
         custom_tools.append(consult_panel_tool)
 
+        # ── Custom tool: web_search ──
+        async def _web_search_handler(invocation: object) -> ToolResult:
+            """Run a web search via the Copilot CLI in -p mode."""
+            args = getattr(invocation, "arguments", {}) or {}
+            query = args.get("query", "").strip()
+            if not query:
+                return ToolResult(
+                    text_result_for_llm="Error: 'query' parameter is required",
+                    result_type="error",
+                )
+            # Find the copilot CLI binary (bundled with the SDK)
+            try:
+                import copilot as _copilot_pkg
+                cli_dir = os.path.dirname(_copilot_pkg.__file__)
+                cli_bin = os.path.join(cli_dir, "bin", "copilot")
+            except Exception:
+                cli_bin = "copilot"
+
+            prompt = (
+                f"Use the web_search tool to search for: {query}\n"
+                "Return ONLY the search result text. No commentary, no preamble."
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    cli_bin, "-p", prompt,
+                    "--model", "claude-sonnet-4.6",
+                    "--allow-all-tools", "--no-auto-update",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, "NO_COLOR": "1"},
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=60.0,
+                )
+                result_text = stdout.decode("utf-8", errors="replace").strip()
+                if not result_text:
+                    err = stderr.decode("utf-8", errors="replace").strip()
+                    return ToolResult(
+                        text_result_for_llm=f"Web search returned no results. stderr: {err[:500]}",
+                        result_type="error",
+                    )
+                # Strip the tool-call decoration line the CLI prepends
+                lines = result_text.split("\n")
+                cleaned = []
+                skip_next_blank = False
+                for line in lines:
+                    if line.startswith("● Web Search") or line.strip().startswith("└ {"):
+                        skip_next_blank = True
+                        continue
+                    if skip_next_blank and not line.strip():
+                        skip_next_blank = False
+                        continue
+                    skip_next_blank = False
+                    cleaned.append(line)
+                return ToolResult(
+                    text_result_for_llm="\n".join(cleaned).strip() or result_text,
+                )
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Web search timed out after 60s",
+                    result_type="error",
+                )
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"Web search failed: {e}",
+                    result_type="error",
+                )
+
+        web_search_tool = Tool(
+            name="web_search",
+            description=(
+                "Search the web for current information. Returns an AI-generated "
+                "summary with citations. Use when you need up-to-date information, "
+                "recent events, documentation, or facts you're unsure about."
+            ),
+            handler=_web_search_handler,
+            skip_permission=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "A clear, specific search query. Example: "
+                            "'Python asyncio best practices 2025'"
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        )
+        custom_tools.append(web_search_tool)
+
         # ── Load plugin tools ──
         try:
             from enclave.agent.plugins import discover_plugins
