@@ -61,6 +61,10 @@ class MessageType(str, Enum):
     # Environment management
     NIX_SHELL_REQUEST = "nix_shell_request"
 
+    # Agent lifecycle signals
+    TASK_DONE = "task_done"
+    ASK_USER = "ask_user"
+
 
 @dataclass
 class Message:

@@ -854,6 +854,31 @@ class MessageRouter:
             )
         elif msg.type == MessageType.NIX_SHELL_REQUEST:
             await self._handle_nix_shell_request(session, msg)
+        elif msg.type == MessageType.TASK_DONE:
+            summary = msg.payload.get("summary", "")
+            log.info("Agent %s marked task done: %s", session.id, summary[:80])
+            if summary:
+                await self.matrix.send_message(
+                    session.room_id,
+                    f"✅ {summary}",
+                )
+        elif msg.type == MessageType.ASK_USER:
+            question = msg.payload.get("question", "")
+            choices = msg.payload.get("choices") or []
+            log.info("Agent %s asking user: %s", session.id, question[:80])
+            thread_id = self._thread_events.get(session.id)
+            if choices:
+                answers = [(c, c) for c in choices]
+                await self.matrix.send_poll(
+                    session.room_id, question, answers,
+                    thread_event_id=thread_id,
+                )
+            else:
+                await self.matrix.send_message(
+                    session.room_id,
+                    f"❓ {question}",
+                    thread_id=thread_id,
+                )
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",

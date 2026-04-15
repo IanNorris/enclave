@@ -38,6 +38,8 @@ class AgentState:
         # Doom loop detection
         "task_start_time", "consecutive_turns", "tool_failures",
         "recent_edit_targets", "doom_loop_nudged",
+        # Auto-continue lifecycle
+        "task_done", "asked_user", "auto_continue_handle",
     )
 
     # After this many turns with a pending message, deny tool calls to nudge
@@ -73,6 +75,10 @@ class AgentState:
         self.tool_failures: int = 0
         self.recent_edit_targets: list[str] = []
         self.doom_loop_nudged: bool = False
+        # Auto-continue lifecycle
+        self.task_done: bool = False  # agent explicitly called mark_done
+        self.asked_user: bool = False  # agent explicitly called ask_user
+        self.auto_continue_handle: object | None = None  # pending call_later handle
 
 
 def setup_session_listener(
@@ -271,6 +277,10 @@ def setup_session_listener(
 
         elif etype == SessionEventType.ASSISTANT_TURN_START:
             _set_phase("thinking", active=True)
+            # Cancel any pending auto-continue — agent is actively working
+            if agent_state and agent_state.auto_continue_handle is not None:
+                agent_state.auto_continue_handle.cancel()
+                agent_state.auto_continue_handle = None
             turn_id = getattr(data, "turn_id", None) or getattr(data, "turnId", "")
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.TURN_START,
@@ -402,12 +412,58 @@ def setup_session_listener(
                     agent_state.pending_interrupt = False
                     agent_state.turns_since_enqueue = 0
                     agent_state.pending_messages.clear()
+
+                    # Auto-continue: if agent had a multi-turn session and didn't
+                    # explicitly mark_done or ask_user, nudge it to continue
+                    turns = agent_state.consecutive_turns
+                    should_continue = (
+                        turns >= 3
+                        and not agent_state.task_done
+                        and not agent_state.asked_user
+                    )
+
                     # Reset doom loop tracking for next task
                     agent_state.task_start_time = 0.0
                     agent_state.consecutive_turns = 0
                     agent_state.tool_failures = 0
                     agent_state.recent_edit_targets.clear()
                     agent_state.doom_loop_nudged = False
+                    # Reset lifecycle flags for next task
+                    agent_state.task_done = False
+                    agent_state.asked_user = False
+
+                    if should_continue:
+                        print(
+                            f"[agent] Auto-continue: {turns} turns without "
+                            f"mark_done/ask_user, scheduling nudge",
+                            file=sys.stderr,
+                        )
+
+                        async def _send_continue() -> None:
+                            if agent_state.turn_active:
+                                return  # already resumed
+                            try:
+                                await sdk_session.send(
+                                    "[Agent framework] You went idle but didn't "
+                                    "call mark_done() or ask_user(). If you have "
+                                    "more work to do, please continue with the "
+                                    "next item on your plan. If you're finished, "
+                                    "call mark_done(). If you need the user's "
+                                    "input, call ask_user()."
+                                )
+                            except Exception as e:
+                                print(
+                                    f"[agent] Auto-continue send failed: {e}",
+                                    file=sys.stderr,
+                                )
+
+                        def _fire_continue() -> None:
+                            agent_state.auto_continue_handle = None
+                            _fire_and_forget(_send_continue())
+
+                        agent_state.auto_continue_handle = loop.call_later(
+                            10.0, _fire_continue,
+                        )
             else:
                 # Log truly unhandled events for diagnostics
                 print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
@@ -2366,6 +2422,105 @@ async def try_init_copilot(
             skip_permission=True,
         )
         custom_tools.append(check_messages_tool)
+
+        # Custom tool: mark_done — signal that the agent has finished its work
+        async def _mark_done_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            summary = args.get("summary", "")
+            if agent_state is not None:
+                agent_state.task_done = True
+            if ipc and ipc.is_connected:
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.TASK_DONE,
+                    payload={"summary": summary},
+                )))
+            return ToolResult(
+                text_result_for_llm=(
+                    "Marked as done. The session will stay idle until the user "
+                    "sends a new message."
+                ),
+            )
+
+        mark_done_tool = Tool(
+            name="mark_done",
+            description=(
+                "Signal that you have finished your current work and are waiting "
+                "for the user. Call this when you've completed all items on your "
+                "plan, or when there's nothing more to do without user input. "
+                "If you don't call this, the framework will ask you to continue."
+            ),
+            handler=_mark_done_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief summary of what was accomplished.",
+                    },
+                },
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(mark_done_tool)
+
+        # Custom tool: ask_user — ask the user a question (optionally as a poll)
+        async def _ask_user_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            question = args.get("question", "").strip()
+            choices = args.get("choices") or []
+            if not question:
+                return ToolResult(
+                    text_result_for_llm="Error: 'question' parameter is required.",
+                    result_type="error",
+                )
+            if agent_state is not None:
+                agent_state.asked_user = True
+            if ipc and ipc.is_connected:
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.ASK_USER,
+                    payload={
+                        "question": question,
+                        "choices": choices if choices else None,
+                    },
+                )))
+            return ToolResult(
+                text_result_for_llm=(
+                    "Question sent to the user. The session will stay idle "
+                    "until they respond. Their reply will arrive as a normal "
+                    "message."
+                ),
+            )
+
+        ask_user_tool = Tool(
+            name="ask_user",
+            description=(
+                "Ask the user a question and wait for their response. Use this "
+                "when you need a decision, clarification, or want to know what "
+                "the user wants to work on next. Optionally provide choices for "
+                "a poll-style question."
+            ),
+            handler=_ask_user_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask the user.",
+                    },
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional list of choices for a poll-style question. "
+                            "If omitted, the question is sent as plain text."
+                        ),
+                    },
+                },
+                "required": ["question"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(ask_user_tool)
 
         # Custom tool: enter_nix_shell — restart under a nix-shell environment
         async def _enter_nix_shell_handler(invocation: object) -> ToolResult:

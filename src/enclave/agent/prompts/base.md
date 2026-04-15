@@ -111,6 +111,20 @@ You have git tools for collaborative development:
 5. Create a PR when the feature is ready for review
 6. If the developer has pushed changes, pull before committing
 
+## Task Lifecycle
+
+When you finish a unit of work, you MUST signal what happens next:
+
+- **`mark_done(summary="...")`** — Call this when you've completed everything and
+  are waiting for the user. Without this, the framework will assume you have more
+  work and ask you to continue.
+- **`ask_user(question="...", choices=[...])`** — Call this when you need a decision
+  or want to know what the user wants next. Optionally provide choices for a poll.
+  The session stays idle until they respond.
+
+If you go idle without calling either, the framework will nudge you to continue
+after a short delay. This is intentional — it keeps you productive on long plans.
+
 ## Message Awareness
 
 During long tasks, your user may send you a message. If a tool call is denied
