@@ -919,20 +919,23 @@ class MessageRouter:
             await self._update_activity(session, plain, thread_id, html=html)
             return
 
-        # Full reasoning text (complete thinking block)
+        # Full reasoning text (complete thinking block) — send as its own
+        # message so it doesn't get swallowed by the activity throttle.
         reasoning = msg.payload.get("reasoning", "")
         if reasoning:
-            # Truncate long reasoning to a preview
-            preview = reasoning[:200].replace("\n", " ")
-            if len(reasoning) > 200:
+            preview = reasoning[:500].replace("\n", " ")
+            if len(reasoning) > 500:
                 preview += "…"
             log.debug("Agent %s reasoning: %s", session.id, preview[:80])
             plain = f"🧠 {preview}"
             html = f"🧠 <i>{_html_escape(preview)}</i>"
-            await self._update_activity(session, plain, thread_id, html=html)
+            await self.matrix.send_message(
+                session.room_id, plain, thread_event_id=thread_id,
+                html_body=html,
+            )
             return
 
-        # Streaming reasoning delta — accumulate and show latest chunk
+        # Streaming reasoning delta — show via activity (transient)
         delta = msg.payload.get("reasoning_delta", "")
         if delta:
             preview = delta.strip()[:150].replace("\n", " ")
@@ -943,30 +946,31 @@ class MessageRouter:
 
     # Friendly display names for common SDK tools
     _TOOL_LABELS: dict[str, str] = {
-        "bash": "Running command",
-        "read_bash": "Reading output",
-        "write_bash": "Sending input",
-        "stop_bash": "Stopping process",
-        "view": "Reading file",
-        "edit": "Editing file",
-        "create": "Creating file",
-        "grep": "Searching code",
-        "glob": "Finding files",
-        "web_fetch": "Fetching URL",
-        "web_search": "Searching web",
-        "task": "Running sub-agent",
-        "read_agent": "Reading agent result",
-        "sql": "Running query",
-        "ask_user": "Asking user",
-        "list_bash": "Listing sessions",
+        "bash": "🖥️",
+        "read_bash": "📖",
+        "write_bash": "⌨️",
+        "stop_bash": "⏹️",
+        "view": "📄",
+        "edit": "✏️",
+        "create": "📝",
+        "grep": "🔍",
+        "glob": "📁",
+        "web_fetch": "🌐",
+        "web_search": "🔎",
+        "task": "🤖",
+        "read_agent": "📨",
+        "sql": "🗃️",
+        "ask_user": "❓",
+        "list_bash": "📋",
     }
 
     async def _handle_tool_start(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle tool execution start — show tool name and description."""
+        """Handle tool execution start — show tool name and detail."""
         tool_name = msg.payload.get("tool_name", "unknown")
         description = msg.payload.get("description", "")
+        detail = msg.payload.get("detail", "")
         # Skip internal/noisy tools
         if tool_name in ("report_intent",):
             return
@@ -980,13 +984,17 @@ class MessageRouter:
             return
         thread_id = self._thread_events.get(session.id)
 
-        label = self._TOOL_LABELS.get(tool_name, tool_name)
-        if description:
-            plain = f"🔧 {label}: {description}"
-            html = f"🔧 <b>{label}</b>: {_html_escape(description)}"
+        icon = self._TOOL_LABELS.get(tool_name, "🔧")
+        # Build a concise, informative line
+        if detail:
+            plain = f"{icon} {detail}"
+            html = f"{icon} <code>{_html_escape(detail)}</code>"
+        elif description:
+            plain = f"{icon} {description}"
+            html = f"{icon} {_html_escape(description)}"
         else:
-            plain = f"🔧 {label}"
-            html = f"🔧 <b>{label}</b>"
+            plain = f"{icon} {tool_name}"
+            html = f"{icon} <code>{_html_escape(tool_name)}</code>"
         await self._update_activity(session, plain, thread_id, html=html)
 
     async def _handle_tool_complete(
@@ -1382,16 +1390,23 @@ class MessageRouter:
                 session.id, msgs, tokens, pre, post,
             )
             thread_id = self._thread_events.get(session.id)
+            parts = []
             if pre is not None and post is not None:
-                detail = f"{int(pre):,} → {int(post):,} tokens"
-                if msgs is not None:
-                    detail += f" ({msgs} messages removed)"
-            elif pre is not None:
-                detail = f"from {int(pre):,} tokens"
-            elif msgs is not None and tokens is not None:
-                detail = f"{msgs} messages, {tokens} tokens freed"
-            else:
-                detail = "context compacted"
+                try:
+                    parts.append(f"{int(pre):,} → {int(post):,} tokens")
+                except (ValueError, TypeError):
+                    pass
+            if msgs is not None:
+                try:
+                    parts.append(f"{int(msgs)} messages removed")
+                except (ValueError, TypeError):
+                    pass
+            elif tokens is not None:
+                try:
+                    parts.append(f"{int(tokens):,} tokens freed")
+                except (ValueError, TypeError):
+                    pass
+            detail = ", ".join(parts) if parts else "context compacted"
             await self._update_activity(
                 session, f"🗜️ Compacted: {detail}", thread_id,
             )

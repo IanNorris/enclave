@@ -175,11 +175,28 @@ def setup_session_listener(
                 except Exception:
                     args = {}
             description = args.get("description", "") or args.get("intent", "") or args.get("prompt", "")
+            # Extract tool-specific detail for richer activity display
+            detail = ""
+            if tool_name == "bash":
+                detail = (args.get("command", "") or "")[:120]
+            elif tool_name in ("view", "read"):
+                detail = args.get("path", "") or ""
+            elif tool_name in ("edit", "create"):
+                detail = args.get("path", "") or ""
+            elif tool_name == "grep":
+                detail = args.get("pattern", "") or ""
+            elif tool_name == "glob":
+                detail = args.get("pattern", "") or ""
+            elif tool_name == "web_fetch":
+                detail = args.get("url", "") or ""
+            elif tool_name == "web_search":
+                detail = args.get("query", "") or ""
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.TOOL_START,
                 payload={
                     "tool_name": tool_name,
                     "description": str(description)[:200],
+                    "detail": str(detail)[:200],
                     "tool_call_id": getattr(data, "tool_call_id", None) or getattr(data, "toolCallId", "") or "",
                     "in_reply_to": reply_to,
                 },
