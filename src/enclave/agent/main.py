@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,7 +33,12 @@ class AgentState:
         "sdk_client", "sdk_session", "listener_ctl",
         "ipc", "loop", "working_directory",
         "turn_active", "turn_phase",
+        "pending_interrupt", "turns_since_enqueue", "enqueue_time",
     )
+
+    # Interrupt thresholds for pending user messages
+    MAX_TURNS_BEFORE_INTERRUPT = 30
+    MAX_TIME_BEFORE_INTERRUPT = 120.0  # seconds
 
     def __init__(self) -> None:
         self.sdk_client: _CopilotClient | None = None
@@ -44,6 +50,10 @@ class AgentState:
         # Turn tracking for smart message injection
         self.turn_active: bool = False
         self.turn_phase: str = "idle"  # idle | thinking | tool | responding
+        # Pending message interrupt tracking
+        self.pending_interrupt: bool = False
+        self.turns_since_enqueue: int = 0
+        self.enqueue_time: float = 0.0
 
 
 def setup_session_listener(
@@ -225,6 +235,21 @@ def setup_session_listener(
                 payload={"turn_id": str(turn_id), "in_reply_to": reply_to},
                 reply_to=reply_to,
             )))
+            # Check if a pending user message needs to interrupt this work
+            if agent_state and agent_state.pending_interrupt:
+                agent_state.turns_since_enqueue += 1
+                elapsed = time.monotonic() - agent_state.enqueue_time
+                if (agent_state.turns_since_enqueue >= AgentState.MAX_TURNS_BEFORE_INTERRUPT
+                        or elapsed >= AgentState.MAX_TIME_BEFORE_INTERRUPT):
+                    print(
+                        f"[agent] Interrupting for pending message "
+                        f"(turns={agent_state.turns_since_enqueue}, "
+                        f"elapsed={elapsed:.0f}s)",
+                        file=sys.stderr,
+                    )
+                    agent_state.pending_interrupt = False
+                    agent_state.turns_since_enqueue = 0
+                    _fire_and_forget(sdk_session.abort())
 
         elif etype == SessionEventType.ASSISTANT_TURN_END:
             _set_phase("idle")
@@ -297,6 +322,10 @@ def setup_session_listener(
                     )))
             elif etype_str == "session.idle":
                 _set_phase("idle", active=False)
+                # Clear interrupt tracking — SDK is idle and will process pending messages
+                if agent_state:
+                    agent_state.pending_interrupt = False
+                    agent_state.turns_since_enqueue = 0
             else:
                 # Log truly unhandled events for diagnostics
                 print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
@@ -455,6 +484,10 @@ async def handle_user_message(
             else:
                 print(f"[agent] Enqueuing message (turn in {state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
                 await state.sdk_session.send(content, attachments=sdk_attachments, mode="enqueue")
+                # Schedule an interrupt so the SDK processes this soon
+                state.pending_interrupt = True
+                state.turns_since_enqueue = 0
+                state.enqueue_time = time.monotonic()
         else:
             print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
             await state.sdk_session.send(content, attachments=sdk_attachments)
