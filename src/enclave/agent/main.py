@@ -2430,10 +2430,10 @@ async def try_init_copilot(
             if agent_state is not None:
                 agent_state.task_done = True
             if ipc and ipc.is_connected:
-                _fire_and_forget(ipc.send(Message(
+                await ipc.send(Message(
                     type=MessageType.TASK_DONE,
                     payload={"summary": summary},
-                )))
+                ))
             return ToolResult(
                 text_result_for_llm=(
                     "Marked as done. The session will stay idle until the user "
@@ -2476,13 +2476,13 @@ async def try_init_copilot(
             if agent_state is not None:
                 agent_state.asked_user = True
             if ipc and ipc.is_connected:
-                _fire_and_forget(ipc.send(Message(
+                await ipc.send(Message(
                     type=MessageType.ASK_USER,
                     payload={
                         "question": question,
                         "choices": choices if choices else None,
                     },
-                )))
+                ))
             return ToolResult(
                 text_result_for_llm=(
                     "Question sent to the user. The session will stay idle "
