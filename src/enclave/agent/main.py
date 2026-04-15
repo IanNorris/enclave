@@ -34,11 +34,14 @@ class AgentState:
         "ipc", "loop", "working_directory",
         "turn_active", "turn_phase",
         "pending_interrupt", "turns_since_enqueue", "enqueue_time",
+        "pending_messages",
     )
 
-    # Interrupt thresholds for pending user messages
-    MAX_TURNS_BEFORE_INTERRUPT = 30
-    MAX_TIME_BEFORE_INTERRUPT = 120.0  # seconds
+    # After this many turns with a pending message, deny tool calls to nudge
+    NUDGE_TURNS = 10
+    # Hard abort safety net (if nudging doesn't work)
+    MAX_TURNS_BEFORE_INTERRUPT = 100
+    MAX_TIME_BEFORE_INTERRUPT = 300.0  # 5 minutes
 
     def __init__(self) -> None:
         self.sdk_client: _CopilotClient | None = None
@@ -54,6 +57,7 @@ class AgentState:
         self.pending_interrupt: bool = False
         self.turns_since_enqueue: int = 0
         self.enqueue_time: float = 0.0
+        self.pending_messages: list[str] = []  # stored content for check_messages tool
 
 
 def setup_session_listener(
@@ -249,6 +253,7 @@ def setup_session_listener(
                     )
                     agent_state.pending_interrupt = False
                     agent_state.turns_since_enqueue = 0
+                    agent_state.pending_messages.clear()
                     _fire_and_forget(sdk_session.abort())
 
         elif etype == SessionEventType.ASSISTANT_TURN_END:
@@ -326,6 +331,7 @@ def setup_session_listener(
                 if agent_state:
                     agent_state.pending_interrupt = False
                     agent_state.turns_since_enqueue = 0
+                    agent_state.pending_messages.clear()
             else:
                 # Log truly unhandled events for diagnostics
                 print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
@@ -484,10 +490,11 @@ async def handle_user_message(
             else:
                 print(f"[agent] Enqueuing message (turn in {state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
                 await state.sdk_session.send(content, attachments=sdk_attachments, mode="enqueue")
-                # Schedule an interrupt so the SDK processes this soon
+                # Schedule nudge so the agent gets a coffee-break notification
                 state.pending_interrupt = True
                 state.turns_since_enqueue = 0
                 state.enqueue_time = time.monotonic()
+                state.pending_messages.append(content)
         else:
             print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
             await state.sdk_session.send(content, attachments=sdk_attachments)
@@ -811,6 +818,19 @@ async def try_init_copilot(
 
         # Permission handler: screens SDK tool requests for host profile
         def perm_handler(_req: object, _meta: object) -> PermissionRequestResult:
+            # ☕ Coffee break: nudge the agent if a user message is waiting
+            if (agent_state.pending_interrupt
+                    and agent_state.turns_since_enqueue >= AgentState.NUDGE_TURNS):
+                return PermissionRequestResult(
+                    kind="denied-interactively-by-user",
+                    message=(
+                        "☕ A user message is waiting for you. "
+                        "Please wrap up your current step and respond — "
+                        "the message will be delivered when you finish. "
+                        "Or call check_messages to see a preview."
+                    ),
+                )
+
             # Containers are already sandboxed — auto-approve everything
             if not is_host:
                 return PermissionRequestResult(kind="approved")
@@ -2198,6 +2218,38 @@ async def try_init_copilot(
             },
         )
         custom_tools.append(system_status_tool)
+
+        # Custom tool: check_messages — peek at pending user messages
+        async def _check_messages_handler(_invocation: object) -> ToolResult:
+            if not agent_state.pending_messages:
+                return ToolResult(
+                    text_result_for_llm="No pending messages.",
+                )
+            preview = "\n---\n".join(agent_state.pending_messages)
+            return ToolResult(
+                text_result_for_llm=(
+                    f"📬 {len(agent_state.pending_messages)} pending message(s):\n\n"
+                    f"{preview}\n\n"
+                    "The full message will be delivered when your current task "
+                    "completes. Please wrap up your current step."
+                ),
+            )
+
+        check_messages_tool = Tool(
+            name="check_messages",
+            description=(
+                "Check if the user has sent any messages while you were working. "
+                "Call this if a tool call is denied with a 'message waiting' notice, "
+                "or at natural breakpoints in long tasks."
+            ),
+            handler=_check_messages_handler,
+            parameters={
+                "type": "object",
+                "properties": {},
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(check_messages_tool)
 
         # Custom tool: enter_nix_shell — restart under a nix-shell environment
         async def _enter_nix_shell_handler(invocation: object) -> ToolResult:

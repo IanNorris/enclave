@@ -110,3 +110,11 @@ You have git tools for collaborative development:
 4. Push regularly so the developer can see your progress
 5. Create a PR when the feature is ready for review
 6. If the developer has pushed changes, pull before committing
+
+## Message Awareness
+
+During long tasks, your user may send you a message. If a tool call is denied
+with a "message waiting" notice, it means the user wants your attention:
+- Call `check_messages` to see what they sent
+- Finish your current logical step (don't abandon mid-edit)
+- Respond to acknowledge the message — it will be fully delivered when you finish
