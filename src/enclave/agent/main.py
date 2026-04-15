@@ -35,6 +35,9 @@ class AgentState:
         "turn_active", "turn_phase",
         "pending_interrupt", "turns_since_enqueue", "enqueue_time",
         "pending_messages",
+        # Doom loop detection
+        "task_start_time", "consecutive_turns", "tool_failures",
+        "recent_edit_targets", "doom_loop_nudged",
     )
 
     # After this many turns with a pending message, deny tool calls to nudge
@@ -42,6 +45,12 @@ class AgentState:
     # Hard abort safety net (if nudging doesn't work)
     MAX_TURNS_BEFORE_INTERRUPT = 100
     MAX_TIME_BEFORE_INTERRUPT = 300.0  # 5 minutes
+
+    # Doom loop detection thresholds
+    DOOM_LOOP_TIME_GATE = 900.0  # 15 minutes of continuous work before checking
+    DOOM_LOOP_FAILURE_RATE = 0.30  # 30% tool failure rate triggers nudge
+    DOOM_LOOP_SAME_FILE_EDITS = 5  # editing same file this many times triggers nudge
+    DOOM_LOOP_MAX_TURNS = 60  # this many turns without idle triggers nudge
 
     def __init__(self) -> None:
         self.sdk_client: _CopilotClient | None = None
@@ -58,6 +67,12 @@ class AgentState:
         self.turns_since_enqueue: int = 0
         self.enqueue_time: float = 0.0
         self.pending_messages: list[str] = []  # stored content for check_messages tool
+        # Doom loop detection
+        self.task_start_time: float = 0.0  # monotonic time of first turn after idle
+        self.consecutive_turns: int = 0
+        self.tool_failures: int = 0
+        self.recent_edit_targets: list[str] = []
+        self.doom_loop_nudged: bool = False
 
 
 def setup_session_listener(
@@ -202,6 +217,9 @@ def setup_session_listener(
                 },
                 reply_to=reply_to,
             )))
+            # Track edit targets for doom loop detection
+            if agent_state and tool_name in ("edit", "create") and detail:
+                agent_state.recent_edit_targets.append(detail)
 
         elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
             _set_phase("thinking")  # back to thinking between tools
@@ -222,6 +240,9 @@ def setup_session_listener(
                 },
                 reply_to=reply_to,
             )))
+            # Track tool failures for doom loop detection
+            if agent_state and not success:
+                agent_state.tool_failures += 1
 
         elif etype == SessionEventType.SUBAGENT_STARTED:
             agent_name = getattr(data, "name", None) or getattr(data, "agent_name", "") or "sub-agent"
@@ -256,6 +277,38 @@ def setup_session_listener(
                 payload={"turn_id": str(turn_id), "in_reply_to": reply_to},
                 reply_to=reply_to,
             )))
+
+            if agent_state:
+                # Doom loop tracking: count turns and check for stuck patterns
+                if agent_state.task_start_time == 0.0:
+                    agent_state.task_start_time = time.monotonic()
+                agent_state.consecutive_turns += 1
+
+                # Doom loop detection (only once per task)
+                if not agent_state.doom_loop_nudged and agent_state.task_start_time > 0:
+                    task_elapsed = time.monotonic() - agent_state.task_start_time
+                    if task_elapsed >= AgentState.DOOM_LOOP_TIME_GATE:
+                        turns = agent_state.consecutive_turns
+                        failures = agent_state.tool_failures
+                        from collections import Counter
+                        edit_counts = Counter(agent_state.recent_edit_targets)
+                        top_file_edits = edit_counts.most_common(1)[0][1] if edit_counts else 0
+
+                        doom_signal = (
+                            (turns > 0 and failures / turns > AgentState.DOOM_LOOP_FAILURE_RATE)
+                            or top_file_edits >= AgentState.DOOM_LOOP_SAME_FILE_EDITS
+                            or turns >= AgentState.DOOM_LOOP_MAX_TURNS
+                        )
+                        if doom_signal:
+                            agent_state.doom_loop_nudged = True
+                            print(
+                                f"[agent] Doom loop detected "
+                                f"(turns={turns}, failures={failures}, "
+                                f"top_edits={top_file_edits}, "
+                                f"elapsed={task_elapsed:.0f}s)",
+                                file=sys.stderr,
+                            )
+
             # Check if a pending user message needs to interrupt this work
             if agent_state and agent_state.pending_interrupt:
                 agent_state.turns_since_enqueue += 1
@@ -349,6 +402,12 @@ def setup_session_listener(
                     agent_state.pending_interrupt = False
                     agent_state.turns_since_enqueue = 0
                     agent_state.pending_messages.clear()
+                    # Reset doom loop tracking for next task
+                    agent_state.task_start_time = 0.0
+                    agent_state.consecutive_turns = 0
+                    agent_state.tool_failures = 0
+                    agent_state.recent_edit_targets.clear()
+                    agent_state.doom_loop_nudged = False
             else:
                 # Log truly unhandled events for diagnostics
                 print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
@@ -849,6 +908,42 @@ async def try_init_copilot(
                         "Please wrap up your current step and respond — "
                         "the message will be delivered when you finish. "
                         "Or call check_messages to see a preview."
+                    ),
+                )
+
+            # 🔄 Doom loop detection: nudge the agent to step back
+            if (agent_state is not None
+                    and agent_state.doom_loop_nudged
+                    and not agent_state.pending_interrupt):
+                # One-shot: clear the flag so we don't nag on every tool call
+                agent_state.doom_loop_nudged = False
+                turns = agent_state.consecutive_turns
+                minutes = int(
+                    (time.monotonic() - agent_state.task_start_time) / 60
+                ) if agent_state.task_start_time > 0 else 0
+                return PermissionRequestResult(
+                    kind="denied-interactively-by-user",
+                    message=(
+                        f"[Agent framework] Sorry to interrupt but you've been "
+                        f"at this for a while ({turns} turns, {minutes}min). "
+                        f"Let's take a step back and list out:\n\n"
+                        f"• What are we trying to solve here?\n"
+                        f"• What have we tried so far, and what were the results?\n"
+                        f"• What do we KNOW? What are the anchoring and key "
+                        f"pieces of information?\n"
+                        f"• What information do we NOT have that would help us "
+                        f"fill in gaps?\n"
+                        f"• Do we need new tools to develop a better "
+                        f"understanding?\n\n"
+                        f"If you know what needs doing and you're working on it, "
+                        f"please continue, but if you're lacking information and "
+                        f"struggling to make progress, use this as an opportunity "
+                        f"to take stock. Also consider:\n\n"
+                        f"• Revert to a known-good state and try a fundamentally "
+                        f"different approach\n"
+                        f"• Ask the user for their opinion and experience\n"
+                        f"• Call `consult_panel` to get a second opinion from a "
+                        f"panel of expert agents"
                     ),
                 )
 
@@ -2327,6 +2422,86 @@ async def try_init_copilot(
             },
         )
         custom_tools.append(nix_shell_tool)
+
+        # Custom tool: consult_panel — get second opinions from expert sub-agents
+        async def _consult_panel_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            problem = args.get("problem_description", "").strip()
+            if not problem:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: please provide a detailed 'problem_description' "
+                        "explaining what you're trying to solve, what you've tried, "
+                        "and where you're stuck."
+                    ),
+                    result_type="error",
+                )
+            expert_prompt = (
+                "You are an expert consultant helping a fellow engineer who is stuck. "
+                "They will describe a technical problem they're facing. Provide:\n\n"
+                "1. Your analysis of the root cause\n"
+                "2. Key information they may be overlooking\n"
+                "3. Concrete alternative approaches to try\n"
+                "4. Any diagnostic steps that could clarify the situation\n\n"
+                "Be direct, practical, and specific. Don't repeat what they already know.\n\n"
+                "--- Problem Description ---\n"
+                f"{problem}"
+            )
+            return ToolResult(
+                text_result_for_llm=(
+                    "To consult the expert panel, fire these sub-agents in parallel "
+                    "using the `task` tool:\n\n"
+                    "**Agent 1 — Claude Opus 4.6:**\n"
+                    "```\n"
+                    f'task(name="expert-a", agent_type="general-purpose", '
+                    f'model="claude-opus-4.6", mode="background", '
+                    f'prompt={repr(expert_prompt)})\n'
+                    "```\n\n"
+                    "**Agent 2 — Claude Opus 4.6 (second opinion):**\n"
+                    "```\n"
+                    f'task(name="expert-b", agent_type="general-purpose", '
+                    f'model="claude-opus-4.6", mode="background", '
+                    f'prompt={repr(expert_prompt)})\n'
+                    "```\n\n"
+                    "**Agent 3 — GPT-5.2:**\n"
+                    "```\n"
+                    f'task(name="expert-c", agent_type="general-purpose", '
+                    f'model="gpt-5.2", mode="background", '
+                    f'prompt={repr(expert_prompt)})\n'
+                    "```\n\n"
+                    "Launch all three, then use `read_agent` to collect their "
+                    "responses. Synthesize the best ideas from each expert into "
+                    "your approach."
+                ),
+            )
+
+        consult_panel_tool = Tool(
+            name="consult_panel",
+            description=(
+                "Get a second opinion from a panel of expert agents when stuck on "
+                "a difficult problem. Provide a detailed description of the problem, "
+                "what you've tried, and where you're stuck. Returns instructions to "
+                "fire multiple sub-agents with different AI models for diverse "
+                "perspectives."
+            ),
+            handler=_consult_panel_handler,
+            skip_permission=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "problem_description": {
+                        "type": "string",
+                        "description": (
+                            "Detailed description of the problem: what you're trying "
+                            "to solve, what approaches you've tried, what error messages "
+                            "or symptoms you're seeing, and where you're stuck."
+                        ),
+                    },
+                },
+                "required": ["problem_description"],
+            },
+        )
+        custom_tools.append(consult_panel_tool)
 
         # ── Load plugin tools ──
         try:

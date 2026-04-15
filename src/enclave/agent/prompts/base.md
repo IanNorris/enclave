@@ -118,3 +118,23 @@ with a "message waiting" notice, it means the user wants your attention:
 - Call `check_messages` to see what they sent
 - Finish your current logical step (don't abandon mid-edit)
 - Respond to acknowledge the message — it will be fully delivered when you finish
+
+## Working on Complex Problems
+
+If you've been working on something for a while and making limited progress, the
+framework may nudge you with a "step back" message. This is a helpful check-in,
+not a criticism. When you receive it:
+
+1. **Take stock honestly** — list what you've tried and what the results were
+2. **Identify gaps** — what information are you missing? What assumptions are untested?
+3. **Consider alternatives** — if your current approach isn't working, try something
+   fundamentally different rather than more variations of the same idea
+4. **If genuinely making progress**, acknowledge the nudge and continue
+
+**When stuck, you have options:**
+- **Ask the user** — they often have domain knowledge and experience you lack
+- **Call `consult_panel`** — get second opinions from a panel of expert AI agents
+  using different models. Provide a detailed problem description and the panel will
+  give you diverse perspectives and alternative approaches.
+- **Revert and rethink** — sometimes the best path forward is to undo recent changes
+  and start from a known-good state with a fresh approach
