@@ -593,6 +593,7 @@ async def _recover_sdk_session(state: AgentState) -> bool:
                 working_directory=state.working_directory,
                 ipc=state.ipc,
                 existing_client=old_client,
+                agent_state=state,
             )
             if result:
                 state.sdk_client, state.sdk_session = result
@@ -620,6 +621,7 @@ async def _recover_sdk_session(state: AgentState) -> bool:
         result = await try_init_copilot(
             working_directory=state.working_directory,
             ipc=state.ipc,
+            agent_state=state,
         )
         if result:
             state.sdk_client, state.sdk_session = result
@@ -768,6 +770,7 @@ async def try_init_copilot(
     working_directory: str = "/workspace",
     ipc: IPCClient | None = None,
     existing_client: _CopilotClient | None = None,
+    agent_state: AgentState | None = None,
 ) -> tuple[_CopilotClient, _CopilotSession] | None:
     """Try to initialize the Copilot SDK.
 
@@ -836,7 +839,8 @@ async def try_init_copilot(
         # Permission handler: screens SDK tool requests for host profile
         def perm_handler(_req: object, _meta: object) -> PermissionRequestResult:
             # ☕ Coffee break: nudge the agent if a user message is waiting
-            if (agent_state.pending_interrupt
+            if (agent_state is not None
+                    and agent_state.pending_interrupt
                     and agent_state.turns_since_enqueue >= AgentState.NUDGE_TURNS):
                 return PermissionRequestResult(
                     kind="denied-interactively-by-user",
@@ -2418,6 +2422,7 @@ async def main() -> None:
 
     sdk_result = await try_init_copilot(
         working_directory=state.working_directory, ipc=ipc,
+        agent_state=state,
     )
     if sdk_result:
         state.sdk_client, state.sdk_session = sdk_result
