@@ -142,6 +142,9 @@ class MessageRouter:
         # Used for profile selection polls (and potentially other non-approval polls)
         self._generic_polls: dict[str, tuple[asyncio.Event, list[str]]] = {}
 
+        # ask_user polls: poll_event_id → session_id
+        self._ask_user_polls: dict[str, str] = {}
+
         # Rooms waiting for a user to join before sending queued messages
         # room_id → list of message strings to send once the user joins
         self._awaiting_join: dict[str, list[str]] = {}
@@ -889,10 +892,12 @@ class MessageRouter:
                     f"{mention_plain}: {question}" if mention_plain
                     else question
                 )
-                await self.matrix.send_poll(
+                poll_eid = await self.matrix.send_poll(
                     session.room_id, tagged_q, answers,
                     thread_event_id=thread_id,
                 )
+                if poll_eid:
+                    self._ask_user_polls[poll_eid] = session.id
             else:
                 plain = (
                     f"❓ {mention_plain}: {question}" if mention_plain
@@ -1945,6 +1950,25 @@ class MessageRouter:
             if answer_ids:
                 result.append(answer_ids[0])
             event.set()
+            return
+
+        # ask_user polls — forward the selected answer to the agent
+        ask_session_id = self._ask_user_polls.pop(poll_event_id, None)
+        if ask_session_id is not None:
+            answer_text = answer_ids[0] if answer_ids else "(no selection)"
+            log.info(
+                "Poll answer from %s for %s: %s",
+                sender, ask_session_id, answer_text,
+            )
+            await self.ipc.send_to(ask_session_id, Message(
+                type=MessageType.USER_MESSAGE,
+                payload={
+                    "content": answer_text,
+                    "sender": sender,
+                    "room_id": room_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            ))
             return
 
         request_id, scope, needs_pattern = self._approval.handle_poll_response(
