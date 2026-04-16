@@ -106,6 +106,18 @@ class EnclaveMatrixClient:
             config=config,
         )
 
+        # Global send throttle — serialises all room_send calls and
+        # enforces a minimum interval between them to stay under the
+        # Synapse rate limit (default rc_message: 0.2/s, burst 10).
+        self._send_lock = asyncio.Lock()
+        self._last_send: float = 0.0
+        # Minimum seconds between consecutive room_send calls.
+        # Synapse sustains ~1 msg/5s; we aim for headroom.
+        self._min_send_interval: float = 1.0
+        # When we hit a 429, back off to this interval temporarily
+        self._backoff_interval: float = 6.0
+        self._rate_limited_until: float = 0.0
+
         self._message_handlers: list[MatrixMessageHandler] = []
         self._join_handlers: list[MatrixJoinHandler] = []
         self._reaction_handlers: list[MatrixReactionHandler] = []
@@ -253,6 +265,51 @@ class EnclaveMatrixClient:
         """Signal the sync loop to stop."""
         self._syncing = False
 
+    async def _throttled_room_send(
+        self,
+        room_id: str,
+        message_type: str,
+        content: dict[str, Any],
+    ) -> RoomSendResponse | Any:
+        """Send an event through the global rate-limit gate.
+
+        Serialises all room_send calls and enforces a minimum interval
+        between them.  When we detect a 429, increases the interval
+        temporarily so we drain the backlog without cascading retries.
+        """
+        async with self._send_lock:
+            now = time.monotonic()
+            # Use backoff interval if we recently hit a 429
+            interval = (
+                self._backoff_interval
+                if now < self._rate_limited_until
+                else self._min_send_interval
+            )
+            wait = interval - (now - self._last_send)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            resp = await self.client.room_send(
+                room_id=room_id,
+                message_type=message_type,
+                content=content,
+            )
+            self._last_send = time.monotonic()
+
+            # Detect 429 from nio's transport response (it retries
+            # internally but we still see the delay).  If the call
+            # took much longer than expected, assume rate-limiting.
+            elapsed = self._last_send - (now + max(wait, 0))
+            if elapsed > 3.0:
+                self._rate_limited_until = self._last_send + 30.0
+                log.warning(
+                    "Probable rate-limit (send took %.1fs), "
+                    "backing off for 30s",
+                    elapsed,
+                )
+
+            return resp
+
     async def send_message(
         self,
         room_id: str,
@@ -291,7 +348,7 @@ class EnclaveMatrixClient:
                 "m.in_reply_to": {"event_id": thread_event_id},
             }
 
-        resp = await self.client.room_send(
+        resp = await self._throttled_room_send(
             room_id=room_id,
             message_type="m.room.message",
             content=content,
@@ -340,7 +397,7 @@ class EnclaveMatrixClient:
     ) -> str | None:
         """React to a message with an emoji."""
         await self._ensure_keys_for_room(room_id)
-        resp = await self.client.room_send(
+        resp = await self._throttled_room_send(
             room_id=room_id,
             message_type="m.reaction",
             content={
@@ -398,7 +455,7 @@ class EnclaveMatrixClient:
                 "m.in_reply_to": {"event_id": thread_event_id},
             }
 
-        resp = await self.client.room_send(
+        resp = await self._throttled_room_send(
             room_id=room_id,
             message_type="org.matrix.msc3381.poll.start",
             content=content,
@@ -418,7 +475,7 @@ class EnclaveMatrixClient:
     ) -> str | None:
         """End/close a poll."""
         await self._ensure_keys_for_room(room_id)
-        resp = await self.client.room_send(
+        resp = await self._throttled_room_send(
             room_id=room_id,
             message_type="org.matrix.msc3381.poll.end",
             content={
@@ -492,7 +549,7 @@ class EnclaveMatrixClient:
             },
         }
 
-        resp = await self.client.room_send(
+        resp = await self._throttled_room_send(
             room_id=room_id,
             message_type="m.room.message",
             content=content,
@@ -996,7 +1053,7 @@ class EnclaveMatrixClient:
                 },
             }
 
-            send_resp = await self.client.room_send(
+            send_resp = await self._throttled_room_send(
                 room_id=room_id,
                 message_type="m.room.message",
                 content=content,
