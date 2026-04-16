@@ -932,8 +932,18 @@ class MessageRouter:
         if not content:
             return
 
-        # Thinking stream is done once response content starts
-        self._thinking_stream.pop(session.id, None)
+        # Thinking stream is done once response content starts — finalize it
+        thinking_stream = self._thinking_stream.pop(session.id, None)
+        if thinking_stream and thinking_stream.get("event_id") and thinking_stream.get("content"):
+            preview = thinking_stream["content"].replace("\n", " ")
+            if len(preview) > 800:
+                preview = preview[:800] + "…"
+            plain = f"🤔 {preview}"
+            html = f"🤔 <i>{_html_escape(preview)}</i>"
+            await self.matrix.edit_message(
+                session.room_id, thinking_stream["event_id"],
+                plain, html_body=html,
+            )
 
         thread_id = self._thread_events.get(session.id)
         stream = self._streaming.get(session.id)
@@ -955,6 +965,9 @@ class MessageRouter:
                 "content": content,
             }
         else:
+            # Only accept longer content (handles out-of-order IPC delivery)
+            if len(content) < len(stream.get("content", "")):
+                return
             stream["content"] = content
             # Throttle edits
             if now - stream["last_edit"] >= _EDIT_THROTTLE and stream.get("event_id"):
@@ -992,8 +1005,9 @@ class MessageRouter:
             preview = thinking.replace("\n", " ")
             if len(preview) > 800:
                 preview = preview[:800] + "…"
-            plain = f"🤔 {preview}"
-            html = f"🤔 <i>{_html_escape(preview)}</i>"
+            # Trailing 🤔 as "still thinking" indicator (like ▍ cursor)
+            plain = f"🤔 {preview} 🤔"
+            html = f"🤔 <i>{_html_escape(preview)}</i> 🤔"
 
             if stream is None:
                 # First thinking chunk — detach activity message and create new one
@@ -1010,6 +1024,9 @@ class MessageRouter:
                     "content": thinking,
                 }
             else:
+                # Only accept longer content (handles out-of-order IPC delivery)
+                if len(thinking) < len(stream.get("content", "")):
+                    return
                 stream["content"] = thinking
                 if now - stream["last_edit"] >= _EDIT_THROTTLE and stream.get("event_id"):
                     await self.matrix.edit_message(
@@ -1030,7 +1047,7 @@ class MessageRouter:
             log.debug("Agent %s reasoning: %s", session.id, preview[:80])
             plain = f"🤔 {preview}"
             html = f"🤔 <i>{_html_escape(preview)}</i>"
-            # If we have a thinking stream, edit it with the final text
+            # If we have a thinking stream, edit it with the final text (no trailing 🤔)
             stream = self._thinking_stream.pop(session.id, None)
             if stream and stream.get("event_id"):
                 await self.matrix.edit_message(

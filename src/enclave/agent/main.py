@@ -165,11 +165,12 @@ def setup_session_listener(
             _set_phase("thinking")
             delta = getattr(data, "delta_content", None) or ""
             if delta:
+                accumulated_thinking.append(delta)
+                full = "".join(accumulated_thinking)
                 _fire_and_forget(ipc.send(Message(
                     type=MessageType.AGENT_THINKING,
                     payload={
-                        "reasoning_delta": delta,
-                        "reasoning_id": getattr(data, "reasoning_id", None) or "",
+                        "thinking_content": full,
                         "in_reply_to": reply_to,
                     },
                     reply_to=reply_to,
@@ -469,28 +470,13 @@ def setup_session_listener(
                             10.0, _fire_continue,
                         )
             else:
-                # Handle streaming_delta (phase-based thinking/response chunks)
-                if etype_str == "assistant.streaming_delta":
-                    phase = getattr(data, "phase", None)
-                    delta = getattr(data, "delta_content", None) or ""
-                    if phase == "thinking" and delta:
-                        _set_phase("thinking")
-                        accumulated_thinking.append(delta)
-                        full = "".join(accumulated_thinking)
-                        _fire_and_forget(ipc.send(Message(
-                            type=MessageType.AGENT_THINKING,
-                            payload={
-                                "thinking_content": full,
-                                "in_reply_to": reply_to,
-                            },
-                            reply_to=reply_to,
-                        )))
-                elif etype_str not in (
+                if etype_str not in (
                     "session.tools_updated", "user.message",
                     "session.usage_info", "permission.requested",
                     "permission.completed", "session.background_tasks_changed",
                     "external_tool.requested", "external_tool.completed",
                     "pending_messages.modified", "session.idle",
+                    "assistant.streaming_delta",
                 ):
                     print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
 
