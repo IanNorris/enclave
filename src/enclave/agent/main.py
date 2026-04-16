@@ -98,6 +98,7 @@ def setup_session_listener(
     # Track the "current" user message so replies are correlated.
     current_msg_id: str | None = None
     accumulated_content: list[str] = []
+    accumulated_thinking: list[str] = []
 
     def _fire_and_forget(coro: object) -> None:
         future = asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
@@ -127,6 +128,8 @@ def setup_session_listener(
 
         if etype == SessionEventType.ASSISTANT_MESSAGE_DELTA:
             _set_phase("responding")
+            if accumulated_thinking:
+                accumulated_thinking.clear()
             delta = getattr(data, "delta_content", None) or getattr(data, "content", None) or ""
             if delta:
                 accumulated_content.append(delta)
@@ -277,6 +280,7 @@ def setup_session_listener(
 
         elif etype == SessionEventType.ASSISTANT_TURN_START:
             _set_phase("thinking", active=True)
+            accumulated_thinking.clear()
             # Cancel any pending auto-continue — agent is actively working
             if agent_state and agent_state.auto_continue_handle is not None:
                 agent_state.auto_continue_handle.cancel()
@@ -465,8 +469,30 @@ def setup_session_listener(
                             10.0, _fire_continue,
                         )
             else:
-                # Log truly unhandled events for diagnostics
-                print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
+                # Handle streaming_delta (phase-based thinking/response chunks)
+                if etype_str == "assistant.streaming_delta":
+                    phase = getattr(data, "phase", None)
+                    delta = getattr(data, "delta_content", None) or ""
+                    if phase == "thinking" and delta:
+                        _set_phase("thinking")
+                        accumulated_thinking.append(delta)
+                        full = "".join(accumulated_thinking)
+                        _fire_and_forget(ipc.send(Message(
+                            type=MessageType.AGENT_THINKING,
+                            payload={
+                                "thinking_content": full,
+                                "in_reply_to": reply_to,
+                            },
+                            reply_to=reply_to,
+                        )))
+                elif etype_str not in (
+                    "session.tools_updated", "user.message",
+                    "session.usage_info", "permission.requested",
+                    "permission.completed", "session.background_tasks_changed",
+                    "external_tool.requested", "external_tool.completed",
+                    "pending_messages.modified", "session.idle",
+                ):
+                    print(f"[agent] Unhandled event: {etype_str}", file=sys.stderr)
 
     def set_current_msg(msg_id: str | None) -> None:
         nonlocal current_msg_id
@@ -2786,6 +2812,7 @@ async def try_init_copilot(
                     working_directory=working_directory,
                     tools=custom_tools,
                     infinite_sessions=infinite_sessions_config,
+                    streaming=True,
                 )
                 print(f"[agent] Session resumed: {last_id}", file=sys.stderr)
                 await _configure_model(session)
@@ -2800,6 +2827,7 @@ async def try_init_copilot(
             working_directory=working_directory,
             tools=custom_tools,
             infinite_sessions=infinite_sessions_config,
+            streaming=True,
         )
         await _configure_model(session)
         return (client, session)

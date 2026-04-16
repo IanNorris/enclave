@@ -108,6 +108,9 @@ class MessageRouter:
         # Key: session_id, Value: dict with streaming context
         self._streaming: dict[str, dict[str, Any]] = {}
 
+        # Thinking stream state: session_id → {event_id, last_edit, content}
+        self._thinking_stream: dict[str, dict[str, Any]] = {}
+
         # Activity status message per session (editable tool/thinking display)
         self._activity_msg: dict[str, str] = {}  # session_id → Matrix event_id
         # Accumulated activity lines per session (appended, not replaced)
@@ -929,6 +932,9 @@ class MessageRouter:
         if not content:
             return
 
+        # Thinking stream is done once response content starts
+        self._thinking_stream.pop(session.id, None)
+
         thread_id = self._thread_events.get(session.id)
         stream = self._streaming.get(session.id)
         now = time.monotonic()
@@ -977,20 +983,65 @@ class MessageRouter:
             await self._update_activity(session, plain, thread_id, html=html)
             return
 
-        # Full reasoning text (complete thinking block) — send as its own
-        # message so it doesn't get swallowed by the activity throttle.
+        # Accumulated thinking content (streaming edit-in-place)
+        thinking = msg.payload.get("thinking_content", "")
+        if thinking:
+            stream = self._thinking_stream.get(session.id)
+            now = time.monotonic()
+            # Collapse to single line for display, truncate
+            preview = thinking.replace("\n", " ")
+            if len(preview) > 800:
+                preview = preview[:800] + "…"
+            plain = f"🤔 {preview}"
+            html = f"🤔 <i>{_html_escape(preview)}</i>"
+
+            if stream is None:
+                # First thinking chunk — detach activity message and create new one
+                self._activity_msg.pop(session.id, None)
+                self._activity_lines.pop(session.id, None)
+                event_id = await self.matrix.send_message(
+                    session.room_id, plain,
+                    html_body=html,
+                    thread_event_id=thread_id,
+                )
+                self._thinking_stream[session.id] = {
+                    "event_id": event_id,
+                    "last_edit": now,
+                    "content": thinking,
+                }
+            else:
+                stream["content"] = thinking
+                if now - stream["last_edit"] >= _EDIT_THROTTLE and stream.get("event_id"):
+                    await self.matrix.edit_message(
+                        session.room_id,
+                        stream["event_id"],
+                        plain,
+                        html_body=html,
+                    )
+                    stream["last_edit"] = now
+            return
+
+        # Full reasoning text (complete thinking block)
         reasoning = msg.payload.get("reasoning", "")
         if reasoning:
             preview = reasoning[:500].replace("\n", " ")
             if len(reasoning) > 500:
                 preview += "…"
             log.debug("Agent %s reasoning: %s", session.id, preview[:80])
-            plain = f"🧠 {preview}"
-            html = f"🧠 <i>{_html_escape(preview)}</i>"
-            await self.matrix.send_message(
-                session.room_id, plain, thread_event_id=thread_id,
-                html_body=html,
-            )
+            plain = f"🤔 {preview}"
+            html = f"🤔 <i>{_html_escape(preview)}</i>"
+            # If we have a thinking stream, edit it with the final text
+            stream = self._thinking_stream.pop(session.id, None)
+            if stream and stream.get("event_id"):
+                await self.matrix.edit_message(
+                    session.room_id, stream["event_id"],
+                    plain, html_body=html,
+                )
+            else:
+                await self.matrix.send_message(
+                    session.room_id, plain, thread_event_id=thread_id,
+                    html_body=html,
+                )
             return
 
         # Streaming reasoning delta — show via activity (transient)
@@ -998,8 +1049,8 @@ class MessageRouter:
         if delta:
             preview = delta.strip()[:150].replace("\n", " ")
             if preview:
-                plain = f"🧠 …{preview}"
-                html = f"🧠 <i>…{_html_escape(preview)}</i>"
+                plain = f"🤔 …{preview}"
+                html = f"🤔 <i>…{_html_escape(preview)}</i>"
                 await self._update_activity(session, plain, thread_id, html=html)
 
     # Friendly display names for common SDK tools
@@ -1368,6 +1419,7 @@ class MessageRouter:
 
         # If we have a streaming message, edit it with final content.
         # Otherwise, send a new message.
+        self._thinking_stream.pop(session.id, None)
         stream = self._streaming.pop(session.id, None)
         if stream and stream.get("event_id"):
             await self.matrix.edit_message(
@@ -2087,6 +2139,7 @@ class MessageRouter:
         """Called when an agent disconnects."""
         # Clean up streaming state
         self._streaming.pop(session_id, None)
+        self._thinking_stream.pop(session_id, None)
         # Cancel pending activity flush and clean up tracking
         task = self._activity_flush_tasks.pop(session_id, None)
         if task and not task.done():
