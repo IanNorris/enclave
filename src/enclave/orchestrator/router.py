@@ -46,7 +46,7 @@ from enclave.orchestrator.control import ControlServer
 log = get_logger("router")
 
 # Minimum interval between Matrix message edits (seconds)
-_EDIT_THROTTLE = 1.5
+_EDIT_THROTTLE = 5.0
 
 # Max length for accumulated activity messages before starting a new one
 _MAX_ACTIVITY_LEN = 3500
@@ -111,10 +111,15 @@ class MessageRouter:
         # Thinking stream state: session_id → {event_id, last_edit, content}
         self._thinking_stream: dict[str, dict[str, Any]] = {}
 
-        # Per-session locks for serializing stream operations.
+        # Per-session locks for serializing the initial message creation.
         # IPC messages arrive as concurrent asyncio tasks; without a lock
         # multiple tasks can race to create the initial Matrix message.
         self._stream_locks: dict[str, asyncio.Lock] = {}
+
+        # Timer-based flush tasks for streaming edits.
+        # Instead of every IPC task trying to edit, tasks just update the
+        # stream dict and a single periodic timer does the actual Matrix edit.
+        self._stream_flush_tasks: dict[str, asyncio.Task] = {}  # session_id → Task
 
         # Activity status message per session (editable tool/thinking display)
         self._activity_msg: dict[str, str] = {}  # session_id → Matrix event_id
@@ -936,16 +941,103 @@ class MessageRouter:
             self._stream_locks[session_id] = lock
         return lock
 
+    def _flush_key(self, session_id: str, thinking: bool = False) -> str:
+        return f"{session_id}:thinking" if thinking else session_id
+
+    def _schedule_stream_flush(
+        self, session_id: str, thinking: bool = False
+    ) -> None:
+        """Schedule a deferred edit for the streaming/thinking message.
+
+        Only one flush timer per stream per session is active at a time.
+        The timer fires after _EDIT_THROTTLE seconds, reads the current
+        content from the stream dict, and performs a single Matrix edit.
+        """
+        key = self._flush_key(session_id, thinking)
+        if key in self._stream_flush_tasks:
+            return  # Timer already scheduled
+        task = asyncio.create_task(
+            self._do_stream_flush(session_id, thinking)
+        )
+        self._stream_flush_tasks[key] = task
+
+    def _cancel_stream_flush(
+        self, session_id: str, thinking: bool = False
+    ) -> None:
+        key = self._flush_key(session_id, thinking)
+        task = self._stream_flush_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _do_stream_flush(
+        self, session_id: str, thinking: bool
+    ) -> None:
+        """Wait for the throttle interval, then edit the Matrix message."""
+        try:
+            await asyncio.sleep(_EDIT_THROTTLE)
+        except asyncio.CancelledError:
+            return
+        finally:
+            key = self._flush_key(session_id, thinking)
+            self._stream_flush_tasks.pop(key, None)
+
+        session = self.sessions.get_session(session_id) or self.containers.get_session(session_id)
+        if session is None:
+            return
+
+        stream = (self._thinking_stream if thinking else self._streaming).get(session_id)
+        if not stream or not stream.get("event_id"):
+            return
+
+        content = stream.get("content", "")
+        if not content:
+            return
+
+        now = time.monotonic()
+        if thinking:
+            preview = content.replace("\n", " ")
+            if len(preview) > 800:
+                preview = preview[:800] + "…"
+            plain = f"🤔 {preview} 🤔"
+            html = f"🤔 <i>{_html_escape(preview)}</i> 🤔"
+            await self.matrix.edit_message(
+                session.room_id, stream["event_id"],
+                plain, html_body=html,
+            )
+        else:
+            await self.matrix.edit_message(
+                session.room_id, stream["event_id"],
+                content + " ▍",
+            )
+        stream["last_edit"] = now
+
     async def _handle_agent_delta(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle a streaming text delta — create or edit a Matrix message."""
+        """Handle a streaming text delta — update content, flush via timer."""
         content = msg.payload.get("content", "")
         if not content:
             return
 
+        stream = self._streaming.get(session.id)
+        if stream is not None:
+            # Fast path (no lock): just update content if longer
+            if len(content) > len(stream.get("content", "")):
+                stream["content"] = content
+                self._schedule_stream_flush(session.id)
+            return
+
+        # Slow path: need to create the initial message (lock to prevent dupes)
         async with self._get_stream_lock(session.id):
-            # Thinking stream is done once response content starts — finalize it
+            # Double-check after acquiring lock
+            stream = self._streaming.get(session.id)
+            if stream is not None:
+                if len(content) > len(stream.get("content", "")):
+                    stream["content"] = content
+                    self._schedule_stream_flush(session.id)
+                return
+
+            # Finalize thinking stream now that response is starting
             thinking_stream = self._thinking_stream.pop(session.id, None)
             if thinking_stream and thinking_stream.get("event_id") and thinking_stream.get("content"):
                 preview = thinking_stream["content"].replace("\n", " ")
@@ -957,39 +1049,23 @@ class MessageRouter:
                     session.room_id, thinking_stream["event_id"],
                     plain, html_body=html,
                 )
+            # Cancel any thinking flush timer
+            self._cancel_stream_flush(session.id, thinking=True)
 
             thread_id = self._thread_events.get(session.id)
-            stream = self._streaming.get(session.id)
-            now = time.monotonic()
-
-            if stream is None:
-                # First delta — detach activity message (keep in chat) and start streaming
-                self._activity_msg.pop(session.id, None)
-                self._activity_lines.pop(session.id, None)
-                # Send a new message as placeholder
-                event_id = await self.matrix.send_message(
-                    session.room_id,
-                    content + " ▍",
-                    thread_event_id=thread_id,
-                )
-                self._streaming[session.id] = {
-                    "event_id": event_id,
-                    "last_edit": now,
-                    "content": content,
-                }
-            else:
-                # Only accept longer content (handles out-of-order IPC delivery)
-                if len(content) < len(stream.get("content", "")):
-                    return
-                stream["content"] = content
-                # Throttle edits
-                if now - stream["last_edit"] >= _EDIT_THROTTLE and stream.get("event_id"):
-                    await self.matrix.edit_message(
-                        session.room_id,
-                        stream["event_id"],
-                        content + " ▍",
-                    )
-                    stream["last_edit"] = now
+            self._activity_msg.pop(session.id, None)
+            self._activity_lines.pop(session.id, None)
+            event_id = await self.matrix.send_message(
+                session.room_id,
+                content + " ▍",
+                thread_event_id=thread_id,
+            )
+            self._streaming[session.id] = {
+                "event_id": event_id,
+                "last_edit": time.monotonic(),
+                "content": content,
+            }
+            self._schedule_stream_flush(session.id)
 
     async def _handle_agent_thinking(
         self, session: Session, msg: Message
@@ -1012,49 +1088,48 @@ class MessageRouter:
         # Accumulated thinking content (streaming edit-in-place)
         thinking = msg.payload.get("thinking_content", "")
         if thinking:
+            stream = self._thinking_stream.get(session.id)
+            if stream is not None:
+                # Fast path: just update content if longer
+                if len(thinking) > len(stream.get("content", "")):
+                    stream["content"] = thinking
+                    self._schedule_stream_flush(session.id, thinking=True)
+                return
+
+            # Slow path: create initial thinking message (lock to prevent dupes)
             async with self._get_stream_lock(session.id):
                 stream = self._thinking_stream.get(session.id)
-                now = time.monotonic()
-                # Collapse to single line for display, truncate
+                if stream is not None:
+                    if len(thinking) > len(stream.get("content", "")):
+                        stream["content"] = thinking
+                        self._schedule_stream_flush(session.id, thinking=True)
+                    return
+
+                self._activity_msg.pop(session.id, None)
+                self._activity_lines.pop(session.id, None)
                 preview = thinking.replace("\n", " ")
                 if len(preview) > 800:
                     preview = preview[:800] + "…"
-                # Trailing 🤔 as "still thinking" indicator (like ▍ cursor)
                 plain = f"🤔 {preview} 🤔"
                 html = f"🤔 <i>{_html_escape(preview)}</i> 🤔"
-
-                if stream is None:
-                    # First thinking chunk — detach activity message and create new one
-                    self._activity_msg.pop(session.id, None)
-                    self._activity_lines.pop(session.id, None)
-                    event_id = await self.matrix.send_message(
-                        session.room_id, plain,
-                        html_body=html,
-                        thread_event_id=thread_id,
-                    )
-                    self._thinking_stream[session.id] = {
-                        "event_id": event_id,
-                        "last_edit": now,
-                        "content": thinking,
-                    }
-                else:
-                    # Only accept longer content (handles out-of-order IPC delivery)
-                    if len(thinking) < len(stream.get("content", "")):
-                        return
-                    stream["content"] = thinking
-                    if now - stream["last_edit"] >= _EDIT_THROTTLE and stream.get("event_id"):
-                        await self.matrix.edit_message(
-                            session.room_id,
-                            stream["event_id"],
-                            plain,
-                            html_body=html,
-                        )
-                        stream["last_edit"] = now
+                event_id = await self.matrix.send_message(
+                    session.room_id, plain,
+                    html_body=html,
+                    thread_event_id=thread_id,
+                )
+                self._thinking_stream[session.id] = {
+                    "event_id": event_id,
+                    "last_edit": time.monotonic(),
+                    "content": thinking,
+                }
+                self._schedule_stream_flush(session.id, thinking=True)
             return
 
         # Full reasoning text (complete thinking block)
         reasoning = msg.payload.get("reasoning", "")
         if reasoning:
+            # Cancel any pending thinking flush
+            self._cancel_stream_flush(session.id, thinking=True)
             async with self._get_stream_lock(session.id):
                 preview = reasoning[:500].replace("\n", " ")
                 if len(reasoning) > 500:
@@ -1062,7 +1137,6 @@ class MessageRouter:
                 log.debug("Agent %s reasoning: %s", session.id, preview[:80])
                 plain = f"🤔 {preview}"
                 html = f"🤔 <i>{_html_escape(preview)}</i>"
-                # If we have a thinking stream, edit it with the final text (no trailing 🤔)
                 stream = self._thinking_stream.pop(session.id, None)
                 if stream and stream.get("event_id"):
                     await self.matrix.edit_message(
@@ -1451,9 +1525,11 @@ class MessageRouter:
 
         # If we have a streaming message, edit it with final content.
         # Otherwise, send a new message.
-        async with self._get_stream_lock(session.id):
-            self._thinking_stream.pop(session.id, None)
-            stream = self._streaming.pop(session.id, None)
+        # Cancel any pending flush timers first
+        self._cancel_stream_flush(session.id)
+        self._cancel_stream_flush(session.id, thinking=True)
+        self._thinking_stream.pop(session.id, None)
+        stream = self._streaming.pop(session.id, None)
         if stream and stream.get("event_id"):
             await self.matrix.edit_message(
                 session.room_id,
@@ -2170,6 +2246,9 @@ class MessageRouter:
 
     async def _on_agent_disconnect(self, session_id: str) -> None:
         """Called when an agent disconnects."""
+        # Cancel pending stream flush timers
+        self._cancel_stream_flush(session_id)
+        self._cancel_stream_flush(session_id, thinking=True)
         # Clean up streaming state
         self._streaming.pop(session_id, None)
         self._thinking_stream.pop(session_id, None)
