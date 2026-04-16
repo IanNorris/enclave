@@ -882,7 +882,7 @@ class MessageRouter:
                 await self.matrix.send_message(
                     session.room_id,
                     f"❓ {question}",
-                    thread_id=thread_id,
+                    thread_event_id=thread_id,
                 )
         else:
             log.debug(
