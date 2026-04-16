@@ -872,16 +872,39 @@ class MessageRouter:
             choices = msg.payload.get("choices") or []
             log.info("Agent %s asking user: %s", session.id, question[:80])
             thread_id = self._thread_events.get(session.id)
+            user_mxid = self._get_user_for_session(session)
+            if user_mxid:
+                display = user_mxid.split(":")[0].lstrip("@")
+                mention_plain = f"@{display}"
+                mention_html = (
+                    f'<a href="https://matrix.to/#/{user_mxid}">'
+                    f"{display}</a>"
+                )
+            else:
+                mention_plain = ""
+                mention_html = ""
             if choices:
                 answers = [(c, c) for c in choices]
+                tagged_q = (
+                    f"{mention_plain}: {question}" if mention_plain
+                    else question
+                )
                 await self.matrix.send_poll(
-                    session.room_id, question, answers,
+                    session.room_id, tagged_q, answers,
                     thread_event_id=thread_id,
                 )
             else:
+                plain = (
+                    f"❓ {mention_plain}: {question}" if mention_plain
+                    else f"❓ {question}"
+                )
+                html = (
+                    f"❓ {mention_html}: {question}" if mention_html
+                    else None
+                )
                 await self.matrix.send_message(
-                    session.room_id,
-                    f"❓ {question}",
+                    session.room_id, plain,
+                    html_body=html,
                     thread_event_id=thread_id,
                 )
         else:
