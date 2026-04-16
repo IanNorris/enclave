@@ -763,6 +763,12 @@ class MessageRouter:
                 session, resolved_attachments
             )
 
+        # Priority message: strip leading '!' and flag for immediate injection
+        priority = False
+        if body.startswith("!"):
+            body = body[1:].lstrip()
+            priority = True
+
         msg = Message(
             type=MessageType.USER_MESSAGE,
             payload={
@@ -772,6 +778,7 @@ class MessageRouter:
                 "thread_id": thread_id,
                 "attachments": resolved_attachments,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "priority": priority,
             },
         )
 

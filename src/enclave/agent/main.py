@@ -622,6 +622,7 @@ async def handle_user_message(
 
     try:
         # Smart message injection: interrupt thinking, enqueue during tools
+        priority = msg.payload.get("priority", False)
         if state.turn_active:
             if state.turn_phase == "thinking":
                 print(f"[agent] Aborting thinking to inject message", file=sys.stderr)
@@ -631,6 +632,9 @@ async def handle_user_message(
                     print(f"[agent] Abort failed (non-fatal): {e}", file=sys.stderr)
                 print(f"[agent] Sending to SDK: {content[:100]}...", file=sys.stderr)
                 await state.sdk_session.send(content, attachments=sdk_attachments)
+            elif priority:
+                print(f"[agent] PRIORITY inject (turn in {state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
+                await state.sdk_session.send(content, attachments=sdk_attachments, mode="immediate")
             else:
                 print(f"[agent] Enqueuing message (turn in {state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
                 await state.sdk_session.send(content, attachments=sdk_attachments, mode="enqueue")
