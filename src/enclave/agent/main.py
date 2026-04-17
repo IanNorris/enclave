@@ -34,7 +34,7 @@ class AgentState:
         "ipc", "loop", "working_directory",
         "turn_active", "turn_phase",
         "pending_interrupt", "turns_since_enqueue", "enqueue_time",
-        "pending_messages",
+        "pending_messages", "queued_user_messages",
         # Doom loop detection
         "task_start_time", "consecutive_turns", "tool_failures",
         "recent_edit_targets", "doom_loop_nudged",
@@ -69,6 +69,7 @@ class AgentState:
         self.turns_since_enqueue: int = 0
         self.enqueue_time: float = 0.0
         self.pending_messages: list[str] = []  # stored content for check_messages tool
+        self.queued_user_messages: list[tuple[str, list | None]] = []  # (content, attachments) batched for next turn
         # Doom loop detection
         self.task_start_time: float = 0.0  # monotonic time of first turn after idle
         self.consecutive_turns: int = 0
@@ -349,6 +350,30 @@ def setup_session_listener(
                 payload={"turn_id": str(turn_id), "in_reply_to": reply_to},
                 reply_to=reply_to,
             )))
+
+            # Flush queued user messages as a single combined message
+            if agent_state and agent_state.queued_user_messages and sdk_session:
+                queued = agent_state.queued_user_messages
+                agent_state.queued_user_messages = []
+                agent_state.pending_messages.clear()
+                agent_state.pending_interrupt = False
+
+                # Combine all queued messages into one
+                combined_parts = []
+                combined_attachments = []
+                for content, atts in queued:
+                    combined_parts.append(content)
+                    if atts:
+                        combined_attachments.extend(atts)
+                combined = "\n\n---\n\n".join(combined_parts)
+                print(f"[agent] Flushing {len(queued)} queued message(s) as one: {combined[:100]}...", file=sys.stderr)
+                try:
+                    await sdk_session.send(
+                        combined,
+                        attachments=combined_attachments or None,
+                    )
+                except Exception as e:
+                    print(f"[agent] Queued message flush failed: {e}", file=sys.stderr)
 
         elif etype == SessionEventType.SESSION_ERROR:
             err = getattr(data, "message", str(data))
@@ -636,8 +661,8 @@ async def handle_user_message(
                 print(f"[agent] PRIORITY inject (turn in {state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
                 await state.sdk_session.send(content, attachments=sdk_attachments, mode="immediate")
             else:
-                print(f"[agent] Enqueuing message (turn in {state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
-                await state.sdk_session.send(content, attachments=sdk_attachments, mode="enqueue")
+                print(f"[agent] Queuing message for end of turn ({state.turn_phase} phase): {content[:100]}...", file=sys.stderr)
+                state.queued_user_messages.append((content, sdk_attachments))
                 # Schedule nudge so the agent gets a coffee-break notification
                 state.pending_interrupt = True
                 state.turns_since_enqueue = 0
