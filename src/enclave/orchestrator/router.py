@@ -306,7 +306,20 @@ class MessageRouter:
                 content,
                 html_body=f"<i>{_html_escape(content)}</i>",
             )
-        return sent
+            return True
+
+        # Agent not connected — try to restore the session
+        stopped_session = self.containers.get_any_session_by_room(session.room_id)
+        if stopped_session and stopped_session.id not in self._restoring:
+            log.info("Control inject: restoring stopped session %s", session_id)
+            self._pending_messages.setdefault(session_id, []).append({
+                "body": content,
+                "sender": "control",
+                "room_id": session.room_id,
+            })
+            await self._restore_session(stopped_session, session.room_id)
+            return True
+        return False
 
     async def _auto_restore_sessions(self) -> None:
         """Restore sessions that were running before last shutdown/reboot.
