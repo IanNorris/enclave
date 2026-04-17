@@ -278,7 +278,8 @@ class MessageRouter:
         """Inject a user message into a session (from control socket).
 
         Also echoes the message to the agent's Matrix room so users can
-        follow the conversation.
+        follow the conversation.  Control-socket messages are always
+        treated as priority (immediate injection after current tool call).
         """
         session = self.containers.get_session(session_id)
         if not session:
@@ -292,6 +293,7 @@ class MessageRouter:
                 "thread_id": None,
                 "attachments": [],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "priority": True,
             },
         )
         sent = await self.ipc.send_to(session_id, msg)
