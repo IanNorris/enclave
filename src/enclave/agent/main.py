@@ -2622,13 +2622,13 @@ async def try_init_copilot(
                 text_result_for_llm=(
                     "To consult the expert panel, fire these sub-agents in parallel "
                     "using the `task` tool:\n\n"
-                    "**Agent 1 — Claude Opus 4.6:**\n"
+                    "**Agent 1 — Claude Opus 4.7:**\n"
                     "```\n"
                     f'task(name="expert-a", agent_type="general-purpose", '
-                    f'model="claude-opus-4.6", mode="background", '
+                    f'model="claude-opus-4.7", mode="background", '
                     f'prompt={repr(expert_prompt)})\n'
                     "```\n\n"
-                    "**Agent 2 — Claude Opus 4.6 (second opinion):**\n"
+                    "**Agent 2 — Claude Opus 4.6:**\n"
                     "```\n"
                     f'task(name="expert-b", agent_type="general-purpose", '
                     f'model="claude-opus-4.6", mode="background", '
