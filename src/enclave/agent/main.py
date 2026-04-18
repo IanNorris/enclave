@@ -909,7 +909,7 @@ def _request_permission_sync(
     return _ask()  # Returns a coroutine (Awaitable) — SDK will await it
 
 
-_TARGET_MODEL = "claude-opus-4.6"
+_TARGET_MODEL = "claude-opus-4.7"
 _REASONING_EFFORT = "medium"
 
 
