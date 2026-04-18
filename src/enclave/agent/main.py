@@ -367,13 +367,16 @@ def setup_session_listener(
                         combined_attachments.extend(atts)
                 combined = "\n\n---\n\n".join(combined_parts)
                 print(f"[agent] Flushing {len(queued)} queued message(s) as one: {combined[:100]}...", file=sys.stderr)
-                try:
-                    await sdk_session.send(
-                        combined,
-                        attachments=combined_attachments or None,
-                    )
-                except Exception as e:
-                    print(f"[agent] Queued message flush failed: {e}", file=sys.stderr)
+
+                async def _flush_queued() -> None:
+                    try:
+                        await sdk_session.send(
+                            combined,
+                            attachments=combined_attachments or None,
+                        )
+                    except Exception as e:
+                        print(f"[agent] Queued message flush failed: {e}", file=sys.stderr)
+                _fire_and_forget(_flush_queued())
 
         elif etype == SessionEventType.SESSION_ERROR:
             err = getattr(data, "message", str(data))
