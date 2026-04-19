@@ -37,7 +37,7 @@ class AgentState:
         "pending_messages", "queued_user_messages",
         # Doom loop detection
         "task_start_time", "consecutive_turns", "tool_failures",
-        "recent_edit_targets", "doom_loop_nudged",
+        "recent_edit_targets", "doom_loop_nudged_at",
         # Auto-continue lifecycle
         "task_done", "asked_user", "auto_continue_handle",
     )
@@ -49,10 +49,10 @@ class AgentState:
     MAX_TIME_BEFORE_INTERRUPT = 300.0  # 5 minutes
 
     # Doom loop detection thresholds
-    DOOM_LOOP_TIME_GATE = 900.0  # 15 minutes of continuous work before checking
+    DOOM_LOOP_TIME_GATE = 300.0  # 5 minutes of continuous work before checking
     DOOM_LOOP_FAILURE_RATE = 0.30  # 30% tool failure rate triggers nudge
     DOOM_LOOP_SAME_FILE_EDITS = 5  # editing same file this many times triggers nudge
-    DOOM_LOOP_MAX_TURNS = 60  # this many turns without idle triggers nudge
+    DOOM_LOOP_MAX_TURNS = 40  # this many turns without idle triggers nudge
 
     def __init__(self) -> None:
         self.sdk_client: _CopilotClient | None = None
@@ -75,7 +75,7 @@ class AgentState:
         self.consecutive_turns: int = 0
         self.tool_failures: int = 0
         self.recent_edit_targets: list[str] = []
-        self.doom_loop_nudged: bool = False
+        self.doom_loop_nudged_at: int = 0
         # Auto-continue lifecycle
         self.task_done: bool = False  # agent explicitly called mark_done
         self.asked_user: bool = False  # agent explicitly called ask_user
@@ -300,8 +300,8 @@ def setup_session_listener(
                     agent_state.task_start_time = time.monotonic()
                 agent_state.consecutive_turns += 1
 
-                # Doom loop detection (only once per task)
-                if not agent_state.doom_loop_nudged and agent_state.task_start_time > 0:
+                # Doom loop detection (repeats every DOOM_LOOP_MAX_TURNS)
+                if agent_state.task_start_time > 0:
                     task_elapsed = time.monotonic() - agent_state.task_start_time
                     if task_elapsed >= AgentState.DOOM_LOOP_TIME_GATE:
                         turns = agent_state.consecutive_turns
@@ -310,19 +310,41 @@ def setup_session_listener(
                         edit_counts = Counter(agent_state.recent_edit_targets)
                         top_file_edits = edit_counts.most_common(1)[0][1] if edit_counts else 0
 
+                        # Check if we've passed a nudge threshold since last nudge
+                        turns_since_nudge = turns - agent_state.doom_loop_nudged_at
                         doom_signal = (
-                            (turns > 0 and failures / turns > AgentState.DOOM_LOOP_FAILURE_RATE)
-                            or top_file_edits >= AgentState.DOOM_LOOP_SAME_FILE_EDITS
-                            or turns >= AgentState.DOOM_LOOP_MAX_TURNS
+                            turns_since_nudge >= AgentState.DOOM_LOOP_MAX_TURNS
+                            and (
+                                (turns > 0 and failures / turns > AgentState.DOOM_LOOP_FAILURE_RATE)
+                                or top_file_edits >= AgentState.DOOM_LOOP_SAME_FILE_EDITS
+                                or turns >= AgentState.DOOM_LOOP_MAX_TURNS
+                            )
                         )
                         if doom_signal:
-                            agent_state.doom_loop_nudged = True
+                            agent_state.doom_loop_nudged_at = turns
                             print(
                                 f"[agent] Doom loop detected "
                                 f"(turns={turns}, failures={failures}, "
                                 f"top_edits={top_file_edits}, "
                                 f"elapsed={task_elapsed:.0f}s)",
                                 file=sys.stderr,
+                            )
+                            # Inject a high-priority interrupt to break the loop
+                            doom_msg = (
+                                "[Enclave Coordinator — doom loop detected] You have "
+                                f"been running for {turns} turns "
+                                f"({task_elapsed/60:.0f} min) without completing or "
+                                "asking the user for help. "
+                                "STOP what you are doing and reassess:\n"
+                                "1. Call `consult_panel` with what you're trying to "
+                                "achieve and where you're stuck.\n"
+                                "2. If the panel can't help, call `ask_user()`.\n"
+                                "3. If done, call `mark_done()`.\n"
+                                "Do NOT continue your current approach without "
+                                "consulting the panel or the user first."
+                            )
+                            _fire_and_forget(
+                                sdk_session.send(doom_msg, mode="immediate")
                             )
 
             # Check if a pending user message needs to interrupt this work
@@ -460,7 +482,7 @@ def setup_session_listener(
                     agent_state.consecutive_turns = 0
                     agent_state.tool_failures = 0
                     agent_state.recent_edit_targets.clear()
-                    agent_state.doom_loop_nudged = False
+                    agent_state.doom_loop_nudged_at = 0
                     # Reset lifecycle flags for next task
                     agent_state.task_done = False
                     agent_state.asked_user = False
@@ -477,7 +499,7 @@ def setup_session_listener(
                                 return  # already resumed
                             try:
                                 await sdk_session.send(
-                                    "[Agent framework] You went idle but didn't "
+                                    "[Enclave Coordinator] You went idle but didn't "
                                     "call mark_done() or ask_user(). If you have "
                                     "more work to do, please continue with the "
                                     "next item on your plan. If you're finished, "
@@ -1013,10 +1035,9 @@ async def try_init_copilot(
 
             # 🔄 Doom loop detection: nudge the agent to step back
             if (agent_state is not None
-                    and agent_state.doom_loop_nudged
+                    and agent_state.doom_loop_nudged_at > 0
+                    and agent_state.consecutive_turns == agent_state.doom_loop_nudged_at
                     and not agent_state.pending_interrupt):
-                # One-shot: clear the flag so we don't nag on every tool call
-                agent_state.doom_loop_nudged = False
                 turns = agent_state.consecutive_turns
                 minutes = int(
                     (time.monotonic() - agent_state.task_start_time) / 60
@@ -1024,26 +1045,20 @@ async def try_init_copilot(
                 return PermissionRequestResult(
                     kind="denied-interactively-by-user",
                     message=(
-                        f"[Agent framework] Sorry to interrupt but you've been "
-                        f"at this for a while ({turns} turns, {minutes}min). "
-                        f"Let's take a step back and list out:\n\n"
-                        f"• What are we trying to solve here?\n"
-                        f"• What have we tried so far, and what were the results?\n"
-                        f"• What do we KNOW? What are the anchoring and key "
-                        f"pieces of information?\n"
-                        f"• What information do we NOT have that would help us "
-                        f"fill in gaps?\n"
-                        f"• Do we need new tools to develop a better "
-                        f"understanding?\n\n"
-                        f"If you know what needs doing and you're working on it, "
-                        f"please continue, but if you're lacking information and "
-                        f"struggling to make progress, use this as an opportunity "
-                        f"to take stock. Also consider:\n\n"
-                        f"• Revert to a known-good state and try a fundamentally "
-                        f"different approach\n"
-                        f"• Ask the user for their opinion and experience\n"
-                        f"• Call `consult_panel` to get a second opinion from a "
-                        f"panel of expert agents"
+                        f"[Enclave Coordinator] You've been at this for {turns} "
+                        f"turns ({minutes}min) and appear to be going in circles. "
+                        f"STOP and reassess before continuing.\n\n"
+                        f"1. Call `consult_panel` with a detailed description of "
+                        f"what you're trying to achieve, what you've tried, and "
+                        f"where you're stuck. Let the expert panel give you a "
+                        f"fresh perspective.\n"
+                        f"2. If the panel doesn't help, call `ask_user` to get "
+                        f"the human's input — they often have domain knowledge "
+                        f"you lack.\n"
+                        f"3. Consider reverting to a known-good state and trying "
+                        f"a fundamentally different approach.\n\n"
+                        f"Do NOT continue with your current approach without "
+                        f"first consulting the panel or the user."
                     ),
                 )
 
