@@ -934,7 +934,7 @@ def _request_permission_sync(
     return _ask()  # Returns a coroutine (Awaitable) — SDK will await it
 
 
-_TARGET_MODEL = "claude-opus-4.7"
+_TARGET_MODEL = "claude-opus-4.6"
 _REASONING_EFFORT = "medium"
 
 
@@ -2680,11 +2680,13 @@ async def try_init_copilot(
                     "using the `task` tool:\n\n"
                     "**Agent 1 — Claude Opus 4.7:**\n"
                     "```\n"
+                    "**Agent 1 — Claude Opus 4.6 (A):**\n"
+                    "```\n"
                     f'task(name="expert-a", agent_type="general-purpose", '
-                    f'model="claude-opus-4.7", mode="background", '
+                    f'model="claude-opus-4.6", mode="background", '
                     f'prompt={repr(expert_prompt)})\n'
                     "```\n\n"
-                    "**Agent 2 — Claude Opus 4.6:**\n"
+                    "**Agent 2 — Claude Opus 4.6 (B):**\n"
                     "```\n"
                     f'task(name="expert-b", agent_type="general-purpose", '
                     f'model="claude-opus-4.6", mode="background", '
