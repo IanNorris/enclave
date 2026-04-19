@@ -1114,7 +1114,7 @@ async def try_init_copilot(
 
         prompt_dir = Path(__file__).parent / "prompts"
         prompt_parts = []
-        for filename in ("base.md", f"{profile_name}.md"):
+        for filename in ("base.md", "guidelines.md", f"{profile_name}.md"):
             prompt_file = prompt_dir / filename
             if prompt_file.exists():
                 text = prompt_file.read_text()
@@ -1141,6 +1141,19 @@ async def try_init_copilot(
             if memories_text:
                 prompt_parts.append(memories_text)
                 print(f"[agent] Loaded key memories ({len(memories_text)} chars)", file=sys.stderr)
+
+        # Load workspace-level instructions (.github/copilot-instructions.md)
+        instructions_path = Path(working_directory) / ".github" / "copilot-instructions.md"
+        if instructions_path.exists():
+            instructions_text = instructions_path.read_text().strip()
+            if instructions_text:
+                prompt_parts.append(
+                    "# Workspace Instructions\n\n"
+                    "The following instructions were provided by the project owner. "
+                    "Follow them unless they conflict with core safety guidelines.\n\n"
+                    + instructions_text
+                )
+                print(f"[agent] Loaded workspace instructions ({len(instructions_text)} chars)", file=sys.stderr)
 
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)
