@@ -2701,8 +2701,13 @@ async def try_init_copilot(
                 return ToolResult(
                     text_result_for_llm=(
                         "Error: please provide a detailed 'problem_description' "
-                        "explaining what you're trying to solve, what you've tried, "
-                        "and where you're stuck."
+                        "that includes: what you're trying to solve, what you've "
+                        "tried, your current proposed plan (if any), your actual "
+                        "constraints (deadline, scope, risk tolerance), AND the "
+                        "research you've already done — attach relevant file "
+                        "excerpts, command outputs, error messages, and prior "
+                        "art. The panel reasons over the evidence you provide; "
+                        "don't expect them to do discovery for you."
                     ),
                     result_type="error",
                 )
@@ -2716,6 +2721,16 @@ async def try_init_copilot(
                     "balanced take.\n\n"
                     f"**Your voice:** {voice}\n\n"
                     f"**What you look for:** {focus}\n\n"
+                    "**DO NOT do your own background research.** The calling "
+                    "engineer has already done the investigation and attached "
+                    "their findings in the problem description. Reason from "
+                    "the evidence they provided. Only fire off tool calls to "
+                    "research something if you have a specific idea that isn't "
+                    "covered by their attached material AND that idea is "
+                    "central to your recommendation — never for general "
+                    "background. If you want more evidence, name what's "
+                    "missing in your 'sharp question' instead of hunting for "
+                    "it yourself.\n\n"
                     "Stay in character. Be direct, specific, and concrete. "
                     "Do NOT hedge with 'it depends' — pick a position and defend "
                     "it. Your perspective will be synthesized with the others, "
@@ -2845,12 +2860,16 @@ async def try_init_copilot(
             description=(
                 "Convene a 4-person panel of expert agents with deliberately "
                 "different archetypes (Architect, Pragmatist, Skeptic, "
-                "Contrarian) when stuck on a difficult problem. Each brings "
-                "a distinct lens rather than producing balanced takes, so "
-                "expect sharp disagreement — that's where the signal is. "
-                "Provide a detailed description of the problem, what you've "
-                "tried, and where you're stuck. Returns instructions to fire "
-                "the panel in parallel via sub-agents."
+                "Contrarian) at high-leverage decision points. Use BEFORE "
+                "starting any large new piece of work, when designing an API "
+                "or architecture, when choosing between viable approaches, on "
+                "the 2nd attempt at a problem, or when stuck. Each panelist "
+                "brings a distinct lens rather than a balanced take — expect "
+                "sharp disagreement, that's where the signal is. YOU must do "
+                "the research first and attach findings (file excerpts, "
+                "command output, errors, prior art) and your proposed plan; "
+                "the panel reasons over your evidence rather than doing "
+                "their own discovery."
             ),
             handler=_consult_panel_handler,
             skip_permission=True,
@@ -2860,9 +2879,16 @@ async def try_init_copilot(
                     "problem_description": {
                         "type": "string",
                         "description": (
-                            "Detailed description of the problem: what you're trying "
-                            "to solve, what approaches you've tried, what error messages "
-                            "or symptoms you're seeing, and where you're stuck."
+                            "A detailed brief for the panel. Must include: "
+                            "(a) what you're trying to solve and why; "
+                            "(b) what you've tried and the result; "
+                            "(c) your current proposed plan or approach; "
+                            "(d) real constraints (deadline, scope, risk); "
+                            "(e) research you've already done — attach "
+                            "relevant file excerpts, command outputs, error "
+                            "messages, and any prior art you've considered. "
+                            "The panel critiques evidence, they do not "
+                            "replace discovery work."
                         ),
                     },
                 },
