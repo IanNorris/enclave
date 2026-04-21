@@ -2693,6 +2693,7 @@ async def try_init_copilot(
         custom_tools.append(nix_shell_tool)
 
         # Custom tool: consult_panel — get second opinions from expert sub-agents
+        # Each panelist plays a distinct archetype to surface orthogonal concerns.
         async def _consult_panel_handler(invocation: object) -> ToolResult:
             args = getattr(invocation, "arguments", {}) or {}
             problem = args.get("problem_description", "").strip()
@@ -2705,55 +2706,151 @@ async def try_init_copilot(
                     ),
                     result_type="error",
                 )
-            expert_prompt = (
-                "You are an expert consultant helping a fellow engineer who is stuck. "
-                "They will describe a technical problem they're facing. Provide:\n\n"
-                "1. Your analysis of the root cause\n"
-                "2. Key information they may be overlooking\n"
-                "3. Concrete alternative approaches to try\n"
-                "4. Any diagnostic steps that could clarify the situation\n\n"
-                "Be direct, practical, and specific. Don't repeat what they already know.\n\n"
-                "--- Problem Description ---\n"
-                f"{problem}"
+
+            def _archetype_prompt(role: str, voice: str, focus: str) -> str:
+                return (
+                    f"You are **{role}**, one member of a 4-person expert panel "
+                    "consulted by a fellow engineer who is stuck on a technical "
+                    "problem. The other panelists have different perspectives — "
+                    "your job is to bring YOUR distinct lens, not to produce a "
+                    "balanced take.\n\n"
+                    f"**Your voice:** {voice}\n\n"
+                    f"**What you look for:** {focus}\n\n"
+                    "Stay in character. Be direct, specific, and concrete. "
+                    "Do NOT hedge with 'it depends' — pick a position and defend "
+                    "it. Your perspective will be synthesized with the others, "
+                    "so redundancy with a balanced middle-ground is wasted effort.\n\n"
+                    "Structure your response as:\n"
+                    "1. **Your take** (2-4 sentences: the core point from your lens)\n"
+                    "2. **What the engineer is likely missing** (concrete risks or "
+                    "opportunities through your lens)\n"
+                    "3. **Concrete recommendation** (what you would do, and why)\n"
+                    "4. **A sharp question** (one question that if answered would "
+                    "materially change the approach)\n\n"
+                    "--- Problem Description ---\n"
+                    f"{problem}"
+                )
+
+            architect_prompt = _archetype_prompt(
+                role="The Architect",
+                voice=(
+                    "'What does this look like in 2 years at 10x scale? Who "
+                    "maintains this?' You care about long-term stewardship, "
+                    "cohesion, extension points, and keeping the mental model "
+                    "clean."
+                ),
+                focus=(
+                    "Coupling, hidden assumptions baked into code, decisions "
+                    "that are cheap now but expensive to reverse later, "
+                    "abstractions that will or won't hold up, interfaces that "
+                    "shape future work. Call out when a quick fix is actually "
+                    "a load-bearing decision in disguise."
+                ),
             )
+
+            pragmatist_prompt = _archetype_prompt(
+                role="The Pragmatist",
+                voice=(
+                    "'What's the simplest thing that could work? Ship it, "
+                    "iterate later.' You distrust complexity, premature "
+                    "abstraction, and analysis paralysis. Think VERY hard and "
+                    "carefully before speaking — the engineer will rely on "
+                    "your judgment about what's truly necessary vs. what's "
+                    "gold-plating."
+                ),
+                focus=(
+                    "YAGNI violations, over-engineering, scope creep, "
+                    "speculative generality. What's the smallest diff that "
+                    "actually solves the user's real problem today? What can "
+                    "be deleted, deferred, or faked? Call out when the "
+                    "engineer is solving a problem they don't actually have."
+                ),
+            )
+
+            skeptic_prompt = _archetype_prompt(
+                role="The Skeptic",
+                voice=(
+                    "'How does this fail? What's the attacker's move? What "
+                    "if the input is null, malicious, or huge?' You assume "
+                    "the happy path is a lie and every assumption is wrong "
+                    "until proven otherwise."
+                ),
+                focus=(
+                    "Edge cases, security holes, race conditions, silent "
+                    "failures, unvalidated inputs, data integrity, error "
+                    "paths, partial failures, concurrency bugs, trust "
+                    "boundaries. What inputs break this? What happens on a "
+                    "crash mid-operation? What does an adversary do?"
+                ),
+            )
+
+            contrarian_prompt = _archetype_prompt(
+                role="The Contrarian",
+                voice=(
+                    "'What if the framing is wrong? What if we should do the "
+                    "literal opposite?' You question premises, flip "
+                    "assumptions, and look for the problem behind the "
+                    "problem."
+                ),
+                focus=(
+                    "Unquestioned assumptions in how the problem is framed, "
+                    "false dichotomies, wrong-level solutions, cases where "
+                    "NOT doing the thing is the right answer. If everyone "
+                    "else is agreeing, dig for what they're all missing. "
+                    "Surface the option nobody proposed."
+                ),
+            )
+
             return ToolResult(
                 text_result_for_llm=(
-                    "To consult the expert panel, fire these sub-agents in parallel "
-                    "using the `task` tool:\n\n"
-                    "**Agent 1 — Claude Opus 4.7:**\n"
+                    "To consult the expert panel, fire these 4 sub-agents in "
+                    "parallel using the `task` tool. Each has a distinct "
+                    "archetype — expect contradictory advice, that's the point. "
+                    "Synthesize; don't average.\n\n"
+                    "**Agent 1 — The Architect (Claude Opus 4.7):**\n"
                     "```\n"
-                    "**Agent 1 — Claude Opus 4.7:**\n"
-                    "```\n"
-                    f'task(name="expert-a", agent_type="general-purpose", '
+                    f'task(name="architect", agent_type="general-purpose", '
                     f'model="claude-opus-4.7", mode="background", '
-                    f'prompt={repr(expert_prompt)})\n'
+                    f'prompt={repr(architect_prompt)})\n'
                     "```\n\n"
-                    "**Agent 2 — Claude Opus 4.6:**\n"
+                    "**Agent 2 — The Pragmatist (GPT-5.4, xhigh reasoning):**\n"
                     "```\n"
-                    f'task(name="expert-b", agent_type="general-purpose", '
-                    f'model="claude-opus-4.6", mode="background", '
-                    f'prompt={repr(expert_prompt)})\n'
+                    f'task(name="pragmatist", agent_type="general-purpose", '
+                    f'model="gpt-5.4", mode="background", '
+                    f'prompt={repr(pragmatist_prompt)})\n'
                     "```\n\n"
-                    "**Agent 3 — GPT-5.2:**\n"
+                    "**Agent 3 — The Skeptic (Claude Sonnet 4.6):**\n"
                     "```\n"
-                    f'task(name="expert-c", agent_type="general-purpose", '
-                    f'model="gpt-5.2", mode="background", '
-                    f'prompt={repr(expert_prompt)})\n'
+                    f'task(name="skeptic", agent_type="general-purpose", '
+                    f'model="claude-sonnet-4.6", mode="background", '
+                    f'prompt={repr(skeptic_prompt)})\n'
                     "```\n\n"
-                    "Launch all three, then use `read_agent` to collect their "
-                    "responses. Synthesize the best ideas from each expert into "
-                    "your approach."
+                    "**Agent 4 — The Contrarian (Claude Opus 4.7):**\n"
+                    "```\n"
+                    f'task(name="contrarian", agent_type="general-purpose", '
+                    f'model="claude-opus-4.7", mode="background", '
+                    f'prompt={repr(contrarian_prompt)})\n'
+                    "```\n\n"
+                    "Launch all four, then use `read_agent` to collect their "
+                    "responses. Expect sharp disagreement between the Architect "
+                    "and Pragmatist, and between the Contrarian and the others "
+                    "— that tension is where the signal is. Pick the take that "
+                    "best fits your actual constraints; don't try to please "
+                    "all four."
                 ),
             )
 
         consult_panel_tool = Tool(
             name="consult_panel",
             description=(
-                "Get a second opinion from a panel of expert agents when stuck on "
-                "a difficult problem. Provide a detailed description of the problem, "
-                "what you've tried, and where you're stuck. Returns instructions to "
-                "fire multiple sub-agents with different AI models for diverse "
-                "perspectives."
+                "Convene a 4-person panel of expert agents with deliberately "
+                "different archetypes (Architect, Pragmatist, Skeptic, "
+                "Contrarian) when stuck on a difficult problem. Each brings "
+                "a distinct lens rather than producing balanced takes, so "
+                "expect sharp disagreement — that's where the signal is. "
+                "Provide a detailed description of the problem, what you've "
+                "tried, and where you're stuck. Returns instructions to fire "
+                "the panel in parallel via sub-agents."
             ),
             handler=_consult_panel_handler,
             skip_permission=True,
