@@ -72,6 +72,17 @@ COPY pyproject.toml /build/
 COPY src/ /build/src/
 RUN pip install --no-cache-dir /build && rm -rf /build
 
+# The github-copilot-sdk wheel on PyPI ships an older bundled `copilot` binary
+# (e.g. 1.0.21) that returns "Unknown error" on some model requests. Run the
+# CLI's self-update to grab the latest release and replace the in-place binary.
+# HOME must be writable because `copilot update` caches the downloaded tarball
+# under $HOME/.cache/copilot/pkg/. Errors are ignored so builds still succeed
+# offline — the runtime will just use the bundled version in that case.
+RUN HOME=/tmp/copilot-update mkdir -p "$HOME" && \
+    /usr/local/lib/python3.12/site-packages/copilot/bin/copilot update 2>&1 | tail -5 || true && \
+    /usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version || true && \
+    rm -rf /tmp/copilot-update
+
 WORKDIR /workspace
 
 # Entrypoint: install Nix on first run (if profile uses it), then start agent
