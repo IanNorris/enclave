@@ -941,6 +941,36 @@ _MODEL_PREFERENCES: tuple[str, ...] = (
 )
 _REASONING_EFFORT = "medium"
 
+# Panel archetype model preferences (first available wins).
+# Architect & Contrarian want the deepest reasoning model; Pragmatist
+# favours the fastest-thinking GPT; Skeptic favours a strong Claude
+# Sonnet for careful failure-mode analysis.
+_PANEL_MODEL_PREFERENCES: dict[str, tuple[str, ...]] = {
+    "architect": ("claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"),
+    "pragmatist": ("gpt-5.4", "gpt-5.3-codex", "gpt-5.2"),
+    "skeptic": ("claude-sonnet-4.6", "claude-sonnet-4.5", "claude-haiku-4.5"),
+    "contrarian": ("claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"),
+}
+
+# Populated at startup by _configure_model(); shared with consult_panel.
+_AVAILABLE_MODEL_IDS: set[str] = set()
+
+
+def _resolve_model(preferences: tuple[str, ...]) -> str:
+    """Pick the first model from preferences that's actually available.
+
+    Falls back to the first preference if the available-models set hasn't
+    been populated yet (e.g. list_models failed at startup). The caller
+    can then log and handle the case where the returned model is still
+    unavailable.
+    """
+    if not _AVAILABLE_MODEL_IDS:
+        return preferences[0]
+    for candidate in preferences:
+        if candidate in _AVAILABLE_MODEL_IDS:
+            return candidate
+    return preferences[0]
+
 
 async def _configure_model(
     session: _CopilotSession, client: _CopilotClient | None = None,
@@ -953,19 +983,21 @@ async def _configure_model(
     (e.g. claude-opus-4.7 not rolled out yet) — logging success but actually
     using a weaker model.
     """
+    global _AVAILABLE_MODEL_IDS
     # Try to discover available models via the client.
     target = _MODEL_PREFERENCES[0]
     try:
         if client is not None:
             models = await client.list_models()
-            available_ids = {m.id for m in models}
+            _AVAILABLE_MODEL_IDS = {m.id for m in models}
             chosen = next(
-                (m for m in _MODEL_PREFERENCES if m in available_ids), None,
+                (m for m in _MODEL_PREFERENCES if m in _AVAILABLE_MODEL_IDS),
+                None,
             )
             if chosen is None:
                 print(
                     f"[agent] WARNING: none of {_MODEL_PREFERENCES} are available. "
-                    f"Available: {sorted(available_ids)}",
+                    f"Available: {sorted(_AVAILABLE_MODEL_IDS)}",
                     file=sys.stderr,
                 )
                 return
@@ -2816,34 +2848,39 @@ async def try_init_copilot(
                 ),
             )
 
+            architect_model = _resolve_model(_PANEL_MODEL_PREFERENCES["architect"])
+            pragmatist_model = _resolve_model(_PANEL_MODEL_PREFERENCES["pragmatist"])
+            skeptic_model = _resolve_model(_PANEL_MODEL_PREFERENCES["skeptic"])
+            contrarian_model = _resolve_model(_PANEL_MODEL_PREFERENCES["contrarian"])
+
             return ToolResult(
                 text_result_for_llm=(
                     "To consult the expert panel, fire these 4 sub-agents in "
                     "parallel using the `task` tool. Each has a distinct "
                     "archetype — expect contradictory advice, that's the point. "
                     "Synthesize; don't average.\n\n"
-                    "**Agent 1 — The Architect (Claude Opus 4.7):**\n"
+                    f"**Agent 1 — The Architect ({architect_model}):**\n"
                     "```\n"
                     f'task(name="architect", agent_type="general-purpose", '
-                    f'model="claude-opus-4.7", mode="background", '
+                    f'model="{architect_model}", mode="background", '
                     f'prompt={repr(architect_prompt)})\n'
                     "```\n\n"
-                    "**Agent 2 — The Pragmatist (GPT-5.4, xhigh reasoning):**\n"
+                    f"**Agent 2 — The Pragmatist ({pragmatist_model}):**\n"
                     "```\n"
                     f'task(name="pragmatist", agent_type="general-purpose", '
-                    f'model="gpt-5.4", mode="background", '
+                    f'model="{pragmatist_model}", mode="background", '
                     f'prompt={repr(pragmatist_prompt)})\n'
                     "```\n\n"
-                    "**Agent 3 — The Skeptic (Claude Sonnet 4.6):**\n"
+                    f"**Agent 3 — The Skeptic ({skeptic_model}):**\n"
                     "```\n"
                     f'task(name="skeptic", agent_type="general-purpose", '
-                    f'model="claude-sonnet-4.6", mode="background", '
+                    f'model="{skeptic_model}", mode="background", '
                     f'prompt={repr(skeptic_prompt)})\n'
                     "```\n\n"
-                    "**Agent 4 — The Contrarian (Claude Opus 4.7):**\n"
+                    f"**Agent 4 — The Contrarian ({contrarian_model}):**\n"
                     "```\n"
                     f'task(name="contrarian", agent_type="general-purpose", '
-                    f'model="claude-opus-4.7", mode="background", '
+                    f'model="{contrarian_model}", mode="background", '
                     f'prompt={repr(contrarian_prompt)})\n'
                     "```\n\n"
                     "Launch all four, then use `read_agent` to collect their "
