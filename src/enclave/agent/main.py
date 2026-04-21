@@ -988,8 +988,21 @@ async def _configure_model(
     target = _MODEL_PREFERENCES[0]
     try:
         if client is not None:
-            models = await client.list_models()
-            _AVAILABLE_MODEL_IDS = {m.id for m in models}
+            try:
+                models = await client.list_models()
+                _AVAILABLE_MODEL_IDS = {m.id for m in models}
+            except Exception as e:
+                # Newer CLI releases may return models with null `supports`/`limits`
+                # fields that trip the SDK's pydantic parser. Fall back to a raw
+                # JSON-RPC call and extract just the ids we need.
+                print(
+                    f"[agent] list_models parse failed ({e}); trying raw RPC",
+                    file=sys.stderr,
+                )
+                raw = await client._client.request("models.list", {})
+                _AVAILABLE_MODEL_IDS = {
+                    m.get("id") for m in raw.get("models", []) if m.get("id")
+                }
             chosen = next(
                 (m for m in _MODEL_PREFERENCES if m in _AVAILABLE_MODEL_IDS),
                 None,
