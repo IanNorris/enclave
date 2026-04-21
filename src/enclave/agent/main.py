@@ -934,15 +934,57 @@ def _request_permission_sync(
     return _ask()  # Returns a coroutine (Awaitable) — SDK will await it
 
 
-_TARGET_MODEL = "claude-opus-4.6"
+_MODEL_PREFERENCES: tuple[str, ...] = (
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+)
 _REASONING_EFFORT = "medium"
 
 
-async def _configure_model(session: _CopilotSession) -> None:
-    """Switch to the preferred model with reasoning enabled."""
+async def _configure_model(
+    session: _CopilotSession, client: _CopilotClient | None = None,
+) -> None:
+    """Switch to the best available preferred model with reasoning enabled.
+
+    Tries each model in _MODEL_PREFERENCES in order and uses the first one
+    that's actually available for this session. Needed because set_model()
+    silently falls back to a default model if the requested one is unavailable
+    (e.g. claude-opus-4.7 not rolled out yet) — logging success but actually
+    using a weaker model.
+    """
+    # Try to discover available models via the client.
+    target = _MODEL_PREFERENCES[0]
     try:
-        await session.set_model(_TARGET_MODEL, reasoning_effort=_REASONING_EFFORT)
-        print(f"[agent] Model set to {_TARGET_MODEL} (reasoning={_REASONING_EFFORT})", file=sys.stderr)
+        if client is not None:
+            models = await client.list_models()
+            available_ids = {m.id for m in models}
+            chosen = next(
+                (m for m in _MODEL_PREFERENCES if m in available_ids), None,
+            )
+            if chosen is None:
+                print(
+                    f"[agent] WARNING: none of {_MODEL_PREFERENCES} are available. "
+                    f"Available: {sorted(available_ids)}",
+                    file=sys.stderr,
+                )
+                return
+            target = chosen
+            if target != _MODEL_PREFERENCES[0]:
+                print(
+                    f"[agent] Preferred model {_MODEL_PREFERENCES[0]} unavailable; "
+                    f"falling back to {target}",
+                    file=sys.stderr,
+                )
+    except Exception as e:
+        print(f"[agent] list_models failed (using {target}): {e}", file=sys.stderr)
+
+    try:
+        await session.set_model(target, reasoning_effort=_REASONING_EFFORT)
+        print(
+            f"[agent] Model set to {target} (reasoning={_REASONING_EFFORT})",
+            file=sys.stderr,
+        )
     except Exception as e:
         print(f"[agent] set_model failed (non-fatal): {e}", file=sys.stderr)
 
@@ -2680,13 +2722,13 @@ async def try_init_copilot(
                     "using the `task` tool:\n\n"
                     "**Agent 1 — Claude Opus 4.7:**\n"
                     "```\n"
-                    "**Agent 1 — Claude Opus 4.6 (A):**\n"
+                    "**Agent 1 — Claude Opus 4.7:**\n"
                     "```\n"
                     f'task(name="expert-a", agent_type="general-purpose", '
-                    f'model="claude-opus-4.6", mode="background", '
+                    f'model="claude-opus-4.7", mode="background", '
                     f'prompt={repr(expert_prompt)})\n'
                     "```\n\n"
-                    "**Agent 2 — Claude Opus 4.6 (B):**\n"
+                    "**Agent 2 — Claude Opus 4.6:**\n"
                     "```\n"
                     f'task(name="expert-b", agent_type="general-purpose", '
                     f'model="claude-opus-4.6", mode="background", '
@@ -2863,7 +2905,7 @@ async def try_init_copilot(
                     streaming=True,
                 )
                 print(f"[agent] Session resumed: {last_id}", file=sys.stderr)
-                await _configure_model(session)
+                await _configure_model(session, client)
                 return (client, session)
         except Exception as e:
             print(f"[agent] Session resume failed ({e}), creating new session", file=sys.stderr)
@@ -2877,7 +2919,7 @@ async def try_init_copilot(
             infinite_sessions=infinite_sessions_config,
             streaming=True,
         )
-        await _configure_model(session)
+        await _configure_model(session, client)
         return (client, session)
     except Exception as e:
         print(f"[agent] Copilot SDK init failed: {e}", file=sys.stderr)
