@@ -902,7 +902,7 @@ def _request_permission_sync(
     if not ipc or not ipc.is_connected:
         return PermissionRequestResult(
             kind="denied-by-rules",
-            message="Cannot reach orchestrator for approval",
+            feedback="Cannot reach orchestrator for approval",
         )
 
     async def _ask() -> PermissionRequestResult:
@@ -922,13 +922,13 @@ def _request_permission_sync(
                 return PermissionRequestResult(kind="approved")
             return PermissionRequestResult(
                 kind="denied-interactively-by-user",
-                message=f"User denied access to: {target}",
+                feedback=f"User denied access to: {target}",
             )
         except Exception as exc:
             print(f"[agent] Permission request failed: {exc}", file=sys.stderr)
             return PermissionRequestResult(
                 kind="denied-by-rules",
-                message=f"Permission request failed: {exc}",
+                feedback=f"Permission request failed: {exc}",
             )
 
     return _ask()  # Returns a coroutine (Awaitable) — SDK will await it
@@ -1112,7 +1112,7 @@ async def try_init_copilot(
                     and agent_state.turns_since_enqueue >= AgentState.NUDGE_TURNS):
                 return PermissionRequestResult(
                     kind="denied-interactively-by-user",
-                    message=(
+                    feedback=(
                         "☕ A user message is waiting for you. "
                         "Please wrap up your current step and respond — "
                         "the message will be delivered when you finish. "
@@ -1131,7 +1131,7 @@ async def try_init_copilot(
                 ) if agent_state.task_start_time > 0 else 0
                 return PermissionRequestResult(
                     kind="denied-interactively-by-user",
-                    message=(
+                    feedback=(
                         f"[Enclave Coordinator] You've been at this for {turns} "
                         f"turns ({minutes}min) and appear to be going in circles. "
                         f"STOP and reassess before continuing.\n\n"
