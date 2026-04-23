@@ -10,6 +10,7 @@ import asyncio
 import os
 import sys
 import time
+from collections import Counter, deque
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,7 +38,9 @@ class AgentState:
         "pending_messages", "queued_user_messages",
         # Doom loop detection
         "task_start_time", "consecutive_turns", "tool_failures",
-        "recent_edit_targets", "doom_loop_nudged_at",
+        "consecutive_failures",
+        "recent_edit_targets", "recent_bash_commands",
+        "doom_loop_nudged_at", "doom_loop_nudge_count",
         # Auto-continue lifecycle
         "task_done", "asked_user", "auto_continue_handle",
     )
@@ -50,9 +53,15 @@ class AgentState:
 
     # Doom loop detection thresholds
     DOOM_LOOP_TIME_GATE = 300.0  # 5 minutes of continuous work before checking
-    DOOM_LOOP_FAILURE_RATE = 0.30  # 30% tool failure rate triggers nudge
-    DOOM_LOOP_SAME_FILE_EDITS = 5  # editing same file this many times triggers nudge
-    DOOM_LOOP_MAX_TURNS = 40  # this many turns without idle triggers nudge
+    DOOM_LOOP_MIN_TURNS = 30  # don't even consider nudging below this turn count
+    DOOM_LOOP_CONSECUTIVE_FAILURES = 3  # back-to-back tool failures signal distress
+    DOOM_LOOP_WINDOWED_EDITS = 5  # same file edited this many times in recent edits
+    DOOM_LOOP_EDIT_WINDOW = 15  # how many recent edits we keep for windowed detection
+    DOOM_LOOP_WINDOWED_BASH = 4  # same bash command run this many times in recent bash
+    DOOM_LOOP_BASH_WINDOW = 10  # how many recent bash commands we keep
+    DOOM_LOOP_LONG_TASK_TURNS = 60  # long-runner gate (paired with 15min elapsed)
+    DOOM_LOOP_LONG_TASK_TIME = 900.0  # 15 minutes
+    DOOM_LOOP_COOLDOWN_TURNS = 40  # minimum turns between nudges at the first level
 
     def __init__(self) -> None:
         self.sdk_client: _CopilotClient | None = None
@@ -74,8 +83,17 @@ class AgentState:
         self.task_start_time: float = 0.0  # monotonic time of first turn after idle
         self.consecutive_turns: int = 0
         self.tool_failures: int = 0
-        self.recent_edit_targets: list[str] = []
+        self.consecutive_failures: int = 0  # resets on any tool success
+        # Bounded deques so we compute signals over a recent window rather
+        # than lifetime totals (avoids false positives during long refactors).
+        self.recent_edit_targets: deque[str] = deque(
+            maxlen=AgentState.DOOM_LOOP_EDIT_WINDOW
+        )
+        self.recent_bash_commands: deque[str] = deque(
+            maxlen=AgentState.DOOM_LOOP_BASH_WINDOW
+        )
         self.doom_loop_nudged_at: int = 0
+        self.doom_loop_nudge_count: int = 0  # exponential backoff multiplier
         # Auto-continue lifecycle
         self.task_done: bool = False  # agent explicitly called mark_done
         self.asked_user: bool = False  # agent explicitly called ask_user
@@ -231,6 +249,16 @@ def setup_session_listener(
             # Track edit targets for doom loop detection
             if agent_state and tool_name in ("edit", "create") and detail:
                 agent_state.recent_edit_targets.append(detail)
+            # Track bash commands (normalised to the first token + first arg)
+            # for stereotypy detection — e.g. the agent running the same
+            # `make test` repeatedly with no progress.
+            if agent_state and tool_name == "bash":
+                cmd = (args.get("command", "") or "").strip()
+                if cmd:
+                    # Normalise to catch minor variations: first two whitespace-
+                    # separated tokens, lowercased.
+                    norm = " ".join(cmd.split()[:2]).lower()[:80]
+                    agent_state.recent_bash_commands.append(norm)
 
         elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
             _set_phase("thinking")  # back to thinking between tools
@@ -252,8 +280,12 @@ def setup_session_listener(
                 reply_to=reply_to,
             )))
             # Track tool failures for doom loop detection
-            if agent_state and not success:
-                agent_state.tool_failures += 1
+            if agent_state:
+                if success:
+                    agent_state.consecutive_failures = 0
+                else:
+                    agent_state.tool_failures += 1
+                    agent_state.consecutive_failures += 1
 
         elif etype == SessionEventType.SUBAGENT_STARTED:
             agent_name = getattr(data, "name", None) or getattr(data, "agent_name", "") or "sub-agent"
@@ -300,48 +332,101 @@ def setup_session_listener(
                     agent_state.task_start_time = time.monotonic()
                 agent_state.consecutive_turns += 1
 
-                # Doom loop detection (repeats every DOOM_LOOP_MAX_TURNS)
+                # Doom loop detection — multi-signal with exponential backoff.
+                # We require ≥2 independent stuck-signals to fire (and a
+                # meaningful turn floor) to avoid nagging during legitimate
+                # long tasks. Each re-nudge doubles the cooldown window so
+                # the agent isn't spammed if it ignores the first one.
                 if agent_state.task_start_time > 0:
                     task_elapsed = time.monotonic() - agent_state.task_start_time
-                    if task_elapsed >= AgentState.DOOM_LOOP_TIME_GATE:
-                        turns = agent_state.consecutive_turns
-                        failures = agent_state.tool_failures
-                        from collections import Counter
+                    turns = agent_state.consecutive_turns
+                    # Cooldown grows exponentially with each repeat nudge.
+                    cooldown = (
+                        AgentState.DOOM_LOOP_COOLDOWN_TURNS
+                        * (2 ** agent_state.doom_loop_nudge_count)
+                    )
+                    turns_since_nudge = turns - agent_state.doom_loop_nudged_at
+                    eligible = (
+                        task_elapsed >= AgentState.DOOM_LOOP_TIME_GATE
+                        and turns >= AgentState.DOOM_LOOP_MIN_TURNS
+                        and turns_since_nudge >= cooldown
+                    )
+                    if eligible:
+                        # Compute signals over sliding windows, not lifetime,
+                        # so legitimate long tasks don't accrue noise.
                         edit_counts = Counter(agent_state.recent_edit_targets)
-                        top_file_edits = edit_counts.most_common(1)[0][1] if edit_counts else 0
-
-                        # Check if we've passed a nudge threshold since last nudge
-                        turns_since_nudge = turns - agent_state.doom_loop_nudged_at
-                        doom_signal = (
-                            turns_since_nudge >= AgentState.DOOM_LOOP_MAX_TURNS
-                            and (
-                                (turns > 0 and failures / turns > AgentState.DOOM_LOOP_FAILURE_RATE)
-                                or top_file_edits >= AgentState.DOOM_LOOP_SAME_FILE_EDITS
-                                or turns >= AgentState.DOOM_LOOP_MAX_TURNS
-                            )
+                        top_edit_file, top_edit_count = (
+                            edit_counts.most_common(1)[0]
+                            if edit_counts else ("", 0)
                         )
-                        if doom_signal:
+                        bash_counts = Counter(agent_state.recent_bash_commands)
+                        top_bash_cmd, top_bash_count = (
+                            bash_counts.most_common(1)[0]
+                            if bash_counts else ("", 0)
+                        )
+                        no_checkpoint = (
+                            not agent_state.task_done
+                            and not agent_state.asked_user
+                        )
+
+                        signals: list[str] = []
+                        if agent_state.consecutive_failures >= AgentState.DOOM_LOOP_CONSECUTIVE_FAILURES:
+                            signals.append(
+                                f"{agent_state.consecutive_failures} tool failures in a row"
+                            )
+                        if top_edit_count >= AgentState.DOOM_LOOP_WINDOWED_EDITS:
+                            signals.append(
+                                f"{top_edit_count}× edits to `{top_edit_file}` "
+                                f"in the last {AgentState.DOOM_LOOP_EDIT_WINDOW} edits"
+                            )
+                        if top_bash_count >= AgentState.DOOM_LOOP_WINDOWED_BASH:
+                            signals.append(
+                                f"`{top_bash_cmd}` run {top_bash_count}× "
+                                f"in the last {AgentState.DOOM_LOOP_BASH_WINDOW} bash calls"
+                            )
+                        if (no_checkpoint
+                                and turns >= AgentState.DOOM_LOOP_LONG_TASK_TURNS
+                                and task_elapsed >= AgentState.DOOM_LOOP_LONG_TASK_TIME):
+                            signals.append(
+                                f"{turns} turns ({task_elapsed/60:.0f} min) "
+                                "with no `mark_done` or `ask_user`"
+                            )
+
+                        if len(signals) >= 2:
                             agent_state.doom_loop_nudged_at = turns
+                            agent_state.doom_loop_nudge_count += 1
+                            signal_lines = "\n".join(f"  • {s}" for s in signals)
                             print(
-                                f"[agent] Doom loop detected "
-                                f"(turns={turns}, failures={failures}, "
-                                f"top_edits={top_file_edits}, "
-                                f"elapsed={task_elapsed:.0f}s)",
+                                f"[agent] Doom loop signals tripped "
+                                f"(turns={turns}, elapsed={task_elapsed:.0f}s, "
+                                f"nudge#{agent_state.doom_loop_nudge_count}):\n"
+                                f"{signal_lines}",
                                 file=sys.stderr,
                             )
-                            # Inject a high-priority interrupt to break the loop
+                            # Notify the orchestrator so the user sees it in
+                            # Matrix — useful for tuning thresholds later.
+                            _fire_and_forget(ipc.send(Message(
+                                type=MessageType.STATUS_UPDATE,
+                                payload={
+                                    "status": "doom_loop_detected",
+                                    "turns": turns,
+                                    "elapsed_seconds": int(task_elapsed),
+                                    "nudge_count": agent_state.doom_loop_nudge_count,
+                                    "signals": signals,
+                                },
+                            )))
+                            # Softer, diagnostic message — lets the agent
+                            # self-assess rather than commanding a halt.
                             doom_msg = (
-                                "[Enclave Coordinator — doom loop detected] You have "
-                                f"been running for {turns} turns "
-                                f"({task_elapsed/60:.0f} min) without completing or "
-                                "asking the user for help. "
-                                "STOP what you are doing and reassess:\n"
-                                "1. Call `consult_panel` with what you're trying to "
-                                "achieve and where you're stuck.\n"
-                                "2. If the panel can't help, call `ask_user()`.\n"
-                                "3. If done, call `mark_done()`.\n"
-                                "Do NOT continue your current approach without "
-                                "consulting the panel or the user first."
+                                "[Enclave Coordinator] Quick check-in — a few "
+                                "signals suggest you might be looping:\n"
+                                f"{signal_lines}\n\n"
+                                "If you're making real forward progress, "
+                                "carry on. If this rings true, options are: "
+                                "`consult_panel` for a fresh perspective, "
+                                "`ask_user` if a human decision would unblock "
+                                "you, or revert to a known-good state and try "
+                                "a different approach."
                             )
                             _fire_and_forget(
                                 sdk_session.send(doom_msg, mode="immediate")
@@ -481,8 +566,11 @@ def setup_session_listener(
                     agent_state.task_start_time = 0.0
                     agent_state.consecutive_turns = 0
                     agent_state.tool_failures = 0
+                    agent_state.consecutive_failures = 0
                     agent_state.recent_edit_targets.clear()
+                    agent_state.recent_bash_commands.clear()
                     agent_state.doom_loop_nudged_at = 0
+                    agent_state.doom_loop_nudge_count = 0
                     # Reset lifecycle flags for next task
                     agent_state.task_done = False
                     agent_state.asked_user = False
@@ -1120,34 +1208,11 @@ async def try_init_copilot(
                     ),
                 )
 
-            # 🔄 Doom loop detection: nudge the agent to step back
-            if (agent_state is not None
-                    and agent_state.doom_loop_nudged_at > 0
-                    and agent_state.consecutive_turns == agent_state.doom_loop_nudged_at
-                    and not agent_state.pending_interrupt):
-                turns = agent_state.consecutive_turns
-                minutes = int(
-                    (time.monotonic() - agent_state.task_start_time) / 60
-                ) if agent_state.task_start_time > 0 else 0
-                return PermissionRequestResult(
-                    kind="denied-interactively-by-user",
-                    feedback=(
-                        f"[Enclave Coordinator] You've been at this for {turns} "
-                        f"turns ({minutes}min) and appear to be going in circles. "
-                        f"STOP and reassess before continuing.\n\n"
-                        f"1. Call `consult_panel` with a detailed description of "
-                        f"what you're trying to achieve, what you've tried, and "
-                        f"where you're stuck. Let the expert panel give you a "
-                        f"fresh perspective.\n"
-                        f"2. If the panel doesn't help, call `ask_user` to get "
-                        f"the human's input — they often have domain knowledge "
-                        f"you lack.\n"
-                        f"3. Consider reverting to a known-good state and trying "
-                        f"a fundamentally different approach.\n\n"
-                        f"Do NOT continue with your current approach without "
-                        f"first consulting the panel or the user."
-                    ),
-                )
+            # Doom loop detection now sends a diagnostic message via
+            # sdk_session.send(mode="immediate") in the TURN_START handler —
+            # we intentionally don't also deny the next tool call here,
+            # because a double-hit (message + denial) feels punitive and
+            # blocks useful work while the agent is trying to self-assess.
 
             # Containers are already sandboxed — auto-approve everything
             if not is_host:

@@ -1588,6 +1588,26 @@ class MessageRouter:
         status = msg.payload.get("status", "unknown")
         copilot = msg.payload.get("copilot_available", False)
 
+        if status == "doom_loop_detected":
+            turns = msg.payload.get("turns", 0)
+            elapsed = msg.payload.get("elapsed_seconds", 0)
+            nudge_count = msg.payload.get("nudge_count", 1)
+            signals = msg.payload.get("signals", []) or []
+            signal_lines = "\n".join(f"• {s}" for s in signals)
+            notice = (
+                f"🔄 **Doom-loop nudge #{nudge_count}** "
+                f"({turns} turns, {elapsed // 60}min)\n{signal_lines}"
+            )
+            log.info(
+                "Doom loop nudge for %s: turns=%d elapsed=%ds signals=%s",
+                session.id, turns, elapsed, signals,
+            )
+            try:
+                await self.matrix.send_message(session.room_id, notice)
+            except Exception as e:
+                log.warning("Failed to post doom-loop notice to Matrix: %s", e)
+            return
+
         if status == "ready":
             mode = "🤖 Copilot" if copilot else "📝 Echo"
             ready_msg = f"✅ Agent ready ({mode} mode). Start chatting!"
