@@ -7,10 +7,14 @@
 
 FROM python:3.12-slim
 
-# Install useful tools and create the runtime user (uid 1000)
+# Install useful tools and create the runtime user (uid 1000).
+# fuse3 provides fusermount3 + /dev/fuse helpers for user-space mounts
+# (e.g. mounting disk images). The binary only works if the orchestrator
+# also passes --device /dev/fuse + --cap-add SYS_ADMIN at run time; if
+# not, it's harmless dead weight (~1MB).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    git curl jq xz-utils && \
+    git curl jq xz-utils fuse3 && \
     rm -rf /var/lib/apt/lists/* && \
     useradd -m -u 1000 -s /bin/bash agent
 

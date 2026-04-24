@@ -44,6 +44,7 @@ class ContainerProfile:
     host_mounts: bool = False
     gui: bool = False
     yolo: bool = False
+    fuse: bool = False  # expose /dev/fuse + SYS_ADMIN for user-space mounts
     description: str = ""
 
 
@@ -68,6 +69,7 @@ class ContainerConfig:
             image="enclave-agent:latest",
             nix_store=True,
             host_mounts=False,
+            fuse=True,
             description="🛠️ Native App Development",
         ),
         "light": ContainerProfile(
@@ -240,6 +242,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                         host_mounts=pdata.get("host_mounts", True),
                         gui=pdata.get("gui", False),
                         yolo=pdata.get("yolo", False),
+                        fuse=pdata.get("fuse", False),
                         description=pdata.get("description", ""),
                     )
 

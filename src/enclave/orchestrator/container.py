@@ -106,6 +106,28 @@ class ContainerManager:
                     container_path = f"/host{host_path}"
                     cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
 
+        # FUSE: user-space mounts (e.g. mounting disk images without root).
+        # Needs /dev/fuse device + SYS_ADMIN cap inside the userns. The cap
+        # is scoped to the rootless user namespace, so this does not grant
+        # host-level privileges — mounts are only visible to this container.
+        if profile.fuse:
+            fuse_dev = Path("/dev/fuse")
+            if fuse_dev.exists():
+                cmd.extend([
+                    "--device", "/dev/fuse",
+                    "--cap-add", "SYS_ADMIN",
+                    "--security-opt", "apparmor=unconfined",
+                ])
+                log.info(
+                    "[start:%s] FUSE enabled (/dev/fuse + SYS_ADMIN)",
+                    session.id,
+                )
+            else:
+                log.warning(
+                    "[start:%s] Profile requests FUSE but /dev/fuse missing "
+                    "on host — skipping", session.id,
+                )
+
         # GUI passthrough: mount Wayland socket + GPU for direct rendering
         if profile.gui:
             xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
@@ -128,6 +150,7 @@ class ContainerManager:
             if kvm.exists():
                 cmd.extend(["--device", "/dev/kvm"])
                 log.info("[start:%s] KVM device mounted", session.id)
+
             # NixOS GPU driver stack (Mesa, EGL, Vulkan)
             opengl_driver = Path("/run/opengl-driver")
             if opengl_driver.exists():
