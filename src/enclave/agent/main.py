@@ -161,10 +161,13 @@ def setup_session_listener(
 
         elif etype == SessionEventType.ASSISTANT_MESSAGE:
             # Complete message from the assistant — send as AGENT_RESPONSE.
+            # Clear the delta buffer so the NEXT message's streaming deltas
+            # don't inherit this message's final text (which would make the
+            # router edit this message with the combined content, appearing
+            # to overwrite it).
             final = getattr(data, "content", None) or ""
+            accumulated_content.clear()
             if final:
-                accumulated_content.clear()
-                accumulated_content.append(final)
                 _fire_and_forget(ipc.send(Message(
                     type=MessageType.AGENT_RESPONSE,
                     payload={"content": final, "in_reply_to": reply_to},

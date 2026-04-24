@@ -1040,8 +1040,16 @@ class MessageRouter:
         content = msg.payload.get("content", "")
         if not content:
             return
+        reply_to = msg.payload.get("in_reply_to") or msg.reply_to
 
         stream = self._streaming.get(session.id)
+        # If the stream belongs to a different user turn, finalize it and
+        # start a new message. This prevents a stale stream (e.g. a turn
+        # that ended without an AGENT_RESPONSE) from capturing deltas
+        # belonging to a subsequent reply.
+        if stream is not None and reply_to and stream.get("reply_to") and stream.get("reply_to") != reply_to:
+            await self._finalize_stale_stream(session)
+            stream = None
         if stream is not None:
             # Fast path (no lock): just update content if longer
             if len(content) > len(stream.get("content", "")):
@@ -1053,6 +1061,9 @@ class MessageRouter:
         async with self._get_stream_lock(session.id):
             # Double-check after acquiring lock
             stream = self._streaming.get(session.id)
+            if stream is not None and reply_to and stream.get("reply_to") and stream.get("reply_to") != reply_to:
+                await self._finalize_stale_stream(session)
+                stream = None
             if stream is not None:
                 if len(content) > len(stream.get("content", "")):
                     stream["content"] = content
@@ -1086,8 +1097,26 @@ class MessageRouter:
                 "event_id": event_id,
                 "last_edit": time.monotonic(),
                 "content": content,
+                "reply_to": reply_to,
             }
             self._schedule_stream_flush(session.id)
+
+    async def _finalize_stale_stream(self, session: Session) -> None:
+        """Finalize a stream belonging to a previous turn: strip the cursor
+        so the old message stops looking in-progress, then clear tracking so
+        the next delta creates a new message."""
+        self._cancel_stream_flush(session.id)
+        stream = self._streaming.pop(session.id, None)
+        if not stream or not stream.get("event_id"):
+            return
+        final = stream.get("content", "")
+        if final:
+            try:
+                await self.matrix.edit_message(
+                    session.room_id, stream["event_id"], final,
+                )
+            except Exception as exc:
+                log.warning("Failed to finalize stale stream: %s", exc)
 
     async def _handle_agent_thinking(
         self, session: Session, msg: Message
