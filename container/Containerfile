@@ -82,10 +82,37 @@ RUN pip install --no-cache-dir /build && rm -rf /build
 # HOME must be writable because `copilot update` caches the downloaded tarball
 # under $HOME/.cache/copilot/pkg/. Errors are ignored so builds still succeed
 # offline — the runtime will just use the bundled version in that case.
-RUN HOME=/tmp/copilot-update mkdir -p "$HOME" && \
-    /usr/local/lib/python3.12/site-packages/copilot/bin/copilot update 2>&1 | tail -5 || true && \
-    /usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version || true && \
-    rm -rf /tmp/copilot-update
+# The github-copilot-sdk wheel on PyPI ships a bundled `copilot` binary that
+# extracts its embedded JS bundle to $HOME/.cache/copilot/pkg/<version>/ on
+# first run. CLI 1.0.35 has a regression in Ice() (the user-permission-response
+# resolver): it only accepts the interactive kinds (approve-once / reject /
+# user-not-available) and rejects the SDK result kinds (approved /
+# denied-interactively-by-user / denied-by-rules / ...) that the Python SDK
+# emits — breaking every shell/write/mcp/memory tool call routed via a
+# registered on_permission_request handler with "unexpected user permission
+# response". We:
+#   1. Run the binary once under a known HOME so the JS bundle is extracted.
+#   2. Patch Ice() to add the missing cases (and its renamed twin in app.js).
+#   3. Stage the patched bundle under /opt/copilot-cache so we can seed each
+#      runtime user's $HOME/.cache/copilot from it.
+#   4. Disable auto-update at runtime so the patched files aren't overwritten.
+RUN export HOME=/tmp/copilot-extract && mkdir -p "$HOME" && \
+    /usr/local/lib/python3.12/site-packages/copilot/bin/copilot update 2>&1 | tail -3 && \
+    /usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version && \
+    rm -rf /tmp/copilot-extract
+
+# Patch script applied at container start (see entrypoint.sh): extends the
+# bundled CLI's Ice() permission-response handler to accept the Python SDK's
+# result kinds. 1.0.35 introduced a regression where Ice only handles the
+# interactive-CLI kinds (approve-once/reject/user-not-available) and falls
+# through to "unexpected user permission response" for the SDK kinds
+# (approved/denied-*), breaking every shell/write/mcp/memory tool call routed
+# through a registered on_permission_request handler. We patch at runtime
+# because the single-binary CLI re-extracts its JS bundle into
+# $HOME/.cache/copilot/pkg/<platform>/<version>/ on startup, potentially
+# overwriting any build-time patch.
+COPY container/patch-copilot-cli.py /usr/local/bin/patch-copilot-cli.py
+RUN chmod +x /usr/local/bin/patch-copilot-cli.py
 
 WORKDIR /workspace
 
@@ -93,6 +120,18 @@ WORKDIR /workspace
 # If ENCLAVE_NIX_SHELL is set, wrap execution in nix-shell for that environment.
 # On nix-shell failure, falls back to running without it and sets error env vars.
 RUN printf '#!/bin/bash\n\
+# Disable CLI auto-update so our Ice() patch is not clobbered by a later\n\
+# release that may or may not have fixed the regression.\n\
+export COPILOT_AUTO_UPDATE=false\n\
+\n\
+# Trigger the bundled CLI to extract its JS bundle into $HOME/.cache/copilot\n\
+# (idempotent — a no-op if already extracted), then patch Ice() to accept the\n\
+# Python-SDK permission result kinds. Fails open: if the patch script errors\n\
+# or the pattern no longer matches (e.g. upstream fixed it), the agent still\n\
+# starts.\n\
+/usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version >/dev/null 2>&1 || true\n\
+/usr/local/bin/patch-copilot-cli.py || true\n\
+\n\
 if [ "${ENCLAVE_NIX_STORE:-0}" = "1" ]; then\n\
   source /usr/local/bin/nix-env-setup.sh\n\
 fi\n\
