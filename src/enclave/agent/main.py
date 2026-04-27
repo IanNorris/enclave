@@ -991,10 +991,7 @@ def _request_permission_sync(
         from copilot.session import PermissionRequestResult
 
     if not ipc or not ipc.is_connected:
-        return PermissionRequestResult(
-            kind="denied-by-rules",
-            feedback="Cannot reach orchestrator for approval",
-        )
+        return PermissionRequestResult(kind="reject")
 
     async def _ask() -> PermissionRequestResult:
         try:
@@ -1010,17 +1007,11 @@ def _request_permission_sync(
                 timeout=360.0,
             )
             if response.payload.get("approved", False):
-                return PermissionRequestResult(kind="approved")
-            return PermissionRequestResult(
-                kind="denied-interactively-by-user",
-                feedback=f"User denied access to: {target}",
-            )
+                return PermissionRequestResult(kind="approve-once")
+            return PermissionRequestResult(kind="reject")
         except Exception as exc:
             print(f"[agent] Permission request failed: {exc}", file=sys.stderr)
-            return PermissionRequestResult(
-                kind="denied-by-rules",
-                feedback=f"Permission request failed: {exc}",
-            )
+            return PermissionRequestResult(kind="reject")
 
     return _ask()  # Returns a coroutine (Awaitable) — SDK will await it
 
@@ -1197,19 +1188,14 @@ async def try_init_copilot(
 
         # Permission handler: screens SDK tool requests for host profile
         def perm_handler(_req: object, _meta: object) -> PermissionRequestResult:
-            # ☕ Coffee break: nudge the agent if a user message is waiting
+            # ☕ Coffee break: nudge the agent if a user message is waiting.
+            # SDK 0.3.0 dropped per-result feedback strings — we still reject
+            # the tool call, and the queued user message will be delivered at
+            # the next session.idle, so the agent learns why naturally.
             if (agent_state is not None
                     and agent_state.pending_interrupt
                     and agent_state.turns_since_enqueue >= AgentState.NUDGE_TURNS):
-                return PermissionRequestResult(
-                    kind="denied-interactively-by-user",
-                    feedback=(
-                        "☕ A user message is waiting for you. "
-                        "Please wrap up your current step and respond — "
-                        "the message will be delivered when you finish. "
-                        "Or call check_messages to see a preview."
-                    ),
-                )
+                return PermissionRequestResult(kind="reject")
 
             # Doom loop detection now sends a diagnostic message via
             # sdk_session.send(mode="immediate") in the TURN_START handler —
@@ -1219,11 +1205,11 @@ async def try_init_copilot(
 
             # Containers are already sandboxed — auto-approve everything
             if not is_host:
-                return PermissionRequestResult(kind="approved")
+                return PermissionRequestResult(kind="approve-once")
 
             # YOLO mode: auto-approve all SDK tools
             if is_yolo:
-                return PermissionRequestResult(kind="approved")
+                return PermissionRequestResult(kind="approve-once")
 
             # Host mode (non-YOLO): screen for restricted operations
             kind = getattr(_req, "kind", "")
@@ -1244,7 +1230,7 @@ async def try_init_copilot(
                     return _request_permission_sync(
                         ipc, "filesystem", outside[0], reason,
                     )
-                return PermissionRequestResult(kind="approved")
+                return PermissionRequestResult(kind="approve-once")
 
             if kind == "read":
                 path = getattr(_req, "path", "") or ""
@@ -1253,7 +1239,7 @@ async def try_init_copilot(
                     return _request_permission_sync(
                         ipc, "filesystem", path, reason,
                     )
-                return PermissionRequestResult(kind="approved")
+                return PermissionRequestResult(kind="approve-once")
 
             if kind == "write":
                 path = getattr(_req, "file_name", "") or ""
@@ -1262,10 +1248,10 @@ async def try_init_copilot(
                     return _request_permission_sync(
                         ipc, "filesystem", path, reason,
                     )
-                return PermissionRequestResult(kind="approved")
+                return PermissionRequestResult(kind="approve-once")
 
             # url, mcp, memory, hook, custom-tool — auto-approve
-            return PermissionRequestResult(kind="approved")
+            return PermissionRequestResult(kind="approve-once")
 
         prompt_dir = Path(__file__).parent / "prompts"
         prompt_parts = []
