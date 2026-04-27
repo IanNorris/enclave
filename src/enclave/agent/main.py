@@ -3264,6 +3264,19 @@ async def main() -> None:
 
     # Register message handlers
     async def on_user_message(msg: Message) -> Message | None:
+        # Real user input resets doom-loop tracking — the heuristic exists
+        # to catch agents stuck without feedback. A reply from the user
+        # IS the feedback, so any past stuck-pattern accrual is no longer
+        # actionable. (Synthetic scheduler callbacks below intentionally
+        # don't reset.)
+        if state is not None:
+            state.task_start_time = 0.0
+            state.consecutive_turns = 0
+            state.consecutive_failures = 0
+            state.doom_loop_nudged_at = 0
+            state.doom_loop_nudge_count = 0
+            state.recent_edit_targets.clear()
+            state.recent_bash_commands.clear()
         await handle_user_message(state, msg)
         return None
 
