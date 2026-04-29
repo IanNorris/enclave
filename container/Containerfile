@@ -76,6 +76,27 @@ COPY pyproject.toml /build/
 COPY src/ /build/src/
 RUN pip install --no-cache-dir /build && rm -rf /build
 
+# Mimir memory backend binaries.
+#
+# We deliberately COPY pre-built host binaries rather than building from
+# source inside the image. Reasons:
+#   1. Same artifact lineage as the host importer/sweeper — no risk of
+#      format/semantic drift between corpus producer and runtime consumer.
+#   2. Avoids adding a Rust toolchain stage (~5-10 min build cost, ~1 GB
+#      of layer bloat).
+#   3. mimir/integration is local-only for now; the binaries live at
+#      ~/Projects/Mimir-vendor/Mimir/target/release/ on the host.
+#
+# Wrapping in mimir-bin/ lets the build context glob to nothing if the
+# operator hasn't built Mimir yet — the COPY then no-ops cleanly. The
+# agent's killswitch covers the runtime case where the binaries are
+# missing or non-functional.
+#
+# When Mimir publishes release artifacts we should switch to a
+# `curl | tar` step keyed on a pinned version.
+COPY container/mimir-bin/ /usr/local/bin/
+RUN chmod +x /usr/local/bin/mimir-* 2>/dev/null || true
+
 # The github-copilot-sdk wheel on PyPI ships an older bundled `copilot` binary
 # (e.g. 1.0.21) that returns "Unknown error" on some model requests. Run the
 # CLI's self-update to grab the latest release and replace the in-place binary.

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
 from collections import Counter, deque
@@ -43,6 +44,10 @@ class AgentState:
         "doom_loop_nudged_at", "doom_loop_nudge_count",
         # Auto-continue lifecycle
         "task_done", "asked_user", "auto_continue_handle",
+        # Mimir memory backend
+        "mimir_enabled", "mimir_killswitch_reason",
+        "mimir_workspace", "mimir_cli_bin", "mimir_librarian_bin",
+        "mimir_failure_count",
     )
 
     # After this many turns with a pending message, deny tool calls to nudge
@@ -98,6 +103,28 @@ class AgentState:
         self.task_done: bool = False  # agent explicitly called mark_done
         self.asked_user: bool = False  # agent explicitly called ask_user
         self.auto_continue_handle: object | None = None  # pending call_later handle
+
+        # Mimir memory backend (read from env at startup; orchestrator
+        # populates these via container env when mimir.enabled=True).
+        self.mimir_enabled: bool = (
+            os.environ.get("ENCLAVE_MIMIR_ENABLED", "0").strip().lower()
+            in {"1", "true", "yes", "on", "enabled"}
+        )
+        self.mimir_killswitch_reason: str | None = None
+        self.mimir_failure_count: int = 0
+        # Resolve workspace, cli, librarian paths from env (with fallbacks).
+        agent_name = os.environ.get("ENCLAVE_MIMIR_AGENT_NAME", "brook")
+        ws_root = os.environ.get(
+            "ENCLAVE_MIMIR_WORKSPACE_ROOT",
+            "/home/agent/.local/share/enclave/mimir",
+        )
+        self.mimir_workspace: str = f"{ws_root.rstrip('/')}/{agent_name}"
+        self.mimir_cli_bin: str = os.environ.get(
+            "ENCLAVE_MIMIR_CLI_BIN", "/usr/local/bin/mimir-cli"
+        )
+        self.mimir_librarian_bin: str = os.environ.get(
+            "ENCLAVE_MIMIR_LIBRARIAN_BIN", "/usr/local/bin/mimir-librarian"
+        )
 
 
 def setup_session_listener(
@@ -2790,6 +2817,137 @@ async def try_init_copilot(
             },
         )
         custom_tools.append(nix_shell_tool)
+
+        # ── Mimir recall tool ────────────────────────────────────────
+        # Spawns mimir-cli per call (no persistent process) and substring-
+        # greps the decoded canonical log. v1 uses substring match because
+        # mimir-mcp's semantic recall requires Lisp `(query ...)` forms
+        # which we don't construct yet. Skipped silently when Mimir is
+        # disabled or the killswitch has tripped.
+        async def _mimir_recall_handler(invocation: object) -> ToolResult:
+            if not agent_state or not agent_state.mimir_enabled:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Mimir recall is disabled for this session. "
+                        "Skipping silently."
+                    ),
+                )
+            if agent_state.mimir_killswitch_reason:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Mimir recall is disabled (killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason})."
+                    ),
+                )
+            args = getattr(invocation, "arguments", {}) or {}
+            query = (args.get("query") or "").strip()
+            limit = int(args.get("limit") or 5)
+            if not query:
+                return ToolResult(
+                    text_result_for_llm="Error: 'query' is required.",
+                    result_type="error",
+                )
+            limit = max(1, min(limit, 50))
+            log_path = f"{agent_state.mimir_workspace}/canonical.log"
+            cli_bin = agent_state.mimir_cli_bin
+            if not Path(log_path).exists():
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"No prior memories — canonical log not yet "
+                        f"created at {log_path}."
+                    ),
+                )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    cli_bin, "decode", log_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=15.0,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"mimir-cli decode rc={proc.returncode}: "
+                        f"{stderr.decode('utf-8', errors='replace')[:200]}"
+                    )
+            except Exception as e:
+                agent_state.mimir_failure_count += 1
+                # Trip the killswitch after 3 consecutive failures so
+                # repeated mimir errors can never spiral into a doom loop.
+                if agent_state.mimir_failure_count >= 3:
+                    agent_state.mimir_killswitch_reason = (
+                        f"3 consecutive mimir-cli failures; last: {e}"
+                    )
+                    print(
+                        f"[agent] Mimir killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason}",
+                        file=sys.stderr,
+                    )
+                return ToolResult(
+                    text_result_for_llm=f"Mimir recall failed: {e}",
+                    result_type="error",
+                )
+            # Reset counter on success.
+            agent_state.mimir_failure_count = 0
+            text = stdout.decode("utf-8", errors="replace")
+            terms = [t for t in re.split(r"\W+", query.lower()) if len(t) >= 3]
+            if not terms:
+                terms = [query.lower()]
+            matches: list[str] = []
+            for line in text.splitlines():
+                lower = line.lower()
+                if any(term in lower for term in terms):
+                    matches.append(line)
+                    if len(matches) >= limit:
+                        break
+            if not matches:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"No prior memories matched terms: {terms}. "
+                        f"Canonical log has {text.count(chr(10))} records."
+                    ),
+                )
+            body = "\n".join(matches)
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Recalled {len(matches)} record(s) matching {terms}:\n"
+                    f"{body}"
+                ),
+            )
+
+        mimir_recall_tool = Tool(
+            name="mimir_recall",
+            description=(
+                "Recall durable cross-session memories from Mimir before "
+                "reasoning about a problem. Use this when the user reports "
+                "a bug, regression, or unexpected behaviour, or when you "
+                "need historical context about the project (e.g. 'what "
+                "did we try last time virtio-net crashed?'). Returns "
+                "matching canonical-log records. Read-only — does not "
+                "modify any memory. Silently no-ops if Mimir is disabled."
+            ),
+            handler=_mimir_recall_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Free-text query. Whitespace/punctuation is split "
+                            "into terms; records matching any term are returned."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max records to return (1–50, default 5).",
+                    },
+                },
+                "required": ["query"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(mimir_recall_tool)
 
         # Custom tool: consult_panel — get second opinions from expert sub-agents
         # Each panelist plays a distinct archetype to surface orthogonal concerns.

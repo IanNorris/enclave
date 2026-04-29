@@ -132,6 +132,7 @@ async def run() -> None:
         config=config.container,
         matrix=matrix,
         ipc=ipc,
+        mimir=config.mimir,
     )
 
     # Message router

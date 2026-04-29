@@ -1,0 +1,6 @@
+# Host-built Mimir binaries copied here at image-build time.
+# Do not commit — they're large (~30-50MB each) and platform-specific.
+# CI / production builds should provide them via a release-artifact fetch.
+mimir-mcp
+mimir-cli
+mimir-librarian
