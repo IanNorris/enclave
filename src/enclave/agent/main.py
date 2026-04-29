@@ -1944,7 +1944,8 @@ async def try_init_copilot(
             },
             skip_permission=True,
         )
-        custom_tools.append(remember_tool)
+        if not (agent_state and agent_state.mimir_enabled):
+            custom_tools.append(remember_tool)
 
         # Custom tool: recall — search memories from past sessions
         async def _recall_handler(invocation: object) -> ToolResult:
@@ -2010,7 +2011,8 @@ async def try_init_copilot(
             },
             skip_permission=True,
         )
-        custom_tools.append(recall_tool)
+        if not (agent_state and agent_state.mimir_enabled):
+            custom_tools.append(recall_tool)
 
         # Custom tool: forget — delete a memory
         async def _forget_handler(invocation: object) -> ToolResult:
@@ -2063,7 +2065,8 @@ async def try_init_copilot(
             },
             skip_permission=True,
         )
-        custom_tools.append(forget_tool)
+        if not (agent_state and agent_state.mimir_enabled):
+            custom_tools.append(forget_tool)
 
         # Custom tool: spawn_sub_agent — request the orchestrator to spawn a sub-agent
         async def _spawn_sub_agent_handler(invocation: object) -> ToolResult:
