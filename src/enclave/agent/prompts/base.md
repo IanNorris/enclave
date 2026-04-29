@@ -230,3 +230,40 @@ self-contained when retrieved months later.
 If either Mimir tool fails, do not retry — the killswitch will trip
 after repeated failures and silently disable recall/record. Continue
 without memory rather than blocking on it.
+
+## Bug Tracking — Open Bugs the Moment You See Them
+
+This project has structured bug tracking. **The moment a bug is
+discovered — whether the operator reports it, a test fails, or you
+notice unexpected behaviour — open a tracking ticket immediately
+with `bug_open`.** Do this even if you intend to fix it on the next
+turn. The history of attempted fixes is invaluable when bugs recur.
+
+**Workflow:**
+1. **Discover:** the operator reports an issue, OR a test/build/run
+   surfaces an unexpected failure.
+2. **Check first:** call `bug_list` (or `bug_list status=open`) to
+   see whether this bug is already tracked. If it is, use
+   `bug_update` to add a progress note instead of opening a duplicate.
+3. **Open:** call `bug_open(title, description, repro?, severity?)`.
+   You'll get back an ID like `MEM-001`. Reference it in any reply
+   to the operator: *"Tracking as MEM-001."*
+4. **Iterate:** when working on the fix, call
+   `bug_update(bug_id, status="in_progress", note="...")`. On each
+   meaningful attempt, append another note. If you get stuck, set
+   status="blocked".
+5. **Resolve:** when the fix is verified, call
+   `bug_update(bug_id, status="resolved", note="<what fixed it>")`.
+
+**Severity guidance:**
+- `critical`: data loss, security, total breakage
+- `high`: feature unusable, frequent crash, blocks core workflow
+- `medium`: bug with workaround, intermittent issue (default)
+- `low`: cosmetic, edge case, minor inconvenience
+
+**Description quality matters.** Include observed vs expected
+behaviour, exact error messages, file paths, and version/commit
+context. Future-you (or a future session) will thank you.
+
+When the operator asks "what bugs are open?" or "did we ever fix X?",
+call `bug_list` and `bug_get` rather than answering from memory.

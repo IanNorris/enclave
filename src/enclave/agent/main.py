@@ -3259,6 +3259,277 @@ async def try_init_copilot(
         )
         custom_tools.append(mimir_record_tool)
 
+        # ── Bug tracker tools (workspace-local source of truth, mirrored to
+        # Mimir for cross-session visibility). Tracking IDs are per-project,
+        # derived from SESSION_NAME, e.g. "Memory Test 4" → MEM-001.
+        from enclave.agent import bug_tracker as _bugs
+
+        _bug_workspace = working_directory
+        _session_name = os.environ.get("SESSION_NAME", "") or os.environ.get(
+            "ENCLAVE_PROJECT_NAME", ""
+        )
+        _bug_prefix = _bugs.compute_prefix(_session_name)
+
+        def _mirror_bug_to_mimir(bug, action: str, extra: str = "") -> None:
+            """Fire-and-forget Mimir record. No-op when Mimir is off."""
+            if not agent_state or not getattr(agent_state, "mimir_enabled", False):
+                return
+            if getattr(agent_state, "mimir_killswitch_reason", None):
+                return
+            submit = getattr(agent_state, "_mimir_submit_draft", None)
+            if not submit:
+                return
+            prose_parts = [
+                f"Bug {bug.id} {action}: {bug.title}.",
+                f"Status: {bug.status}, severity: {bug.severity}.",
+            ]
+            if extra:
+                prose_parts.append(extra.strip())
+            prose = " ".join(prose_parts)
+            asyncio.create_task(
+                submit(
+                    prose=prose,
+                    durability="permanent",
+                    tags=[f"bug:{bug.id}", f"bug-status:{bug.status}", "bug-tracker"],
+                    source_surface="agent-tool:bug_tracker",
+                )
+            )
+
+        async def _bug_open_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            title = (args.get("title") or "").strip()
+            description = (args.get("description") or "").strip()
+            repro = (args.get("repro") or "").strip()
+            severity = (args.get("severity") or "medium").strip().lower()
+            if not title:
+                return ToolResult(
+                    text_result_for_llm="Error: 'title' is required",
+                    result_type="error",
+                )
+            if not description:
+                return ToolResult(
+                    text_result_for_llm="Error: 'description' is required",
+                    result_type="error",
+                )
+            try:
+                bug = _bugs.open_bug(
+                    _bug_workspace,
+                    prefix=_bug_prefix,
+                    title=title,
+                    description=description,
+                    repro=repro,
+                    severity=severity,
+                )
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"Failed to open bug: {e}",
+                    result_type="error",
+                )
+            _mirror_bug_to_mimir(bug, "opened", description[:200])
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Opened {bug.id} (severity={bug.severity}). "
+                    f"File: .enclave-bugs/{bug.id}.md"
+                ),
+            )
+
+        bug_open_tool = Tool(
+            name="bug_open",
+            description=(
+                "Open a new bug with a tracking ID (e.g. MEM-001). Use the "
+                "moment a bug is discovered — even if you'll fix it "
+                "immediately. Captures title, description, repro steps, "
+                "and severity. Returns the assigned ID. Bugs are stored at "
+                ".enclave-bugs/<ID>.md and mirrored to Mimir."
+            ),
+            handler=_bug_open_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short one-line bug title",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "What's wrong, observed vs expected behaviour, "
+                            "any error messages or stack traces. Be specific."
+                        ),
+                    },
+                    "repro": {
+                        "type": "string",
+                        "description": (
+                            "Reproduction steps if known. Optional but "
+                            "highly recommended."
+                        ),
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_SEVERITY),
+                        "description": "Severity (default: medium)",
+                    },
+                },
+                "required": ["title", "description"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_open_tool)
+
+        async def _bug_update_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            bug_id = (args.get("bug_id") or "").strip()
+            status = (args.get("status") or "").strip().lower() or None
+            severity = (args.get("severity") or "").strip().lower() or None
+            note = (args.get("note") or "").strip()
+            if not bug_id:
+                return ToolResult(
+                    text_result_for_llm="Error: 'bug_id' is required",
+                    result_type="error",
+                )
+            if status and status not in _bugs.VALID_STATUS:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Invalid status '{status}'. "
+                        f"Valid: {', '.join(_bugs.VALID_STATUS)}"
+                    ),
+                    result_type="error",
+                )
+            bug = _bugs.update_bug(
+                _bug_workspace, bug_id,
+                status=status, severity=severity, note=note,
+            )
+            if not bug:
+                return ToolResult(
+                    text_result_for_llm=f"Bug {bug_id} not found",
+                    result_type="error",
+                )
+            action = f"updated → {bug.status}" if status else "updated"
+            _mirror_bug_to_mimir(bug, action, note)
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Updated {bug.id} (status={bug.status}, "
+                    f"severity={bug.severity})."
+                ),
+            )
+
+        bug_update_tool = Tool(
+            name="bug_update",
+            description=(
+                "Update an existing bug — change status, severity, or "
+                "append a progress note. Use status='resolved' or "
+                "'wontfix' to close. Use 'in_progress' when actively "
+                "working on the fix, 'blocked' when stuck."
+            ),
+            handler=_bug_update_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "bug_id": {
+                        "type": "string",
+                        "description": "The bug ID, e.g. MEM-001",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_STATUS),
+                        "description": "New status",
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_SEVERITY),
+                        "description": "New severity",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Progress note appended to History",
+                    },
+                },
+                "required": ["bug_id"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_update_tool)
+
+        async def _bug_list_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            status_filter = (args.get("status") or "").strip().lower() or None
+            if status_filter and status_filter not in _bugs.VALID_STATUS:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Invalid status filter '{status_filter}'. "
+                        f"Valid: {', '.join(_bugs.VALID_STATUS)}"
+                    ),
+                    result_type="error",
+                )
+            bugs = _bugs.list_bugs(_bug_workspace, status_filter=status_filter)
+            header = (
+                f"Project bugs (prefix={_bug_prefix}, total={len(bugs)})"
+            )
+            if status_filter:
+                header += f" [filter: status={status_filter}]"
+            return ToolResult(
+                text_result_for_llm=f"{header}\n\n{_bugs.render_table(bugs)}",
+            )
+
+        bug_list_tool = Tool(
+            name="bug_list",
+            description=(
+                "List bugs for this project. Optionally filter by status. "
+                "Use this BEFORE opening a new bug to check whether the "
+                "issue is already tracked."
+            ),
+            handler=_bug_list_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_STATUS),
+                        "description": "Filter to a specific status",
+                    },
+                },
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_list_tool)
+
+        async def _bug_get_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            bug_id = (args.get("bug_id") or "").strip()
+            if not bug_id:
+                return ToolResult(
+                    text_result_for_llm="Error: 'bug_id' is required",
+                    result_type="error",
+                )
+            p = _bugs.bug_dir(_bug_workspace) / f"{bug_id}.md"
+            if not p.is_file():
+                return ToolResult(
+                    text_result_for_llm=f"Bug {bug_id} not found",
+                    result_type="error",
+                )
+            return ToolResult(text_result_for_llm=p.read_text())
+
+        bug_get_tool = Tool(
+            name="bug_get",
+            description=(
+                "Read the full markdown for a bug, including description, "
+                "repro, and history. Use when iterating on a known bug."
+            ),
+            handler=_bug_get_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "bug_id": {
+                        "type": "string",
+                        "description": "The bug ID, e.g. MEM-001",
+                    },
+                },
+                "required": ["bug_id"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_get_tool)
+
         # Custom tool: consult_panel — get second opinions from expert sub-agents
         # Each panelist plays a distinct archetype to surface orthogonal concerns.
         async def _consult_panel_handler(invocation: object) -> ToolResult:
