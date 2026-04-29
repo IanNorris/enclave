@@ -87,6 +87,7 @@ class MessageRouter:
         approval_timeout: float = 300.0,
         idle_timeout: int = 7200,
         memory_config: Any | None = None,
+        mimir_config: Any | None = None,
     ):
         self.matrix = matrix
         self.ipc = ipc
@@ -206,6 +207,7 @@ class MessageRouter:
         # ── Memory stores (per user) ──
         self._memory_stores: dict[str, MemoryStore] = {}  # matrix_user_id → store
         self._memory_config = memory_config
+        self._mimir_config = mimir_config
         self._data_dir = data_dir or os.path.expanduser("~/.local/share/enclave")
 
         # ── Audit log ──
@@ -2580,8 +2582,14 @@ class MessageRouter:
             room_id=room_id,
         )
 
-        # Write key memories to workspace for agent to read
-        if sender:
+        # Write key memories to workspace for agent to read.
+        # When Mimir is enabled, skip this — those memories should already
+        # be in the Mimir corpus (via bulk import) and recall is the agent's
+        # responsibility, not pre-loaded context.
+        mimir_active = bool(
+            self._mimir_config and getattr(self._mimir_config, "enabled", False)
+        )
+        if sender and not mimir_active:
             store = self._get_memory_store(sender)
             if store:
                 prompt = store.key_memories_as_prompt(
