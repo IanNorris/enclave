@@ -48,6 +48,8 @@ class AgentState:
         "mimir_enabled", "mimir_killswitch_reason",
         "mimir_workspace", "mimir_cli_bin", "mimir_librarian_bin",
         "mimir_failure_count",
+        "_mimir_submit_draft",
+        "mimir_recent_user_msgs", "mimir_recent_tool_calls",
     )
 
     # After this many turns with a pending message, deny tool calls to nudge
@@ -125,6 +127,80 @@ class AgentState:
         self.mimir_librarian_bin: str = os.environ.get(
             "ENCLAVE_MIMIR_LIBRARIAN_BIN", "/usr/local/bin/mimir-librarian"
         )
+        # Wired by setup_custom_tools when Mimir tools are registered.
+        # Used by the compaction hook to submit a snapshot draft.
+        self._mimir_submit_draft = None  # type: ignore[assignment]
+        # Rolling buffers used by the compaction hook to build a summary
+        # before the SDK summarises away the rich context. Bounded so a
+        # long-running session doesn't accumulate unboundedly.
+        self.mimir_recent_user_msgs: deque[tuple[float, str]] = deque(maxlen=8)
+        self.mimir_recent_tool_calls: deque[tuple[float, str, str]] = deque(maxlen=40)
+
+
+async def _mimir_compaction_submit(
+    *,
+    submit: object,
+    msgs: list[tuple[float, str]],
+    tools: list[tuple[float, str, str]],
+) -> None:
+    """Build a compaction-window summary and submit as a Mimir draft.
+
+    Called fire-and-forget from the SESSION_COMPACTION_START handler.
+    All exceptions are swallowed (logged) — never let a Mimir failure
+    interrupt compaction. The corresponding killswitch lives on the
+    submit closure, which trips after 3 consecutive failures.
+    """
+    try:
+        import datetime as _dt
+        from collections import Counter as _Counter
+        if not msgs and not tools:
+            return
+        # Build a structured prose summary. Cue the librarian that this
+        # is a compaction-window snapshot — durability="instruction"
+        # because it captures intent + recent activity rather than a
+        # witnessed milestone.
+        parts: list[str] = []
+        parts.append(
+            "This is a Brook session-compaction snapshot. The SDK is "
+            "about to compact; capturing recent context so it survives."
+        )
+        if msgs:
+            parts.append(
+                f"\nRecent user messages ({len(msgs)}, oldest first):"
+            )
+            for ts, content in msgs:
+                ts_iso = _dt.datetime.utcfromtimestamp(ts).strftime("%H:%M:%S")
+                snippet = content.replace("\n", " ").strip()[:400]
+                parts.append(f"- [{ts_iso}] {snippet}")
+        if tools:
+            tool_counts = _Counter(t[1] for t in tools)
+            top = ", ".join(
+                f"{name}×{n}" for name, n in tool_counts.most_common(8)
+            )
+            parts.append(
+                f"\nRecent tool activity ({len(tools)} calls): {top}."
+            )
+            recent_details = [
+                f"{name}: {detail}" for _, name, detail in tools[-10:] if detail
+            ]
+            if recent_details:
+                parts.append("Last 10 tool details:")
+                parts.extend(f"- {d}" for d in recent_details)
+        prose = "\n".join(parts)
+        ok, msg = await submit(
+            prose=prose,
+            durability="instruction",
+            tags=[
+                "compaction-snapshot",
+                f"user-msgs:{len(msgs)}",
+                f"tool-calls:{len(tools)}",
+            ],
+            source_surface="agent-export",
+        )
+        if not ok:
+            print(f"[agent] Mimir compaction submit failed: {msg}", file=sys.stderr)
+    except Exception as e:
+        print(f"[agent] Mimir compaction submit error: {e}", file=sys.stderr)
 
 
 def setup_session_listener(
@@ -276,6 +352,14 @@ def setup_session_listener(
                 },
                 reply_to=reply_to,
             )))
+            # Mimir compaction-hook buffer.
+            if agent_state and agent_state.mimir_enabled:
+                try:
+                    agent_state.mimir_recent_tool_calls.append(
+                        (time.time(), str(tool_name), str(detail)[:200])
+                    )
+                except Exception:
+                    pass
             # Track edit targets for doom loop detection
             if agent_state and tool_name in ("edit", "create") and detail:
                 agent_state.recent_edit_targets.append(detail)
@@ -531,6 +615,27 @@ def setup_session_listener(
                 payload={"status": "compacting", "detail": "Context compaction in progress"},
                 reply_to=reply_to,
             )))
+            # Snapshot recent activity SYNCHRONOUSLY here so the buffers
+            # can't race compaction; then submit asynchronously so we
+            # don't block the SDK's compaction call. We deliberately
+            # capture in this handler rather than the submit coroutine
+            # because the SDK may have already pruned by the time the
+            # coroutine runs.
+            if (
+                agent_state
+                and agent_state.mimir_enabled
+                and not agent_state.mimir_killswitch_reason
+                and agent_state._mimir_submit_draft is not None
+            ):
+                msgs_snapshot = list(agent_state.mimir_recent_user_msgs)
+                tools_snapshot = list(agent_state.mimir_recent_tool_calls)
+                if msgs_snapshot or tools_snapshot:
+                    submit = agent_state._mimir_submit_draft
+                    _fire_and_forget(_mimir_compaction_submit(
+                        submit=submit,
+                        msgs=msgs_snapshot,
+                        tools=tools_snapshot,
+                    ))
 
         elif etype == SessionEventType.SESSION_COMPACTION_COMPLETE:
             msgs_removed = getattr(data, "messages_removed", None)
@@ -760,6 +865,13 @@ async def handle_user_message(
     content = msg.payload.get("content", "")
     timestamp = msg.payload.get("timestamp", "")
     raw_attachments = msg.payload.get("attachments") or []
+
+    # Track for the Mimir compaction-hook summary buffer.
+    if state.mimir_enabled and content:
+        try:
+            state.mimir_recent_user_msgs.append((time.time(), content[:1000]))
+        except Exception:
+            pass
 
     # Prepend current time context so the agent knows when the message was sent
     if timestamp:
@@ -2948,6 +3060,203 @@ async def try_init_copilot(
             skip_permission=True,
         )
         custom_tools.append(mimir_recall_tool)
+
+        # ── Mimir record tool ────────────────────────────────────────
+        # Shells out to `mimir-librarian submit` per call (slow LLM-side
+        # processing happens later, asynchronously, when the host sweeper
+        # runs). The sync submit is just file I/O — it writes a v2 envelope
+        # to drafts/pending/. Skipped silently when Mimir is disabled or
+        # the killswitch has tripped.
+        async def _mimir_submit_draft(
+            *,
+            prose: str,
+            durability: str,
+            tags: list[str] | None = None,
+            source_surface: str = "agent-export",
+        ) -> tuple[bool, str]:
+            """Submit one prose draft to the librarian. Returns (ok, message).
+
+            Shared between the mimir_record tool and the compaction hook.
+            Caller is responsible for guarding on mimir_enabled / killswitch.
+            """
+            if not agent_state:
+                return (False, "agent_state unavailable")
+            librarian_bin = agent_state.mimir_librarian_bin
+            drafts_dir = f"{agent_state.mimir_workspace}/drafts"
+            agent_name = os.environ.get("ENCLAVE_MIMIR_AGENT_NAME", "brook")
+            project_name = os.environ.get("ENCLAVE_USER_NAME", "") or "enclave"
+            operator = os.environ.get("ENCLAVE_USER_NAME", "ian")
+            # Durability cue — librarian's classifier weights @observation
+            # / @policy as 1.0, @agent_instruction as 0.95, @self_report 0.9.
+            # Map our coarse durability flag to the right marker.
+            marker = {
+                "permanent": "@observation",
+                "policy": "@policy",
+                "instruction": "@agent_instruction",
+                "transient": "@self_report",
+            }.get(durability, "@self_report")
+            # Always include the marker prefix; the librarian peels it off
+            # and uses it for confidence scoring.
+            framed = f"{marker}\n\n{prose.strip()}"
+            argv = [
+                librarian_bin, "submit",
+                "--text", framed,
+                "--drafts-dir", drafts_dir,
+                "--source-surface", source_surface,
+                "--agent", agent_name,
+                "--project", project_name,
+                "--operator", operator,
+            ]
+            for tag in tags or []:
+                argv.extend(["--tag", tag])
+            try:
+                Path(drafts_dir).mkdir(parents=True, exist_ok=True)
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=10.0,
+                )
+                if proc.returncode != 0:
+                    err = stderr.decode("utf-8", errors="replace")[:200]
+                    raise RuntimeError(f"librarian submit rc={proc.returncode}: {err}")
+                # Reset on success.
+                agent_state.mimir_failure_count = 0
+                return (True, stdout.decode("utf-8", errors="replace").strip())
+            except Exception as e:
+                agent_state.mimir_failure_count += 1
+                if agent_state.mimir_failure_count >= 3:
+                    agent_state.mimir_killswitch_reason = (
+                        f"3 consecutive mimir-librarian failures; last: {e}"
+                    )
+                    print(
+                        f"[agent] Mimir killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason}",
+                        file=sys.stderr,
+                    )
+                return (False, f"submit failed: {e}")
+
+        # Expose to the agent_state so the compaction hook can reuse it.
+        # Avoids duplicating the validation/killswitch logic.
+        if agent_state is not None:
+            agent_state._mimir_submit_draft = _mimir_submit_draft  # type: ignore[attr-defined]
+
+        async def _mimir_record_handler(invocation: object) -> ToolResult:
+            if not agent_state or not agent_state.mimir_enabled:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Mimir record is disabled for this session. "
+                        "Skipping silently."
+                    ),
+                )
+            if agent_state.mimir_killswitch_reason:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Mimir record is disabled (killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason})."
+                    ),
+                )
+            args = getattr(invocation, "arguments", {}) or {}
+            prose = (args.get("prose") or "").strip()
+            durability = (args.get("durability") or "permanent").strip().lower()
+            extra_tags_raw = args.get("tags") or []
+            if not prose:
+                return ToolResult(
+                    text_result_for_llm="Error: 'prose' is required.",
+                    result_type="error",
+                )
+            if durability not in {"permanent", "policy", "instruction", "transient"}:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: 'durability' must be one of: "
+                        "permanent, policy, instruction, transient."
+                    ),
+                    result_type="error",
+                )
+            if len(prose) > 8000:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Error: prose too long ({len(prose)} chars; max 8000). "
+                        "Split into multiple records or summarise first."
+                    ),
+                    result_type="error",
+                )
+            extra_tags = [
+                str(t).strip()[:64]
+                for t in extra_tags_raw
+                if isinstance(t, str) and t.strip()
+            ][:8]
+            ok, msg = await _mimir_submit_draft(
+                prose=prose,
+                durability=durability,
+                tags=["agent-tool:mimir_record", *extra_tags],
+            )
+            if not ok:
+                return ToolResult(
+                    text_result_for_llm=f"Mimir record failed: {msg}",
+                    result_type="error",
+                )
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Recorded ({durability}). Draft will be processed "
+                    f"asynchronously by the librarian sweeper.\n{msg}"
+                ),
+            )
+
+        mimir_record_tool = Tool(
+            name="mimir_record",
+            description=(
+                "Record a durable cross-session memory in Mimir. Use this "
+                "AFTER you have confirmed something important with the user "
+                "and want it preserved across compactions and future "
+                "sessions: a hard-won lesson, an architectural fact, a "
+                "policy the operator has confirmed, or a notable milestone. "
+                "Do NOT use this for routine status updates or transient "
+                "scratch notes. The draft is processed asynchronously by a "
+                "host-side sweeper — the canonical log is not updated "
+                "synchronously. Silently no-ops if Mimir is disabled."
+            ),
+            handler=_mimir_record_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prose": {
+                        "type": "string",
+                        "description": (
+                            "Plain English description of the fact, lesson, or "
+                            "event to record. State the subject explicitly (e.g. "
+                            "'Brook orchestrator', 'Khione host system') rather "
+                            "than relying on context. Include dates for events. "
+                            "Max 8000 characters."
+                        ),
+                    },
+                    "durability": {
+                        "type": "string",
+                        "enum": ["permanent", "policy", "instruction", "transient"],
+                        "description": (
+                            "How the librarian should weight this record. "
+                            "'permanent' = witnessed historical fact (default). "
+                            "'policy' = enduring rule (condition → action). "
+                            "'instruction' = agent intent / TODO. "
+                            "'transient' = ephemeral observation."
+                        ),
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional short tags (max 8, each ≤64 chars) for "
+                            "later filtering. Avoid PII or secrets."
+                        ),
+                    },
+                },
+                "required": ["prose"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(mimir_record_tool)
 
         # Custom tool: consult_panel — get second opinions from expert sub-agents
         # Each panelist plays a distinct archetype to surface orthogonal concerns.
