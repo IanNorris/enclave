@@ -154,6 +154,14 @@ class MimirConfig:
     mcp_bin: str = "/usr/local/bin/mimir-mcp"
     cli_bin: str = "/usr/local/bin/mimir-cli"
     librarian_bin: str = "/usr/local/bin/mimir-librarian"
+    # Host-side librarian binary, used by the orchestrator's librarian
+    # worker to drain pending drafts. Differs from `librarian_bin` because
+    # the orchestrator runs outside the container and needs a binary that
+    # links against the host's libc.
+    host_librarian_bin: str = str(
+        Path.home() / "Projects" / "Mimir-vendor" / "Mimir"
+        / "target" / "release" / "mimir-librarian"
+    )
 
 
 @dataclass
@@ -323,6 +331,9 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 mcp_bin=m.get("mcp_bin", config.mimir.mcp_bin),
                 cli_bin=m.get("cli_bin", config.mimir.cli_bin),
                 librarian_bin=m.get("librarian_bin", config.mimir.librarian_bin),
+                host_librarian_bin=m.get(
+                    "host_librarian_bin", config.mimir.host_librarian_bin,
+                ),
             )
 
         config.log_level = data.get("log_level", config.log_level)

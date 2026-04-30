@@ -210,6 +210,25 @@ class MessageRouter:
         self._mimir_config = mimir_config
         self._data_dir = data_dir or os.path.expanduser("~/.local/share/enclave")
 
+        # ── Mimir librarian worker ──
+        # Drains pending drafts whenever an agent emits a compaction-complete
+        # event or a successful mimir_record tool call. None if Mimir is
+        # disabled.
+        self._mimir_librarian = None
+        if mimir_config and getattr(mimir_config, "enabled", False):
+            from enclave.orchestrator.mimir_librarian import MimirLibrarianWorker
+            agent_name = getattr(mimir_config, "agent_name", "brook") or "brook"
+            ws_root = getattr(mimir_config, "workspace_root", "")
+            ws_dir = os.path.join(ws_root, agent_name)
+            self._mimir_librarian = MimirLibrarianWorker(
+                librarian_bin=getattr(
+                    mimir_config, "host_librarian_bin",
+                    "/usr/local/bin/mimir-librarian",
+                ),
+                canonical_log=os.path.join(ws_dir, "canonical.log"),
+                drafts_dir=os.path.join(ws_dir, "drafts"),
+            )
+
         # ── Audit log ──
         self._audit = AuditLog(self._data_dir)
 
@@ -254,6 +273,10 @@ class MessageRouter:
         # Start control socket
         await self._control.start()
 
+        # Start Mimir librarian worker (if enabled)
+        if self._mimir_librarian is not None:
+            self._mimir_librarian.start()
+
         # Auto-restore sessions that were running before last shutdown
         await self._auto_restore_sessions()
 
@@ -273,6 +296,8 @@ class MessageRouter:
                 pass
         await self._scheduler.stop()
         await self._control.stop()
+        if self._mimir_librarian is not None:
+            await self._mimir_librarian.stop()
         self._perm_db.close()
         log.info("Router stopped")
 
@@ -1278,6 +1303,16 @@ class MessageRouter:
             "tool_complete", session_id=session.id,
             tool=tool_name, success=success,
         )
+        # Mimir librarian: drain pending drafts after a successful
+        # mimir_record call (the agent just queued a new draft).
+        if (
+            success
+            and tool_name == "mimir_record"
+            and self._mimir_librarian is not None
+        ):
+            self._mimir_librarian.trigger(
+                f"mimir_record by {session.id}"
+            )
         # Keep typing indicator while more work may come
         await self.matrix.set_typing(session.room_id, True)
 
@@ -1725,6 +1760,13 @@ class MessageRouter:
             await self._update_activity(
                 session, f"🗜️ Compacted: {detail}", thread_id,
             )
+            # Mimir librarian: compaction always submits a snapshot draft
+            # (see SESSION_COMPACTION_START hook in the agent), so drain
+            # pending drafts shortly after.
+            if self._mimir_librarian is not None:
+                self._mimir_librarian.trigger(
+                    f"compaction_complete on {session.id}"
+                )
 
         elif status == "nix_shell_active":
             nix_path = msg.payload.get("path", "?")
