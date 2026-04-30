@@ -1156,21 +1156,20 @@ def _request_permission_sync(
 
 
 _MODEL_PREFERENCES: tuple[str, ...] = (
-    "claude-opus-4.7",
+    "gpt-5.5",
+    "claude-opus-4.7-xhigh",
     "claude-opus-4.6",
-    "claude-sonnet-4.6",
 )
-_REASONING_EFFORT = "medium"
+_REASONING_EFFORT = "high"
 
 # Panel archetype model preferences (first available wins).
-# Architect & Contrarian want the deepest reasoning model; Pragmatist
-# favours the fastest-thinking GPT; Skeptic favours a strong Claude
-# Sonnet for careful failure-mode analysis.
+# Architect wants the deepest reasoning; Pragmatist & Contrarian favour
+# GPT 5.5 for breadth; Skeptic uses Opus 4.6 for careful analysis.
 _PANEL_MODEL_PREFERENCES: dict[str, tuple[str, ...]] = {
-    "architect": ("claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"),
-    "pragmatist": ("gpt-5.4", "gpt-5.3-codex", "gpt-5.2"),
-    "skeptic": ("claude-sonnet-4.6", "claude-sonnet-4.5", "claude-haiku-4.5"),
-    "contrarian": ("claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"),
+    "architect": ("claude-opus-4.7-xhigh", "claude-opus-4.6", "claude-opus-4.5"),
+    "pragmatist": ("gpt-5.5", "gpt-5.4", "gpt-5.2"),
+    "skeptic": ("claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.5"),
+    "contrarian": ("gpt-5.5", "claude-opus-4.7-xhigh", "claude-opus-4.6"),
 }
 
 # Populated at startup by _configure_model(); shared with consult_panel.
