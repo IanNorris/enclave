@@ -3658,42 +3658,78 @@ async def try_init_copilot(
             skeptic_model = _resolve_model(_PANEL_MODEL_PREFERENCES["skeptic"])
             contrarian_model = _resolve_model(_PANEL_MODEL_PREFERENCES["contrarian"])
 
+            # Launch all 4 panelists in parallel via copilot -p subprocesses.
+            try:
+                import copilot as _copilot_pkg
+                cli_dir = os.path.dirname(_copilot_pkg.__file__)
+                cli_bin = os.path.join(cli_dir, "bin", "copilot")
+            except Exception:
+                cli_bin = "copilot"
+
+            panelists = [
+                ("The Architect", architect_model, architect_prompt),
+                ("The Pragmatist", pragmatist_model, pragmatist_prompt),
+                ("The Skeptic", skeptic_model, skeptic_prompt),
+                ("The Contrarian", contrarian_model, contrarian_prompt),
+            ]
+
+            async def _run_panelist(
+                name: str, model: str, prompt: str,
+            ) -> tuple[str, str]:
+                """Run a single panelist and return (name, response)."""
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        cli_bin, "-p", prompt,
+                        "--model", model,
+                        "--no-auto-update",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env={**os.environ, "NO_COLOR": "1"},
+                    )
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=180.0,
+                    )
+                    text = stdout.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        err = stderr.decode("utf-8", errors="replace").strip()
+                        return (name, f"[No response. stderr: {err[:300]}]")
+                    # Strip CLI decoration lines
+                    lines = text.split("\n")
+                    cleaned = [
+                        ln for ln in lines
+                        if not ln.startswith("●") and not ln.strip().startswith("└ {")
+                    ]
+                    return (name, "\n".join(cleaned).strip() or text)
+                except asyncio.TimeoutError:
+                    return (name, "[Timed out after 180s]")
+                except Exception as e:
+                    return (name, f"[Error: {e}]")
+
+            print(
+                f"[agent] consult_panel: launching 4 panelists "
+                f"({architect_model}, {pragmatist_model}, "
+                f"{skeptic_model}, {contrarian_model})",
+                file=sys.stderr,
+            )
+
+            results = await asyncio.gather(*(
+                _run_panelist(name, model, prompt)
+                for name, model, prompt in panelists
+            ))
+
+            # Format consolidated response
+            sections = []
+            for name, response in results:
+                sections.append(f"## {name}\n\n{response}")
+
+            consolidated = "\n\n---\n\n".join(sections)
             return ToolResult(
                 text_result_for_llm=(
-                    "To consult the expert panel, fire these 4 sub-agents in "
-                    "parallel using the `task` tool. Each has a distinct "
-                    "archetype — expect contradictory advice, that's the point. "
-                    "Synthesize; don't average.\n\n"
-                    f"**Agent 1 — The Architect ({architect_model}):**\n"
-                    "```\n"
-                    f'task(name="architect", agent_type="general-purpose", '
-                    f'model="{architect_model}", mode="background", '
-                    f'prompt={repr(architect_prompt)})\n'
-                    "```\n\n"
-                    f"**Agent 2 — The Pragmatist ({pragmatist_model}):**\n"
-                    "```\n"
-                    f'task(name="pragmatist", agent_type="general-purpose", '
-                    f'model="{pragmatist_model}", mode="background", '
-                    f'prompt={repr(pragmatist_prompt)})\n'
-                    "```\n\n"
-                    f"**Agent 3 — The Skeptic ({skeptic_model}):**\n"
-                    "```\n"
-                    f'task(name="skeptic", agent_type="general-purpose", '
-                    f'model="{skeptic_model}", mode="background", '
-                    f'prompt={repr(skeptic_prompt)})\n'
-                    "```\n\n"
-                    f"**Agent 4 — The Contrarian ({contrarian_model}):**\n"
-                    "```\n"
-                    f'task(name="contrarian", agent_type="general-purpose", '
-                    f'model="{contrarian_model}", mode="background", '
-                    f'prompt={repr(contrarian_prompt)})\n'
-                    "```\n\n"
-                    "Launch all four, then use `read_agent` to collect their "
-                    "responses. Expect sharp disagreement between the Architect "
-                    "and Pragmatist, and between the Contrarian and the others "
-                    "— that tension is where the signal is. Pick the take that "
-                    "best fits your actual constraints; don't try to please "
-                    "all four."
+                    "Here are the four panel perspectives. Expect sharp "
+                    "disagreement — that's where the signal is. Synthesize "
+                    "the takes that best fit your actual constraints; don't "
+                    "try to please all four.\n\n"
+                    + consolidated
                 ),
             )
 
