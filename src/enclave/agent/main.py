@@ -1156,11 +1156,11 @@ def _request_permission_sync(
 
 
 _MODEL_PREFERENCES: tuple[str, ...] = (
-    "gpt-5.5",
-    "claude-opus-4.7-xhigh",
     "claude-opus-4.6",
+    "claude-opus-4.7",
+    "gpt-5.5",
 )
-_REASONING_EFFORT = "high"
+_REASONING_EFFORT = "medium"
 
 # Panel archetype model preferences (first available wins).
 # Architect wants the deepest reasoning; Pragmatist & Contrarian favour
