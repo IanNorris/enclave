@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from enclave.common.config import ContainerConfig
+from enclave.common.config import ContainerConfig, MimirConfig
 from enclave.common.logging import get_logger
 
 if TYPE_CHECKING:
@@ -85,16 +85,18 @@ class SessionManager:
         matrix: EnclaveMatrixClient | None = None,
         ipc: IPCServer | None = None,
         audit: Any | None = None,
+        mimir: MimirConfig | None = None,
     ):
         self.config = config
         self.matrix = matrix
         self.ipc = ipc
         self.audit = audit
+        self.mimir = mimir
 
         # The runtime manager handles the low-level podman / host-process
         # operations.  Imported lazily to avoid circular deps.
         from enclave.orchestrator.container import ContainerManager
-        self.runtime = ContainerManager(config)
+        self.runtime = ContainerManager(config, mimir=mimir)
 
         # Session storage — runtime manager no longer owns this.
         self._sessions: dict[str, Session] = {}

@@ -132,12 +132,46 @@ class MemoryConfig:
 
 
 @dataclass
+class MimirConfig:
+    """Mimir memory backend settings (durable canonical-log memory).
+
+    Independent of MemoryConfig (legacy SQLite store). Mimir augments
+    rather than replaces the legacy store for now: both can coexist,
+    the system prompt directs the agent which to use when. Disabled
+    by default until proven stable in production.
+    """
+
+    enabled: bool = False
+    # Per-agent workspace root on host. Each agent gets <root>/<agent_name>/
+    # which contains canonical.log + drafts/. Mounted into the container at
+    # the same path layout (under the runtime user's home).
+    workspace_root: str = str(
+        Path.home() / ".local" / "share" / "enclave" / "mimir"
+    )
+    agent_name: str = "brook"
+    # Binary paths (in-container). The Containerfile installs prebuilt
+    # binaries at /usr/local/bin so the defaults work for the standard image.
+    mcp_bin: str = "/usr/local/bin/mimir-mcp"
+    cli_bin: str = "/usr/local/bin/mimir-cli"
+    librarian_bin: str = "/usr/local/bin/mimir-librarian"
+    # Host-side librarian binary, used by the orchestrator's librarian
+    # worker to drain pending drafts. Differs from `librarian_bin` because
+    # the orchestrator runs outside the container and needs a binary that
+    # links against the host's libc.
+    host_librarian_bin: str = str(
+        Path.home() / "Projects" / "Mimir-vendor" / "Mimir"
+        / "target" / "release" / "mimir-librarian"
+    )
+
+
+@dataclass
 class EnclaveConfig:
     """Top-level Enclave configuration."""
 
     matrix: MatrixConfig = field(default_factory=MatrixConfig)
     container: ContainerConfig = field(default_factory=ContainerConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    mimir: MimirConfig = field(default_factory=MimirConfig)
     approval_timeout: float = 300.0  # 5 minute approval timeout
     users: list[UserMapping] = field(default_factory=list)
     log_level: str = "INFO"
@@ -150,6 +184,11 @@ class EnclaveConfig:
             if user.matrix_id == matrix_id:
                 return user
         return None
+
+
+def _coerce_bool(value: str) -> bool:
+    """Parse env-var booleans permissively."""
+    return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
 def _apply_env_overrides(config: EnclaveConfig) -> None:
@@ -167,6 +206,11 @@ def _apply_env_overrides(config: EnclaveConfig) -> None:
         "ENCLAVE_GITHUB_TOKEN": ("container", "github_token"),
         "ENCLAVE_LOG_LEVEL": ("log_level",),
         "ENCLAVE_DATA_DIR": ("data_dir",),
+        "ENCLAVE_MIMIR_WORKSPACE_ROOT": ("mimir", "workspace_root"),
+        "ENCLAVE_MIMIR_AGENT_NAME": ("mimir", "agent_name"),
+        "ENCLAVE_MIMIR_MCP_BIN": ("mimir", "mcp_bin"),
+        "ENCLAVE_MIMIR_CLI_BIN": ("mimir", "cli_bin"),
+        "ENCLAVE_MIMIR_LIBRARIAN_BIN": ("mimir", "librarian_bin"),
     }
     for env_var, path in env_map.items():
         value = os.environ.get(env_var)
@@ -175,6 +219,11 @@ def _apply_env_overrides(config: EnclaveConfig) -> None:
             for part in path[:-1]:
                 obj = getattr(obj, part)
             setattr(obj, path[-1], value)
+
+    # Boolean env overrides (parsed permissively).
+    enabled = os.environ.get("ENCLAVE_MIMIR_ENABLED")
+    if enabled is not None:
+        config.mimir.enabled = _coerce_bool(enabled)
 
 
 def _parse_user_mapping(data: dict[str, Any]) -> UserMapping:
@@ -271,6 +320,20 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 auto_memory=mem.get("auto_memory", config.memory.auto_memory),
                 auto_dreaming=mem.get("auto_dreaming", config.memory.auto_dreaming),
                 key_memory_limit=mem.get("key_memory_limit", config.memory.key_memory_limit),
+            )
+
+        if "mimir" in data:
+            m = data["mimir"]
+            config.mimir = MimirConfig(
+                enabled=m.get("enabled", config.mimir.enabled),
+                workspace_root=m.get("workspace_root", config.mimir.workspace_root),
+                agent_name=m.get("agent_name", config.mimir.agent_name),
+                mcp_bin=m.get("mcp_bin", config.mimir.mcp_bin),
+                cli_bin=m.get("cli_bin", config.mimir.cli_bin),
+                librarian_bin=m.get("librarian_bin", config.mimir.librarian_bin),
+                host_librarian_bin=m.get(
+                    "host_librarian_bin", config.mimir.host_librarian_bin,
+                ),
             )
 
         config.log_level = data.get("log_level", config.log_level)

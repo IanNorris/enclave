@@ -19,6 +19,10 @@ COPY pyproject.toml /build/
 COPY src/ /build/src/
 RUN pip install --no-cache-dir /build && rm -rf /build
 
+# Mimir memory binaries (see Containerfile for rationale).
+COPY container/mimir-bin/ /usr/local/bin/
+RUN chmod +x /usr/local/bin/mimir-* 2>/dev/null || true
+
 WORKDIR /workspace
 
 # Agent entry point

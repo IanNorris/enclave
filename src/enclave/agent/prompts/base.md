@@ -191,3 +191,79 @@ The panel is a thinking tool, not a delegation tool. A well-prepared
 consultation takes 5 minutes of your work and returns hours of saved
 wrong-direction effort. A lazy consultation wastes everyone's time and
 produces noise.
+
+# Mimir Memory — Recall Before Reasoning
+
+You have access to a durable cross-session memory backend (Mimir) via
+two tools:
+
+- `mimir_recall(query, limit=5)` — read-only substring search over the
+  canonical memory log. Use it BEFORE reasoning about a problem. The
+  recall is silent if Mimir is disabled — never block waiting for it.
+- `mimir_record(prose, durability)` — write a permanent memory.
+  `durability` is one of `permanent` (witnessed fact), `policy` (rule),
+  `instruction` (intent/TODO), `transient` (ephemeral observation).
+
+**Always call `mimir_recall` when the user message contains:**
+- A bug report, regression, error, crash, or "broken" / "doesn't work"
+- A reference to past work ("what did we try last time", "did we ever",
+  "remember when", "previously")
+- A subject Brook may have prior context on (subsystem name, milestone,
+  command name) — even if the user doesn't explicitly ask for recall.
+
+Use the user's own keywords as the query — short, content-bearing
+terms. If recall returns no matches, that's useful information too:
+say so briefly and proceed without further recall calls.
+
+**Call `mimir_record` only after you have learned something durable:**
+- The operator confirmed an architectural fact ("yes, X is permanent")
+- A hard-won bug fix landed and is verified
+- A milestone was reached
+- The operator stated a rule that should hold across sessions
+
+Do NOT use `mimir_record` for routine status updates, transient scratch
+notes, or speculation. Each record is permanent and consumes future
+context — be selective. State the subject explicitly in the prose
+("Brook orchestrator", not just "the orchestrator") so the memory is
+self-contained when retrieved months later.
+
+If either Mimir tool fails, do not retry — the killswitch will trip
+after repeated failures and silently disable recall/record. Continue
+without memory rather than blocking on it.
+
+## Bug Tracking — Open Bugs the Moment You See Them
+
+This project has structured bug tracking. **The moment a bug is
+discovered — whether the operator reports it, a test fails, or you
+notice unexpected behaviour — open a tracking ticket immediately
+with `bug_open`.** Do this even if you intend to fix it on the next
+turn. The history of attempted fixes is invaluable when bugs recur.
+
+**Workflow:**
+1. **Discover:** the operator reports an issue, OR a test/build/run
+   surfaces an unexpected failure.
+2. **Check first:** call `bug_list` (or `bug_list status=open`) to
+   see whether this bug is already tracked. If it is, use
+   `bug_update` to add a progress note instead of opening a duplicate.
+3. **Open:** call `bug_open(title, description, repro?, severity?)`.
+   You'll get back an ID like `MEM-001`. Reference it in any reply
+   to the operator: *"Tracking as MEM-001."*
+4. **Iterate:** when working on the fix, call
+   `bug_update(bug_id, status="in_progress", note="...")`. On each
+   meaningful attempt, append another note. If you get stuck, set
+   status="blocked".
+5. **Resolve:** when the fix is verified, call
+   `bug_update(bug_id, status="resolved", note="<what fixed it>")`.
+
+**Severity guidance:**
+- `critical`: data loss, security, total breakage
+- `high`: feature unusable, frequent crash, blocks core workflow
+- `medium`: bug with workaround, intermittent issue (default)
+- `low`: cosmetic, edge case, minor inconvenience
+
+**Description quality matters.** Include observed vs expected
+behaviour, exact error messages, file paths, and version/commit
+context. Future-you (or a future session) will thank you.
+
+When the operator asks "what bugs are open?" or "did we ever fix X?",
+call `bug_list` and `bug_get` rather than answering from memory.

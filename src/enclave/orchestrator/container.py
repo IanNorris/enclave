@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from enclave.common.config import ContainerConfig
+from enclave.common.config import ContainerConfig, MimirConfig
 from enclave.common.logging import get_logger
 
 # Re-export Session so existing imports keep working
@@ -32,8 +32,9 @@ class ContainerManager:
     the responsibility of SessionManager.
     """
 
-    def __init__(self, config: ContainerConfig):
+    def __init__(self, config: ContainerConfig, *, mimir: MimirConfig | None = None):
         self.config = config
+        self.mimir = mimir
 
     async def start_session(self, session: Session) -> tuple[bool, str]:
         """Start the runtime for a session (container or host process).
@@ -90,6 +91,53 @@ class ContainerManager:
             nix_store = Path(self.config.nix_store)
             nix_store.mkdir(parents=True, exist_ok=True)
             cmd.extend(["-v", f"{nix_store}:/nix"])
+
+        # Mimir memory backend: bind-mount the per-agent workspace at the
+        # same path layout the host uses, and forward config to the agent
+        # via env. Workspace contains canonical.log + drafts/. Disabled by
+        # default (mimir.enabled=False); when disabled we only export the
+        # ENCLAVE_MIMIR_ENABLED=0 flag so the agent's killswitch trips
+        # cleanly without needing to know the workspace path.
+        if self.mimir is not None and self.mimir.enabled:
+            agent_name = self.mimir.agent_name or "brook"
+            # Defence-in-depth path validation: enforce alnum+_- and a
+            # resolved path strictly under workspace_root, so a misconfig
+            # can't escape into arbitrary host paths.
+            if not all(c.isalnum() or c in "-_" for c in agent_name):
+                log.warning(
+                    "[start:%s] Invalid mimir.agent_name=%r — disabling Mimir for this session",
+                    session.id, agent_name,
+                )
+            else:
+                root = Path(self.mimir.workspace_root).expanduser().resolve()
+                ws = (root / agent_name).resolve()
+                # ws must live strictly under root.
+                try:
+                    ws.relative_to(root)
+                    valid_path = True
+                except ValueError:
+                    valid_path = False
+                if not valid_path:
+                    log.warning(
+                        "[start:%s] Mimir workspace %s escapes root %s — disabling",
+                        session.id, ws, root,
+                    )
+                else:
+                    ws.mkdir(parents=True, exist_ok=True)
+                    (ws / "drafts" / "pending").mkdir(parents=True, exist_ok=True)
+                    container_ws = f"/home/agent/.local/share/enclave/mimir/{agent_name}"
+                    cmd.extend([
+                        "-v", f"{ws}:{container_ws}",
+                        "-e", "ENCLAVE_MIMIR_ENABLED=1",
+                        "-e", f"ENCLAVE_MIMIR_AGENT_NAME={agent_name}",
+                        "-e", f"ENCLAVE_MIMIR_WORKSPACE_ROOT=/home/agent/.local/share/enclave/mimir",
+                        "-e", f"ENCLAVE_MIMIR_MCP_BIN={self.mimir.mcp_bin}",
+                        "-e", f"ENCLAVE_MIMIR_CLI_BIN={self.mimir.cli_bin}",
+                        "-e", f"ENCLAVE_MIMIR_LIBRARIAN_BIN={self.mimir.librarian_bin}",
+                    ])
+                    log.info("[start:%s] Mimir enabled, workspace=%s", session.id, ws)
+        else:
+            cmd.extend(["-e", "ENCLAVE_MIMIR_ENABLED=0"])
 
         # Extra mounts requested by the agent (approved by user)
         for mount in getattr(session, "extra_mounts", []):

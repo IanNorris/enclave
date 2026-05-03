@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
 from collections import Counter, deque
@@ -43,6 +44,12 @@ class AgentState:
         "doom_loop_nudged_at", "doom_loop_nudge_count",
         # Auto-continue lifecycle
         "task_done", "asked_user", "auto_continue_handle",
+        # Mimir memory backend
+        "mimir_enabled", "mimir_killswitch_reason",
+        "mimir_workspace", "mimir_cli_bin", "mimir_librarian_bin",
+        "mimir_failure_count",
+        "_mimir_submit_draft",
+        "mimir_recent_user_msgs", "mimir_recent_tool_calls",
     )
 
     # After this many turns with a pending message, deny tool calls to nudge
@@ -98,6 +105,102 @@ class AgentState:
         self.task_done: bool = False  # agent explicitly called mark_done
         self.asked_user: bool = False  # agent explicitly called ask_user
         self.auto_continue_handle: object | None = None  # pending call_later handle
+
+        # Mimir memory backend (read from env at startup; orchestrator
+        # populates these via container env when mimir.enabled=True).
+        self.mimir_enabled: bool = (
+            os.environ.get("ENCLAVE_MIMIR_ENABLED", "0").strip().lower()
+            in {"1", "true", "yes", "on", "enabled"}
+        )
+        self.mimir_killswitch_reason: str | None = None
+        self.mimir_failure_count: int = 0
+        # Resolve workspace, cli, librarian paths from env (with fallbacks).
+        agent_name = os.environ.get("ENCLAVE_MIMIR_AGENT_NAME", "brook")
+        ws_root = os.environ.get(
+            "ENCLAVE_MIMIR_WORKSPACE_ROOT",
+            "/home/agent/.local/share/enclave/mimir",
+        )
+        self.mimir_workspace: str = f"{ws_root.rstrip('/')}/{agent_name}"
+        self.mimir_cli_bin: str = os.environ.get(
+            "ENCLAVE_MIMIR_CLI_BIN", "/usr/local/bin/mimir-cli"
+        )
+        self.mimir_librarian_bin: str = os.environ.get(
+            "ENCLAVE_MIMIR_LIBRARIAN_BIN", "/usr/local/bin/mimir-librarian"
+        )
+        # Wired by setup_custom_tools when Mimir tools are registered.
+        # Used by the compaction hook to submit a snapshot draft.
+        self._mimir_submit_draft = None  # type: ignore[assignment]
+        # Rolling buffers used by the compaction hook to build a summary
+        # before the SDK summarises away the rich context. Bounded so a
+        # long-running session doesn't accumulate unboundedly.
+        self.mimir_recent_user_msgs: deque[tuple[float, str]] = deque(maxlen=8)
+        self.mimir_recent_tool_calls: deque[tuple[float, str, str]] = deque(maxlen=40)
+
+
+async def _mimir_compaction_submit(
+    *,
+    submit: object,
+    msgs: list[tuple[float, str]],
+    tools: list[tuple[float, str, str]],
+) -> None:
+    """Build a compaction-window summary and submit as a Mimir draft.
+
+    Called fire-and-forget from the SESSION_COMPACTION_START handler.
+    All exceptions are swallowed (logged) — never let a Mimir failure
+    interrupt compaction. The corresponding killswitch lives on the
+    submit closure, which trips after 3 consecutive failures.
+    """
+    try:
+        import datetime as _dt
+        from collections import Counter as _Counter
+        if not msgs and not tools:
+            return
+        # Build a structured prose summary. Cue the librarian that this
+        # is a compaction-window snapshot — durability="instruction"
+        # because it captures intent + recent activity rather than a
+        # witnessed milestone.
+        parts: list[str] = []
+        parts.append(
+            "This is a Brook session-compaction snapshot. The SDK is "
+            "about to compact; capturing recent context so it survives."
+        )
+        if msgs:
+            parts.append(
+                f"\nRecent user messages ({len(msgs)}, oldest first):"
+            )
+            for ts, content in msgs:
+                ts_iso = _dt.datetime.utcfromtimestamp(ts).strftime("%H:%M:%S")
+                snippet = content.replace("\n", " ").strip()[:400]
+                parts.append(f"- [{ts_iso}] {snippet}")
+        if tools:
+            tool_counts = _Counter(t[1] for t in tools)
+            top = ", ".join(
+                f"{name}×{n}" for name, n in tool_counts.most_common(8)
+            )
+            parts.append(
+                f"\nRecent tool activity ({len(tools)} calls): {top}."
+            )
+            recent_details = [
+                f"{name}: {detail}" for _, name, detail in tools[-10:] if detail
+            ]
+            if recent_details:
+                parts.append("Last 10 tool details:")
+                parts.extend(f"- {d}" for d in recent_details)
+        prose = "\n".join(parts)
+        ok, msg = await submit(
+            prose=prose,
+            durability="instruction",
+            tags=[
+                "compaction-snapshot",
+                f"user-msgs:{len(msgs)}",
+                f"tool-calls:{len(tools)}",
+            ],
+            source_surface="agent-export",
+        )
+        if not ok:
+            print(f"[agent] Mimir compaction submit failed: {msg}", file=sys.stderr)
+    except Exception as e:
+        print(f"[agent] Mimir compaction submit error: {e}", file=sys.stderr)
 
 
 def setup_session_listener(
@@ -249,6 +352,14 @@ def setup_session_listener(
                 },
                 reply_to=reply_to,
             )))
+            # Mimir compaction-hook buffer.
+            if agent_state and agent_state.mimir_enabled:
+                try:
+                    agent_state.mimir_recent_tool_calls.append(
+                        (time.time(), str(tool_name), str(detail)[:200])
+                    )
+                except Exception:
+                    pass
             # Track edit targets for doom loop detection
             if agent_state and tool_name in ("edit", "create") and detail:
                 agent_state.recent_edit_targets.append(detail)
@@ -504,6 +615,27 @@ def setup_session_listener(
                 payload={"status": "compacting", "detail": "Context compaction in progress"},
                 reply_to=reply_to,
             )))
+            # Snapshot recent activity SYNCHRONOUSLY here so the buffers
+            # can't race compaction; then submit asynchronously so we
+            # don't block the SDK's compaction call. We deliberately
+            # capture in this handler rather than the submit coroutine
+            # because the SDK may have already pruned by the time the
+            # coroutine runs.
+            if (
+                agent_state
+                and agent_state.mimir_enabled
+                and not agent_state.mimir_killswitch_reason
+                and agent_state._mimir_submit_draft is not None
+            ):
+                msgs_snapshot = list(agent_state.mimir_recent_user_msgs)
+                tools_snapshot = list(agent_state.mimir_recent_tool_calls)
+                if msgs_snapshot or tools_snapshot:
+                    submit = agent_state._mimir_submit_draft
+                    _fire_and_forget(_mimir_compaction_submit(
+                        submit=submit,
+                        msgs=msgs_snapshot,
+                        tools=tools_snapshot,
+                    ))
 
         elif etype == SessionEventType.SESSION_COMPACTION_COMPLETE:
             msgs_removed = getattr(data, "messages_removed", None)
@@ -733,6 +865,13 @@ async def handle_user_message(
     content = msg.payload.get("content", "")
     timestamp = msg.payload.get("timestamp", "")
     raw_attachments = msg.payload.get("attachments") or []
+
+    # Track for the Mimir compaction-hook summary buffer.
+    if state.mimir_enabled and content:
+        try:
+            state.mimir_recent_user_msgs.append((time.time(), content[:1000]))
+        except Exception:
+            pass
 
     # Prepend current time context so the agent knows when the message was sent
     if timestamp:
@@ -1017,21 +1156,20 @@ def _request_permission_sync(
 
 
 _MODEL_PREFERENCES: tuple[str, ...] = (
-    "claude-opus-4.7",
     "claude-opus-4.6",
-    "claude-sonnet-4.6",
+    "claude-opus-4.7",
+    "gpt-5.5",
 )
 _REASONING_EFFORT = "medium"
 
 # Panel archetype model preferences (first available wins).
-# Architect & Contrarian want the deepest reasoning model; Pragmatist
-# favours the fastest-thinking GPT; Skeptic favours a strong Claude
-# Sonnet for careful failure-mode analysis.
+# Architect wants the deepest reasoning; Pragmatist & Contrarian favour
+# GPT 5.5 for breadth; Skeptic uses Opus 4.6 for careful analysis.
 _PANEL_MODEL_PREFERENCES: dict[str, tuple[str, ...]] = {
-    "architect": ("claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"),
-    "pragmatist": ("gpt-5.4", "gpt-5.3-codex", "gpt-5.2"),
-    "skeptic": ("claude-sonnet-4.6", "claude-sonnet-4.5", "claude-haiku-4.5"),
-    "contrarian": ("claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"),
+    "architect": ("claude-opus-4.7-xhigh", "claude-opus-4.6", "claude-opus-4.5"),
+    "pragmatist": ("gpt-5.5", "gpt-5.4", "gpt-5.2"),
+    "skeptic": ("claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.5"),
+    "contrarian": ("gpt-5.5", "claude-opus-4.7-xhigh", "claude-opus-4.6"),
 }
 
 # Populated at startup by _configure_model(); shared with consult_panel.
@@ -1871,7 +2009,8 @@ async def try_init_copilot(
             },
             skip_permission=True,
         )
-        custom_tools.append(recall_tool)
+        if not (agent_state and agent_state.mimir_enabled):
+            custom_tools.append(recall_tool)
 
         # Custom tool: forget — delete a memory
         async def _forget_handler(invocation: object) -> ToolResult:
@@ -2791,6 +2930,605 @@ async def try_init_copilot(
         )
         custom_tools.append(nix_shell_tool)
 
+        # ── Mimir recall tool ────────────────────────────────────────
+        # Spawns mimir-cli per call (no persistent process) and substring-
+        # greps the decoded canonical log. v1 uses substring match because
+        # mimir-mcp's semantic recall requires Lisp `(query ...)` forms
+        # which we don't construct yet. Skipped silently when Mimir is
+        # disabled or the killswitch has tripped.
+        async def _mimir_recall_handler(invocation: object) -> ToolResult:
+            if not agent_state or not agent_state.mimir_enabled:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Mimir recall is disabled for this session. "
+                        "Skipping silently."
+                    ),
+                )
+            if agent_state.mimir_killswitch_reason:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Mimir recall is disabled (killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason})."
+                    ),
+                )
+            args = getattr(invocation, "arguments", {}) or {}
+            query = (args.get("query") or "").strip()
+            limit = int(args.get("limit") or 5)
+            if not query:
+                return ToolResult(
+                    text_result_for_llm="Error: 'query' is required.",
+                    result_type="error",
+                )
+            limit = max(1, min(limit, 50))
+            log_path = f"{agent_state.mimir_workspace}/canonical.log"
+            cli_bin = agent_state.mimir_cli_bin
+            if not Path(log_path).exists():
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"No prior memories — canonical log not yet "
+                        f"created at {log_path}."
+                    ),
+                )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    cli_bin, "decode", log_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=15.0,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"mimir-cli decode rc={proc.returncode}: "
+                        f"{stderr.decode('utf-8', errors='replace')[:200]}"
+                    )
+            except Exception as e:
+                agent_state.mimir_failure_count += 1
+                # Trip the killswitch after 3 consecutive failures so
+                # repeated mimir errors can never spiral into a doom loop.
+                if agent_state.mimir_failure_count >= 3:
+                    agent_state.mimir_killswitch_reason = (
+                        f"3 consecutive mimir-cli failures; last: {e}"
+                    )
+                    print(
+                        f"[agent] Mimir killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason}",
+                        file=sys.stderr,
+                    )
+                return ToolResult(
+                    text_result_for_llm=f"Mimir recall failed: {e}",
+                    result_type="error",
+                )
+            # Reset counter on success.
+            agent_state.mimir_failure_count = 0
+            text = stdout.decode("utf-8", errors="replace")
+            terms = [t for t in re.split(r"\W+", query.lower()) if len(t) >= 3]
+            if not terms:
+                terms = [query.lower()]
+            matches: list[str] = []
+            for line in text.splitlines():
+                lower = line.lower()
+                if any(term in lower for term in terms):
+                    matches.append(line)
+                    if len(matches) >= limit:
+                        break
+            if not matches:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"No prior memories matched terms: {terms}. "
+                        f"Canonical log has {text.count(chr(10))} records."
+                    ),
+                )
+            body = "\n".join(matches)
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Recalled {len(matches)} record(s) matching {terms}:\n"
+                    f"{body}"
+                ),
+            )
+
+        mimir_recall_tool = Tool(
+            name="mimir_recall",
+            description=(
+                "Recall durable cross-session memories from Mimir before "
+                "reasoning about a problem. Use this when the user reports "
+                "a bug, regression, or unexpected behaviour, or when you "
+                "need historical context about the project (e.g. 'what "
+                "did we try last time virtio-net crashed?'). Returns "
+                "matching canonical-log records. Read-only — does not "
+                "modify any memory. Silently no-ops if Mimir is disabled."
+            ),
+            handler=_mimir_recall_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Free-text query. Whitespace/punctuation is split "
+                            "into terms; records matching any term are returned."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max records to return (1–50, default 5).",
+                    },
+                },
+                "required": ["query"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(mimir_recall_tool)
+
+        # ── Mimir record tool ────────────────────────────────────────
+        # Shells out to `mimir-librarian submit` per call (slow LLM-side
+        # processing happens later, asynchronously, when the host sweeper
+        # runs). The sync submit is just file I/O — it writes a v2 envelope
+        # to drafts/pending/. Skipped silently when Mimir is disabled or
+        # the killswitch has tripped.
+        async def _mimir_submit_draft(
+            *,
+            prose: str,
+            durability: str,
+            tags: list[str] | None = None,
+            source_surface: str = "agent-export",
+        ) -> tuple[bool, str]:
+            """Submit one prose draft to the librarian. Returns (ok, message).
+
+            Shared between the mimir_record tool and the compaction hook.
+            Caller is responsible for guarding on mimir_enabled / killswitch.
+            """
+            if not agent_state:
+                return (False, "agent_state unavailable")
+            librarian_bin = agent_state.mimir_librarian_bin
+            drafts_dir = f"{agent_state.mimir_workspace}/drafts"
+            agent_name = os.environ.get("ENCLAVE_MIMIR_AGENT_NAME", "brook")
+            project_name = os.environ.get("ENCLAVE_USER_NAME", "") or "enclave"
+            operator = os.environ.get("ENCLAVE_USER_NAME", "ian")
+            # Durability cue — librarian's classifier weights @observation
+            # / @policy as 1.0, @agent_instruction as 0.95, @self_report 0.9.
+            # Map our coarse durability flag to the right marker.
+            marker = {
+                "permanent": "@observation",
+                "policy": "@policy",
+                "instruction": "@agent_instruction",
+                "transient": "@self_report",
+            }.get(durability, "@self_report")
+            # Always include the marker prefix; the librarian peels it off
+            # and uses it for confidence scoring.
+            framed = f"{marker}\n\n{prose.strip()}"
+            argv = [
+                librarian_bin, "submit",
+                "--text", framed,
+                "--drafts-dir", drafts_dir,
+                "--source-surface", source_surface,
+                "--agent", agent_name,
+                "--project", project_name,
+                "--operator", operator,
+            ]
+            for tag in tags or []:
+                argv.extend(["--tag", tag])
+            try:
+                Path(drafts_dir).mkdir(parents=True, exist_ok=True)
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=10.0,
+                )
+                if proc.returncode != 0:
+                    err = stderr.decode("utf-8", errors="replace")[:200]
+                    raise RuntimeError(f"librarian submit rc={proc.returncode}: {err}")
+                # Reset on success.
+                agent_state.mimir_failure_count = 0
+                return (True, stdout.decode("utf-8", errors="replace").strip())
+            except Exception as e:
+                agent_state.mimir_failure_count += 1
+                if agent_state.mimir_failure_count >= 3:
+                    agent_state.mimir_killswitch_reason = (
+                        f"3 consecutive mimir-librarian failures; last: {e}"
+                    )
+                    print(
+                        f"[agent] Mimir killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason}",
+                        file=sys.stderr,
+                    )
+                return (False, f"submit failed: {e}")
+
+        # Expose to the agent_state so the compaction hook can reuse it.
+        # Avoids duplicating the validation/killswitch logic.
+        if agent_state is not None:
+            agent_state._mimir_submit_draft = _mimir_submit_draft  # type: ignore[attr-defined]
+
+        async def _mimir_record_handler(invocation: object) -> ToolResult:
+            if not agent_state or not agent_state.mimir_enabled:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Mimir record is disabled for this session. "
+                        "Skipping silently."
+                    ),
+                )
+            if agent_state.mimir_killswitch_reason:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Mimir record is disabled (killswitch tripped: "
+                        f"{agent_state.mimir_killswitch_reason})."
+                    ),
+                )
+            args = getattr(invocation, "arguments", {}) or {}
+            prose = (args.get("prose") or "").strip()
+            durability = (args.get("durability") or "permanent").strip().lower()
+            extra_tags_raw = args.get("tags") or []
+            if not prose:
+                return ToolResult(
+                    text_result_for_llm="Error: 'prose' is required.",
+                    result_type="error",
+                )
+            if durability not in {"permanent", "policy", "instruction", "transient"}:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: 'durability' must be one of: "
+                        "permanent, policy, instruction, transient."
+                    ),
+                    result_type="error",
+                )
+            if len(prose) > 8000:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Error: prose too long ({len(prose)} chars; max 8000). "
+                        "Split into multiple records or summarise first."
+                    ),
+                    result_type="error",
+                )
+            extra_tags = [
+                str(t).strip()[:64]
+                for t in extra_tags_raw
+                if isinstance(t, str) and t.strip()
+            ][:8]
+            ok, msg = await _mimir_submit_draft(
+                prose=prose,
+                durability=durability,
+                tags=["agent-tool:mimir_record", *extra_tags],
+            )
+            if not ok:
+                return ToolResult(
+                    text_result_for_llm=f"Mimir record failed: {msg}",
+                    result_type="error",
+                )
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Recorded ({durability}). Draft will be processed "
+                    f"asynchronously by the librarian sweeper.\n{msg}"
+                ),
+            )
+
+        mimir_record_tool = Tool(
+            name="mimir_record",
+            description=(
+                "Record a durable cross-session memory in Mimir. Use this "
+                "AFTER you have confirmed something important with the user "
+                "and want it preserved across compactions and future "
+                "sessions: a hard-won lesson, an architectural fact, a "
+                "policy the operator has confirmed, or a notable milestone. "
+                "Do NOT use this for routine status updates or transient "
+                "scratch notes. The draft is processed asynchronously by a "
+                "host-side sweeper — the canonical log is not updated "
+                "synchronously. Silently no-ops if Mimir is disabled."
+            ),
+            handler=_mimir_record_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prose": {
+                        "type": "string",
+                        "description": (
+                            "Plain English description of the fact, lesson, or "
+                            "event to record. State the subject explicitly (e.g. "
+                            "'Brook orchestrator', 'Khione host system') rather "
+                            "than relying on context. Include dates for events. "
+                            "Max 8000 characters."
+                        ),
+                    },
+                    "durability": {
+                        "type": "string",
+                        "enum": ["permanent", "policy", "instruction", "transient"],
+                        "description": (
+                            "How the librarian should weight this record. "
+                            "'permanent' = witnessed historical fact (default). "
+                            "'policy' = enduring rule (condition → action). "
+                            "'instruction' = agent intent / TODO. "
+                            "'transient' = ephemeral observation."
+                        ),
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional short tags (max 8, each ≤64 chars) for "
+                            "later filtering. Avoid PII or secrets."
+                        ),
+                    },
+                },
+                "required": ["prose"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(mimir_record_tool)
+
+        # ── Bug tracker tools (workspace-local source of truth, mirrored to
+        # Mimir for cross-session visibility). Tracking IDs are per-project,
+        # derived from SESSION_NAME, e.g. "Memory Test 4" → MEM-001.
+        from enclave.agent import bug_tracker as _bugs
+
+        _bug_workspace = working_directory
+        _session_name = os.environ.get("SESSION_NAME", "") or os.environ.get(
+            "ENCLAVE_PROJECT_NAME", ""
+        )
+        _bug_prefix = _bugs.compute_prefix(_session_name)
+
+        def _mirror_bug_to_mimir(bug, action: str, extra: str = "") -> None:
+            """Fire-and-forget Mimir record. No-op when Mimir is off."""
+            if not agent_state or not getattr(agent_state, "mimir_enabled", False):
+                return
+            if getattr(agent_state, "mimir_killswitch_reason", None):
+                return
+            submit = getattr(agent_state, "_mimir_submit_draft", None)
+            if not submit:
+                return
+            prose_parts = [
+                f"Bug {bug.id} {action}: {bug.title}.",
+                f"Status: {bug.status}, severity: {bug.severity}.",
+            ]
+            if extra:
+                prose_parts.append(extra.strip())
+            prose = " ".join(prose_parts)
+            asyncio.create_task(
+                submit(
+                    prose=prose,
+                    durability="permanent",
+                    tags=[f"bug:{bug.id}", f"bug-status:{bug.status}", "bug-tracker"],
+                    source_surface="agent-tool:bug_tracker",
+                )
+            )
+
+        async def _bug_open_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            title = (args.get("title") or "").strip()
+            description = (args.get("description") or "").strip()
+            repro = (args.get("repro") or "").strip()
+            severity = (args.get("severity") or "medium").strip().lower()
+            if not title:
+                return ToolResult(
+                    text_result_for_llm="Error: 'title' is required",
+                    result_type="error",
+                )
+            if not description:
+                return ToolResult(
+                    text_result_for_llm="Error: 'description' is required",
+                    result_type="error",
+                )
+            try:
+                bug = _bugs.open_bug(
+                    _bug_workspace,
+                    prefix=_bug_prefix,
+                    title=title,
+                    description=description,
+                    repro=repro,
+                    severity=severity,
+                )
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"Failed to open bug: {e}",
+                    result_type="error",
+                )
+            _mirror_bug_to_mimir(bug, "opened", description[:200])
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Opened {bug.id} (severity={bug.severity}). "
+                    f"File: .enclave-bugs/{bug.id}.md"
+                ),
+            )
+
+        bug_open_tool = Tool(
+            name="bug_open",
+            description=(
+                "Open a new bug with a tracking ID (e.g. MEM-001). Use the "
+                "moment a bug is discovered — even if you'll fix it "
+                "immediately. Captures title, description, repro steps, "
+                "and severity. Returns the assigned ID. Bugs are stored at "
+                ".enclave-bugs/<ID>.md and mirrored to Mimir."
+            ),
+            handler=_bug_open_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short one-line bug title",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "What's wrong, observed vs expected behaviour, "
+                            "any error messages or stack traces. Be specific."
+                        ),
+                    },
+                    "repro": {
+                        "type": "string",
+                        "description": (
+                            "Reproduction steps if known. Optional but "
+                            "highly recommended."
+                        ),
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_SEVERITY),
+                        "description": "Severity (default: medium)",
+                    },
+                },
+                "required": ["title", "description"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_open_tool)
+
+        async def _bug_update_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            bug_id = (args.get("bug_id") or "").strip()
+            status = (args.get("status") or "").strip().lower() or None
+            severity = (args.get("severity") or "").strip().lower() or None
+            note = (args.get("note") or "").strip()
+            if not bug_id:
+                return ToolResult(
+                    text_result_for_llm="Error: 'bug_id' is required",
+                    result_type="error",
+                )
+            if status and status not in _bugs.VALID_STATUS:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Invalid status '{status}'. "
+                        f"Valid: {', '.join(_bugs.VALID_STATUS)}"
+                    ),
+                    result_type="error",
+                )
+            bug = _bugs.update_bug(
+                _bug_workspace, bug_id,
+                status=status, severity=severity, note=note,
+            )
+            if not bug:
+                return ToolResult(
+                    text_result_for_llm=f"Bug {bug_id} not found",
+                    result_type="error",
+                )
+            action = f"updated → {bug.status}" if status else "updated"
+            _mirror_bug_to_mimir(bug, action, note)
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Updated {bug.id} (status={bug.status}, "
+                    f"severity={bug.severity})."
+                ),
+            )
+
+        bug_update_tool = Tool(
+            name="bug_update",
+            description=(
+                "Update an existing bug — change status, severity, or "
+                "append a progress note. Use status='resolved' or "
+                "'wontfix' to close. Use 'in_progress' when actively "
+                "working on the fix, 'blocked' when stuck."
+            ),
+            handler=_bug_update_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "bug_id": {
+                        "type": "string",
+                        "description": "The bug ID, e.g. MEM-001",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_STATUS),
+                        "description": "New status",
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_SEVERITY),
+                        "description": "New severity",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Progress note appended to History",
+                    },
+                },
+                "required": ["bug_id"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_update_tool)
+
+        async def _bug_list_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            status_filter = (args.get("status") or "").strip().lower() or None
+            if status_filter and status_filter not in _bugs.VALID_STATUS:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Invalid status filter '{status_filter}'. "
+                        f"Valid: {', '.join(_bugs.VALID_STATUS)}"
+                    ),
+                    result_type="error",
+                )
+            bugs = _bugs.list_bugs(_bug_workspace, status_filter=status_filter)
+            header = (
+                f"Project bugs (prefix={_bug_prefix}, total={len(bugs)})"
+            )
+            if status_filter:
+                header += f" [filter: status={status_filter}]"
+            return ToolResult(
+                text_result_for_llm=f"{header}\n\n{_bugs.render_table(bugs)}",
+            )
+
+        bug_list_tool = Tool(
+            name="bug_list",
+            description=(
+                "List bugs for this project. Optionally filter by status. "
+                "Use this BEFORE opening a new bug to check whether the "
+                "issue is already tracked."
+            ),
+            handler=_bug_list_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": list(_bugs.VALID_STATUS),
+                        "description": "Filter to a specific status",
+                    },
+                },
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_list_tool)
+
+        async def _bug_get_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            bug_id = (args.get("bug_id") or "").strip()
+            if not bug_id:
+                return ToolResult(
+                    text_result_for_llm="Error: 'bug_id' is required",
+                    result_type="error",
+                )
+            p = _bugs.bug_dir(_bug_workspace) / f"{bug_id}.md"
+            if not p.is_file():
+                return ToolResult(
+                    text_result_for_llm=f"Bug {bug_id} not found",
+                    result_type="error",
+                )
+            return ToolResult(text_result_for_llm=p.read_text())
+
+        bug_get_tool = Tool(
+            name="bug_get",
+            description=(
+                "Read the full markdown for a bug, including description, "
+                "repro, and history. Use when iterating on a known bug."
+            ),
+            handler=_bug_get_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "bug_id": {
+                        "type": "string",
+                        "description": "The bug ID, e.g. MEM-001",
+                    },
+                },
+                "required": ["bug_id"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(bug_get_tool)
+
         # Custom tool: consult_panel — get second opinions from expert sub-agents
         # Each panelist plays a distinct archetype to surface orthogonal concerns.
         async def _consult_panel_handler(invocation: object) -> ToolResult:
@@ -2920,42 +3658,78 @@ async def try_init_copilot(
             skeptic_model = _resolve_model(_PANEL_MODEL_PREFERENCES["skeptic"])
             contrarian_model = _resolve_model(_PANEL_MODEL_PREFERENCES["contrarian"])
 
+            # Launch all 4 panelists in parallel via copilot -p subprocesses.
+            try:
+                import copilot as _copilot_pkg
+                cli_dir = os.path.dirname(_copilot_pkg.__file__)
+                cli_bin = os.path.join(cli_dir, "bin", "copilot")
+            except Exception:
+                cli_bin = "copilot"
+
+            panelists = [
+                ("The Architect", architect_model, architect_prompt),
+                ("The Pragmatist", pragmatist_model, pragmatist_prompt),
+                ("The Skeptic", skeptic_model, skeptic_prompt),
+                ("The Contrarian", contrarian_model, contrarian_prompt),
+            ]
+
+            async def _run_panelist(
+                name: str, model: str, prompt: str,
+            ) -> tuple[str, str]:
+                """Run a single panelist and return (name, response)."""
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        cli_bin, "-p", prompt,
+                        "--model", model,
+                        "--no-auto-update",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env={**os.environ, "NO_COLOR": "1"},
+                    )
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=180.0,
+                    )
+                    text = stdout.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        err = stderr.decode("utf-8", errors="replace").strip()
+                        return (name, f"[No response. stderr: {err[:300]}]")
+                    # Strip CLI decoration lines
+                    lines = text.split("\n")
+                    cleaned = [
+                        ln for ln in lines
+                        if not ln.startswith("●") and not ln.strip().startswith("└ {")
+                    ]
+                    return (name, "\n".join(cleaned).strip() or text)
+                except asyncio.TimeoutError:
+                    return (name, "[Timed out after 180s]")
+                except Exception as e:
+                    return (name, f"[Error: {e}]")
+
+            print(
+                f"[agent] consult_panel: launching 4 panelists "
+                f"({architect_model}, {pragmatist_model}, "
+                f"{skeptic_model}, {contrarian_model})",
+                file=sys.stderr,
+            )
+
+            results = await asyncio.gather(*(
+                _run_panelist(name, model, prompt)
+                for name, model, prompt in panelists
+            ))
+
+            # Format consolidated response
+            sections = []
+            for name, response in results:
+                sections.append(f"## {name}\n\n{response}")
+
+            consolidated = "\n\n---\n\n".join(sections)
             return ToolResult(
                 text_result_for_llm=(
-                    "To consult the expert panel, fire these 4 sub-agents in "
-                    "parallel using the `task` tool. Each has a distinct "
-                    "archetype — expect contradictory advice, that's the point. "
-                    "Synthesize; don't average.\n\n"
-                    f"**Agent 1 — The Architect ({architect_model}):**\n"
-                    "```\n"
-                    f'task(name="architect", agent_type="general-purpose", '
-                    f'model="{architect_model}", mode="background", '
-                    f'prompt={repr(architect_prompt)})\n'
-                    "```\n\n"
-                    f"**Agent 2 — The Pragmatist ({pragmatist_model}):**\n"
-                    "```\n"
-                    f'task(name="pragmatist", agent_type="general-purpose", '
-                    f'model="{pragmatist_model}", mode="background", '
-                    f'prompt={repr(pragmatist_prompt)})\n'
-                    "```\n\n"
-                    f"**Agent 3 — The Skeptic ({skeptic_model}):**\n"
-                    "```\n"
-                    f'task(name="skeptic", agent_type="general-purpose", '
-                    f'model="{skeptic_model}", mode="background", '
-                    f'prompt={repr(skeptic_prompt)})\n'
-                    "```\n\n"
-                    f"**Agent 4 — The Contrarian ({contrarian_model}):**\n"
-                    "```\n"
-                    f'task(name="contrarian", agent_type="general-purpose", '
-                    f'model="{contrarian_model}", mode="background", '
-                    f'prompt={repr(contrarian_prompt)})\n'
-                    "```\n\n"
-                    "Launch all four, then use `read_agent` to collect their "
-                    "responses. Expect sharp disagreement between the Architect "
-                    "and Pragmatist, and between the Contrarian and the others "
-                    "— that tension is where the signal is. Pick the take that "
-                    "best fits your actual constraints; don't try to please "
-                    "all four."
+                    "Here are the four panel perspectives. Expect sharp "
+                    "disagreement — that's where the signal is. Synthesize "
+                    "the takes that best fit your actual constraints; don't "
+                    "try to please all four.\n\n"
+                    + consolidated
                 ),
             )
 

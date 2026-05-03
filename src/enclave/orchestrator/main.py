@@ -132,6 +132,7 @@ async def run() -> None:
         config=config.container,
         matrix=matrix,
         ipc=ipc,
+        mimir=config.mimir,
     )
 
     # Message router
@@ -148,6 +149,7 @@ async def run() -> None:
         approval_timeout=config.approval_timeout,
         idle_timeout=config.idle_timeout,
         memory_config=config.memory,
+        mimir_config=config.mimir,
     )
     await router.start()
 
