@@ -1,0 +1,114 @@
+:root {
+  --bg-main: #0f1117;
+  --bg-sidebar: #161822;
+  --bg-card: #1c1f2e;
+  --bg-hover: #1f2233;
+  --bg-active: #1a2440;
+  --border: #2a2d3e;
+  --text-primary: #e4e6f0;
+  --text-secondary: #8b8fa7;
+  --text-muted: #5c6078;
+  --accent: #6c9fff;
+  --accent-hover: #5a8fe8;
+  --success: #4caf7a;
+  --warning: #e8a838;
+  --danger: #e05555;
+  --badge-running: #1a3a2a;
+  --badge-running-text: #4caf7a;
+  --badge-stopped: #2a2025;
+  --badge-stopped-text: #8b8fa7;
+  --radius: 8px;
+  --radius-sm: 4px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+  background: var(--bg-main);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  padding: 0.5rem 1rem;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+button.primary {
+  background: var(--accent);
+  color: white;
+}
+
+button.primary:hover {
+  background: var(--accent-hover);
+}
+
+button.danger {
+  background: var(--danger);
+  color: white;
+}
+
+button.secondary {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+}
+
+button.secondary:hover {
+  background: var(--bg-active);
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.badge.running {
+  background: var(--badge-running);
+  color: var(--badge-running-text);
+}
+
+.badge.stopped {
+  background: var(--badge-stopped);
+  color: var(--badge-stopped-text);
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+}
+
+h2 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 0 0 1.5rem;
+}
+
+input, textarea, select {
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.9rem;
+  width: 100%;
+}
+
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+}

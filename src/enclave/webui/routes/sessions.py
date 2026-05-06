@@ -1,0 +1,407 @@
+"""Session management API routes.
+
+Provides endpoints to list, start, stop, restart sessions,
+inspect and clear state, and manage named snapshots.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import zipfile
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+router = APIRouter()
+
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _get_config(request: Request):
+    return request.app.state.config
+
+
+def _workspace_base(request: Request) -> Path:
+    return Path(_get_config(request).container.workspace_base)
+
+
+def _session_base(request: Request) -> Path:
+    return Path(_get_config(request).container.session_base)
+
+
+def _socket_dir(request: Request) -> Path:
+    return Path(_get_config(request).container.socket_dir)
+
+
+def _snapshots_dir() -> Path:
+    d = Path.home() / ".local" / "share" / "enclave" / "snapshots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _discover_sessions(request: Request) -> list[dict[str, Any]]:
+    """Discover sessions from workspace directories."""
+    ws_base = _workspace_base(request)
+    sessions = []
+    if not ws_base.exists():
+        return sessions
+
+    for entry in sorted(ws_base.iterdir()):
+        if not entry.is_dir():
+            continue
+        session_id = entry.name
+        # Check if agent socket exists (indicates running)
+        socket_path = _socket_dir(request) / f"{session_id}.sock"
+        is_running = socket_path.exists()
+
+        # Try to get session name from config
+        name = session_id
+        config_file = entry / ".enclave-session.json"
+        if config_file.exists():
+            try:
+                data = json.loads(config_file.read_text())
+                name = data.get("name", session_id)
+            except Exception:
+                pass
+
+        sessions.append({
+            "id": session_id,
+            "name": name,
+            "status": "running" if is_running else "stopped",
+            "workspace": str(entry),
+        })
+
+    return sessions
+
+
+def _get_session_workspace(request: Request, session_id: str) -> Path:
+    """Get workspace path for a session, raise 404 if not found."""
+    ws = _workspace_base(request) / session_id
+    if not ws.exists():
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return ws
+
+
+def _copilot_state_dir(request: Request, session_id: str) -> Path:
+    """Get the .copilot-state directory for a session."""
+    ws = _get_session_workspace(request, session_id)
+    state_dir = ws / ".copilot-state"
+    return state_dir
+
+
+# ─── Models ─────────────────────────────────────────────────────────────────
+
+
+class SnapshotCreate(BaseModel):
+    name: str
+
+
+# ─── Session List / Status ──────────────────────────────────────────────────
+
+
+@router.get("")
+async def list_sessions(request: Request):
+    """List all known sessions with their status."""
+    return _discover_sessions(request)
+
+
+@router.get("/{session_id}")
+async def get_session(request: Request, session_id: str):
+    """Get details for a specific session."""
+    sessions = _discover_sessions(request)
+    for s in sessions:
+        if s["id"] == session_id:
+            return s
+    raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+
+# ─── Session Control ────────────────────────────────────────────────────────
+
+
+@router.post("/{session_id}/stop")
+async def stop_session(request: Request, session_id: str):
+    """Stop a running session by sending a stop command via IPC."""
+    # For now, use podman stop directly
+    proc = await asyncio.create_subprocess_exec(
+        "podman", "stop", "-t", "10", session_id,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        err = stderr.decode().strip()
+        if "no such container" in err.lower() or "not found" in err.lower():
+            raise HTTPException(status_code=404, detail=f"Container {session_id} not found or not running")
+        raise HTTPException(status_code=500, detail=f"Failed to stop: {err}")
+    return {"status": "stopped", "session_id": session_id}
+
+
+@router.post("/{session_id}/restart")
+async def restart_session(request: Request, session_id: str):
+    """Restart a session (stop + orchestrator will auto-restart)."""
+    # Stop container — orchestrator auto-restores on next sync
+    proc = await asyncio.create_subprocess_exec(
+        "podman", "stop", "-t", "10", session_id,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    return {"status": "restarting", "session_id": session_id}
+
+
+# ─── State Inspection ───────────────────────────────────────────────────────
+
+
+@router.get("/{session_id}/state")
+async def get_state_tree(request: Request, session_id: str):
+    """Get the file tree of the .copilot-state directory."""
+    state_dir = _copilot_state_dir(request, session_id)
+    if not state_dir.exists():
+        return {"files": [], "exists": False}
+
+    files = []
+    for root, dirs, filenames in os.walk(state_dir):
+        # Skip __pycache__ and .git
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "node_modules")]
+        for fname in sorted(filenames):
+            fpath = Path(root) / fname
+            rel = fpath.relative_to(state_dir)
+            try:
+                size = fpath.stat().st_size
+            except OSError:
+                size = 0
+            files.append({
+                "path": str(rel),
+                "size": size,
+                "modified": datetime.fromtimestamp(
+                    fpath.stat().st_mtime, tz=timezone.utc
+                ).isoformat() if fpath.exists() else None,
+            })
+    return {"files": files, "exists": True}
+
+
+@router.get("/{session_id}/state/{file_path:path}")
+async def get_state_file(request: Request, session_id: str, file_path: str):
+    """Read the contents of a specific state file."""
+    state_dir = _copilot_state_dir(request, session_id)
+    target = state_dir / file_path
+
+    # Security: prevent path traversal
+    try:
+        target.resolve().relative_to(state_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Not a file")
+
+    # Read as text if possible, binary as base64 otherwise
+    try:
+        content = target.read_text(encoding="utf-8")
+        return {"path": file_path, "content": content, "encoding": "utf-8"}
+    except UnicodeDecodeError:
+        import base64
+        content = base64.b64encode(target.read_bytes()).decode("ascii")
+        return {"path": file_path, "content": content, "encoding": "base64"}
+
+
+@router.delete("/{session_id}/state")
+async def clear_state(request: Request, session_id: str):
+    """Clear the .copilot-state directory for a session."""
+    state_dir = _copilot_state_dir(request, session_id)
+    if not state_dir.exists():
+        return {"cleared": False, "reason": "no state directory"}
+
+    # Remove and recreate empty
+    shutil.rmtree(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return {"cleared": True, "session_id": session_id}
+
+
+# ─── Snapshots ──────────────────────────────────────────────────────────────
+
+
+def _session_snapshots_dir(session_id: str) -> Path:
+    d = _snapshots_dir() / session_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@router.get("/{session_id}/snapshots")
+async def list_snapshots(session_id: str):
+    """List all named snapshots for a session."""
+    snap_dir = _session_snapshots_dir(session_id)
+    snapshots = []
+    for f in sorted(snap_dir.iterdir()):
+        if f.suffix == ".zip":
+            snapshots.append({
+                "name": f.stem,
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "created": datetime.fromtimestamp(
+                    f.stat().st_ctime, tz=timezone.utc
+                ).isoformat(),
+            })
+    return snapshots
+
+
+@router.post("/{session_id}/snapshots")
+async def create_snapshot(request: Request, session_id: str, body: SnapshotCreate):
+    """Create a named snapshot of the session's .copilot-state."""
+    state_dir = _copilot_state_dir(request, session_id)
+    if not state_dir.exists():
+        raise HTTPException(status_code=404, detail="No state directory to snapshot")
+
+    snap_dir = _session_snapshots_dir(session_id)
+    # Sanitize name
+    safe_name = "".join(c for c in body.name if c.isalnum() or c in "-_ ").strip()
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid snapshot name")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"{safe_name}_{timestamp}.zip"
+    zip_path = snap_dir / filename
+
+    # Create zip of state dir
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(state_dir):
+            dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git")]
+            for fname in files:
+                fpath = Path(root) / fname
+                arcname = fpath.relative_to(state_dir)
+                zf.write(fpath, arcname)
+
+    return {
+        "name": safe_name,
+        "filename": filename,
+        "size": zip_path.stat().st_size,
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/{session_id}/snapshots/{filename}/download")
+async def download_snapshot(session_id: str, filename: str):
+    """Download a snapshot as a zip file."""
+    snap_dir = _session_snapshots_dir(session_id)
+    zip_path = snap_dir / filename
+
+    if not zip_path.exists() or not zip_path.suffix == ".zip":
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    # Security check
+    try:
+        zip_path.resolve().relative_to(snap_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid path")
+
+    def iter_file():
+        with open(zip_path, "rb") as f:
+            while chunk := f.read(65536):
+                yield chunk
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/{session_id}/snapshots/{filename}/restore")
+async def restore_snapshot(request: Request, session_id: str, filename: str):
+    """Restore a snapshot, replacing current .copilot-state."""
+    snap_dir = _session_snapshots_dir(session_id)
+    zip_path = snap_dir / filename
+
+    if not zip_path.exists() or not zip_path.suffix == ".zip":
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    state_dir = _copilot_state_dir(request, session_id)
+
+    # Clear existing state
+    if state_dir.exists():
+        shutil.rmtree(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract snapshot
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(state_dir)
+
+    return {"restored": True, "from": filename, "session_id": session_id}
+
+
+@router.delete("/{session_id}/snapshots/{filename}")
+async def delete_snapshot(session_id: str, filename: str):
+    """Delete a named snapshot."""
+    snap_dir = _session_snapshots_dir(session_id)
+    zip_path = snap_dir / filename
+
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    zip_path.unlink()
+    return {"deleted": True, "filename": filename}
+
+
+# ─── Logs ───────────────────────────────────────────────────────────────────
+
+
+@router.get("/{session_id}/logs")
+async def get_logs(request: Request, session_id: str, lines: int = 100, since: str | None = None):
+    """Get recent log lines for a session from journalctl."""
+    cmd = [
+        "journalctl", "--user", "-u", "enclave",
+        "--no-pager", "-n", str(min(lines, 5000)),
+        "-o", "short-iso",
+    ]
+    if since:
+        cmd.extend(["--since", since])
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    all_lines = stdout.decode("utf-8", errors="replace").split("\n")
+
+    # Filter to lines containing the session_id
+    filtered = [ln for ln in all_lines if session_id in ln]
+    return {"lines": filtered[-lines:], "session_id": session_id}
+
+
+@router.websocket("/{session_id}/logs/stream")
+async def stream_logs(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint for live-tailing session logs."""
+    await websocket.accept()
+
+    proc = await asyncio.create_subprocess_exec(
+        "journalctl", "--user", "-u", "enclave",
+        "--no-pager", "-f", "-o", "short-iso",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        while True:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=30.0)
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+            if session_id in decoded:
+                await websocket.send_text(decoded)
+    except (WebSocketDisconnect, asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    finally:
+        proc.kill()
+        await proc.wait()
