@@ -78,10 +78,13 @@
     <div v-if="showSnapshot" class="modal-overlay" @click.self="showSnapshot = false">
       <div class="modal card">
         <h3>Create Snapshot</h3>
-        <input v-model="snapshotName" placeholder="Snapshot name" @keydown.enter="createSnapshot" />
+        <input v-model="snapshotName" placeholder="Snapshot name" @keydown.enter="createSnapshot" :disabled="snapshotCreating" />
+        <p v-if="snapshotCreating" class="creating-status">⏳ Creating snapshot… (this may take a moment for large sessions)</p>
         <div class="modal-actions">
-          <button class="secondary" @click="showSnapshot = false">Cancel</button>
-          <button class="primary" @click="createSnapshot" :disabled="!snapshotName.trim()">Create</button>
+          <button class="secondary" @click="showSnapshot = false" :disabled="snapshotCreating">Cancel</button>
+          <button class="primary" @click="createSnapshot" :disabled="!snapshotName.trim() || snapshotCreating">
+            {{ snapshotCreating ? 'Creating…' : 'Create' }}
+          </button>
         </div>
       </div>
     </div>
@@ -110,6 +113,7 @@ const fileContent = ref(null)
 const snapshots = ref([])
 const showSnapshot = ref(false)
 const snapshotName = ref('')
+const snapshotCreating = ref(false)
 
 onMounted(async () => {
   const sessions = await api.getSessions()
@@ -173,10 +177,16 @@ async function clearState() {
 
 async function createSnapshot() {
   if (!snapshotName.value.trim()) return
-  await api.createSnapshot(id, snapshotName.value.trim())
-  showSnapshot.value = false
-  snapshotName.value = ''
-  loadSnapshots()
+  snapshotCreating.value = true
+  try {
+    await api.createSnapshot(id, snapshotName.value.trim())
+    showSnapshot.value = false
+    snapshotName.value = ''
+    activeTab.value = 'Snapshots'
+    await loadSnapshots()
+  } finally {
+    snapshotCreating.value = false
+  }
 }
 
 function downloadSnapshot(filename) {
@@ -343,4 +353,16 @@ watch(activeTab, (tab) => {
 .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
 
 .muted { color: var(--text-muted); }
+
+.creating-status {
+  color: var(--warning);
+  font-size: 0.85rem;
+  margin: 0;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
 </style>

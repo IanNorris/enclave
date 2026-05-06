@@ -52,9 +52,10 @@ export const api = {
     body: JSON.stringify(data),
   }),
   updateBug: (session, bugId, data) => request(`/bugs/${session}/${bugId}`, {
-    method: 'PUT',
+    method: 'PATCH',
     body: JSON.stringify(data),
   }),
+  deleteBug: (session, bugId) => request(`/bugs/${session}/${bugId}`, { method: 'DELETE' }),
 
   // Memories
   getMemories: () => request('/memories'),

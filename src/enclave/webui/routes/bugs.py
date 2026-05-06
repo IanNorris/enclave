@@ -77,6 +77,7 @@ def _parse_bug_file(filepath: Path) -> dict[str, Any] | None:
         "title": frontmatter.get("title", filepath.stem),
         "status": frontmatter.get("status", "open"),
         "severity": frontmatter.get("severity", "medium"),
+        "type": frontmatter.get("type", "bug"),
         "created": frontmatter.get("created", ""),
         "updated": frontmatter.get("updated", ""),
         "body": body,
@@ -93,6 +94,7 @@ def _serialize_bug(bug: dict[str, Any]) -> str:
         "title": bug["title"],
         "status": bug["status"],
         "severity": bug["severity"],
+        "type": bug.get("type", "bug"),
         "created": bug.get("created", datetime.now(timezone.utc).isoformat()),
         "updated": datetime.now(timezone.utc).isoformat(),
     }
@@ -106,6 +108,7 @@ def _serialize_bug(bug: dict[str, Any]) -> str:
 class BugCreate(BaseModel):
     title: str
     severity: str = "medium"
+    type: str = "bug"
     body: str = ""
 
 
@@ -113,6 +116,7 @@ class BugUpdate(BaseModel):
     title: str | None = None
     status: str | None = None
     severity: str | None = None
+    type: str | None = None
     body: str | None = None
 
 
@@ -192,6 +196,7 @@ async def create_bug(request: Request, session_id: str, project_path: str, body:
         "title": body.title,
         "status": "open",
         "severity": body.severity,
+        "type": body.type,
         "created": datetime.now(timezone.utc).isoformat(),
         "body": body.body,
     }
@@ -226,6 +231,8 @@ async def update_bug(request: Request, session_id: str, bug_id: str, body: BugUp
                 bug["status"] = body.status
             if body.severity is not None:
                 bug["severity"] = body.severity
+            if body.type is not None:
+                bug["type"] = body.type
             if body.body is not None:
                 bug["body"] = body.body
 
