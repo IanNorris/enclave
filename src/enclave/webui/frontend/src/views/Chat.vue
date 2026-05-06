@@ -36,6 +36,8 @@
 
       <!-- Input -->
       <div class="input-bar">
+        <button class="secondary attach-btn" @click="$refs.chatFile.click()" title="Attach file">📎</button>
+        <input type="file" ref="chatFile" style="display:none" @change="attachFile" />
         <textarea
           v-model="draft"
           placeholder="Send a message…"
@@ -45,6 +47,10 @@
           ref="inputEl"
         ></textarea>
         <button class="primary" @click="send" :disabled="!draft.trim() || sending">Send</button>
+      </div>
+      <div v-if="pendingFile" class="pending-file">
+        📎 {{ pendingFile.name }} ({{ formatSize(pendingFile.size) }})
+        <button class="secondary" @click="pendingFile = null" style="padding:0.2rem 0.5rem">✕</button>
       </div>
     </div>
     <div v-else class="empty-state">
@@ -67,6 +73,7 @@ const draft = ref('')
 const sending = ref(false)
 const messagesEl = ref(null)
 const inputEl = ref(null)
+const pendingFile = ref(null)
 let ws = null
 
 onMounted(async () => {
@@ -129,18 +136,43 @@ function connectWebSocket() {
 }
 
 async function send() {
-  if (!draft.value.trim() || !selectedSession.value) return
+  if ((!draft.value.trim() && !pendingFile.value) || !selectedSession.value) return
   const content = draft.value.trim()
   draft.value = ''
   sending.value = true
 
   try {
-    await api.sendChatMessage(selectedSession.value, content)
+    if (pendingFile.value) {
+      // Upload file with optional message
+      const token = localStorage.getItem('enclave_token')
+      const form = new FormData()
+      form.append('file', pendingFile.value)
+      if (content) form.append('message', content)
+      await fetch(`/api/chat/${selectedSession.value}/upload`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      })
+      pendingFile.value = null
+    } else {
+      await api.sendChatMessage(selectedSession.value, content)
+    }
   } catch (e) {
     console.error('Send failed:', e)
     draft.value = content
     sending.value = false
   }
+}
+
+function attachFile(event) {
+  const file = event.target.files?.[0]
+  if (file) pendingFile.value = file
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 function scrollToBottom() {
@@ -274,6 +306,13 @@ function formatTime(ts) {
   gap: 0.75rem;
   padding: 1rem 0 0;
   border-top: 1px solid var(--border);
+  align-items: flex-end;
+}
+
+.input-bar .attach-btn {
+  padding: 0.5rem 0.7rem;
+  font-size: 1.1rem;
+  cursor: pointer;
 }
 
 .input-bar textarea {
@@ -287,6 +326,15 @@ function formatTime(ts) {
 .input-bar button {
   align-self: flex-end;
   padding: 0.6rem 1.5rem;
+}
+
+.pending-file {
+  padding: 0.3rem 0;
+  font-size: 0.85rem;
+  color: var(--fg-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .empty-state {

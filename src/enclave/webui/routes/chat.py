@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -129,6 +129,52 @@ async def _send_matrix_message(config, room_id: str, body: str) -> str:
             return data.get("event_id", "")
 
 
+async def _upload_matrix_file(config, filename: str, content: bytes, content_type: str) -> str:
+    """Upload a file to Matrix and return the mxc:// URI."""
+    token = await _get_matrix_token(config)
+
+    async with aiohttp.ClientSession() as session:
+        url = f"{config.homeserver}/_matrix/media/v3/upload?filename={filename}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type,
+        }
+        async with session.post(url, data=content, headers=headers) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise HTTPException(status_code=502, detail=f"Matrix upload failed: {err}")
+            data = await resp.json()
+            return data.get("content_uri", "")
+
+
+async def _send_matrix_file(config, room_id: str, mxc_uri: str, filename: str, size: int, content_type: str) -> str:
+    """Send a file message to a Matrix room."""
+    token = await _get_matrix_token(config)
+    import time
+    txn_id = f"webui-file-{int(time.time() * 1000)}"
+
+    msgtype = "m.image" if content_type.startswith("image/") else "m.file"
+
+    async with aiohttp.ClientSession() as session:
+        url = f"{config.homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "msgtype": msgtype,
+            "body": filename,
+            "url": mxc_uri,
+            "info": {
+                "mimetype": content_type,
+                "size": size,
+            },
+        }
+        async with session.put(url, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise HTTPException(status_code=502, detail=f"Matrix file send failed: {err}")
+            data = await resp.json()
+            return data.get("event_id", "")
+
+
 # ─── Models ─────────────────────────────────────────────────────────────────
 
 
@@ -157,6 +203,33 @@ async def send_message(request: Request, session_id: str, body: SendMessage):
     config = _matrix_config(request)
     event_id = await _send_matrix_message(config, room_id, body.content)
     return {"sent": True, "event_id": event_id}
+
+
+@router.post("/{session_id}/upload")
+async def upload_file(request: Request, session_id: str, file: UploadFile = File(...), message: str = ""):
+    """Upload a file and send it to the agent's Matrix room."""
+    from fastapi import Form
+
+    room_id = _get_room_id(request, session_id)
+    if not room_id:
+        raise HTTPException(status_code=404, detail="Session room not found")
+
+    config = _matrix_config(request)
+    content = await file.read()
+    content_type = file.content_type or "application/octet-stream"
+    filename = file.filename or "attachment"
+
+    # Upload to Matrix
+    mxc_uri = await _upload_matrix_file(config, filename, content, content_type)
+
+    # Send as file message
+    event_id = await _send_matrix_file(config, room_id, mxc_uri, filename, len(content), content_type)
+
+    # If there's an accompanying text message, send that too
+    if message.strip():
+        await _send_matrix_message(config, room_id, message.strip())
+
+    return {"sent": True, "event_id": event_id, "filename": filename}
 
 
 @router.websocket("/{session_id}/stream")
