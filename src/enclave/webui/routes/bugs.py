@@ -1,10 +1,13 @@
 """Bug management API routes.
 
 Reads/writes per-project .enclave-bugs/ markdown files (source of truth).
+When bugs are created or updated, a notification is sent to the agent
+via Matrix to wake it if idle.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -14,6 +17,7 @@ from typing import Any
 
 import aiofiles
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -24,6 +28,32 @@ router = APIRouter()
 
 def _workspace_base(request: Request) -> Path:
     return Path(request.app.state.config.container.workspace_base)
+
+
+def _sessions_json(request: Request) -> Path:
+    return Path(request.app.state.config.container.session_base) / "sessions.json"
+
+
+async def _notify_agent(request: Request, session_id: str, message: str) -> None:
+    """Send a notification to the agent's Matrix room to wake it."""
+    try:
+        sessions_file = _sessions_json(request)
+        if not sessions_file.exists():
+            return
+        data = json.loads(sessions_file.read_text())
+        room_id = None
+        for s in data:
+            if s.get("id") == session_id:
+                room_id = s.get("room_id")
+                break
+        if not room_id:
+            return
+
+        from enclave.webui.routes.chat import _send_matrix_message, _matrix_config
+        config = _matrix_config(request)
+        await _send_matrix_message(config, room_id, message)
+    except Exception:
+        pass  # Best-effort notification
 
 
 def _discover_projects(request: Request) -> list[dict[str, str]]:
@@ -204,6 +234,13 @@ async def create_bug(request: Request, session_id: str, project_path: str, body:
     filepath = bugs_dir / f"{bug_id}.md"
     filepath.write_text(_serialize_bug(bug), encoding="utf-8")
 
+    # Notify agent about the new bug
+    severity_emoji = {"critical": "🚨", "high": "⚠️", "medium": "📋", "low": "📝"}.get(body.severity, "📋")
+    await _notify_agent(
+        request, session_id,
+        f"{severity_emoji} New {body.type} filed: **{bug_id}** — {body.title}"
+    )
+
     bug["project"] = project_path
     return bug
 
@@ -324,3 +361,18 @@ async def upload_attachment(
             }
 
     raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+
+
+@router.get("/{session_id}/{bug_id}/attachments/{filename}")
+async def download_attachment(request: Request, session_id: str, bug_id: str, filename: str):
+    """Download a specific attachment."""
+    ws_base = _workspace_base(request)
+    session_dir = ws_base / session_id
+
+    for bugs_dir in session_dir.rglob(".enclave-bugs"):
+        att_dir = bugs_dir / "attachments" / bug_id
+        file_path = att_dir / filename
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(file_path, filename=filename)
+
+    raise HTTPException(status_code=404, detail="Attachment not found")

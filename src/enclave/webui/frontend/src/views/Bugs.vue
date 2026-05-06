@@ -65,6 +65,23 @@
           </div>
         </div>
         <textarea v-model="editBug.body" placeholder="Description (markdown)" rows="10"></textarea>
+
+        <!-- Attachments section (edit mode only) -->
+        <div v-if="editing" class="attachments-section">
+          <label>Attachments</label>
+          <div v-if="attachments.length" class="attachment-list">
+            <a v-for="att in attachments" :key="att.name"
+               :href="`/api/bugs/${selectedSession}/${editBug.id}/attachments/${att.name}`"
+               target="_blank" class="attachment-item">
+              📎 {{ att.name }} <span class="att-size">({{ formatSize(att.size) }})</span>
+            </a>
+          </div>
+          <div class="upload-row">
+            <input type="file" ref="fileInput" @change="uploadFile" />
+            <span v-if="uploading" class="upload-status">Uploading…</span>
+          </div>
+        </div>
+
         <div class="modal-actions">
           <button class="danger" v-if="editing" @click="deleteBug" style="margin-right:auto">Delete</button>
           <button class="secondary" @click="closeModal">Cancel</button>
@@ -89,6 +106,9 @@ const showOpenOnly = ref(true)
 const showModal = ref(false)
 const editing = ref(false)
 const editBug = ref({})
+const attachments = ref([])
+const uploading = ref(false)
+const fileInput = ref(null)
 
 const filteredBugs = computed(() => {
   if (!showOpenOnly.value) return bugs.value
@@ -122,12 +142,15 @@ function openCreate() {
 function openEdit(bug) {
   editing.value = true
   editBug.value = { ...bug }
+  attachments.value = []
   showModal.value = true
+  loadAttachments(bug.id)
 }
 
 function closeModal() {
   showModal.value = false
   editBug.value = {}
+  attachments.value = []
 }
 
 async function saveBug() {
@@ -157,6 +180,42 @@ async function deleteBug() {
   await api.deleteBug(selectedSession.value, editBug.value.id)
   closeModal()
   loadBugs()
+}
+
+async function loadAttachments(bugId) {
+  try {
+    const token = localStorage.getItem('enclave_token')
+    const res = await fetch(`/api/bugs/${selectedSession.value}/${bugId}/attachments`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (res.ok) attachments.value = await res.json()
+  } catch { attachments.value = [] }
+}
+
+async function uploadFile() {
+  const file = fileInput.value?.files?.[0]
+  if (!file) return
+  uploading.value = true
+  try {
+    const token = localStorage.getItem('enclave_token')
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch(`/api/bugs/${selectedSession.value}/${editBug.value.id}/attachments`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    })
+    if (res.ok) {
+      await loadAttachments(editBug.value.id)
+      fileInput.value.value = ''
+    }
+  } finally { uploading.value = false }
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 </script>
 
@@ -257,4 +316,52 @@ async function deleteBug() {
 .modal h3 { margin: 0; }
 .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
 .muted { color: var(--text-muted); }
+
+.attachments-section {
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.attachments-section label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  display: block;
+  margin-bottom: 0.5rem;
+}
+
+.attachment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0.75rem;
+}
+
+.attachment-item {
+  font-size: 0.85rem;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.attachment-item:hover { text-decoration: underline; }
+
+.att-size {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.upload-row input[type="file"] {
+  font-size: 0.8rem;
+}
+
+.upload-status {
+  color: var(--warning);
+  font-size: 0.8rem;
+}
 </style>
