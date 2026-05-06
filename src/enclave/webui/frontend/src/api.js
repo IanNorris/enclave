@@ -43,11 +43,16 @@ export const api = {
   }),
   deleteSnapshot: (id, filename) => request(`/sessions/${id}/snapshots/${filename}`, { method: 'DELETE' }),
   getLogs: (id, lines = 200) => request(`/sessions/${id}/logs?lines=${lines}`),
+  getSessionPrompt: (id) => request(`/sessions/${id}/prompt`),
+  updateSessionPrompt: (id, content) => request(`/sessions/${id}/prompt`, {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  }),
 
   // Bugs
   getBugs: (session) => request(`/bugs/${session}`),
   getBug: (session, bugId) => request(`/bugs/${session}/${bugId}`),
-  createBug: (session, data) => request(`/bugs/${session}`, {
+  createBug: (session, project, data) => request(`/bugs/${session}/${project}/create`, {
     method: 'POST',
     body: JSON.stringify(data),
   }),
@@ -68,5 +73,10 @@ export const api = {
   sendChatMessage: (session, content) => request(`/chat/${session}/send`, {
     method: 'POST',
     body: JSON.stringify({ content }),
+  }),
+  getModels: (session) => request(`/chat/${session}/models`),
+  setModel: (session, model) => request(`/chat/${session}/model`, {
+    method: 'POST',
+    body: JSON.stringify({ content: model }),
   }),
 }

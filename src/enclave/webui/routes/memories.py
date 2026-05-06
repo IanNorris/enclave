@@ -60,66 +60,163 @@ async def _run_mimir_cli(request: Request, *args: str, timeout: float = 30.0) ->
     return stdout.decode("utf-8", errors="replace")
 
 
-def _parse_log_output(output: str) -> dict[str, Any]:
-    """Parse mimir-cli log output into structured records with resolved symbols."""
-    symbols_map: dict[int, str] = {}
+def _parse_decode_output(output: str) -> dict[str, Any]:
+    """Parse mimir-cli decode output (S-expressions) into structured records."""
     memories: list[dict[str, Any]] = []
     checkpoints: list[dict[str, Any]] = []
 
     for line in output.split("\n"):
         line = line.strip()
-        if not line:
+        if not line or not line.startswith("("):
             continue
 
-        if line.startswith("SYMBOL_ALLOC"):
-            id_match = re.search(r"id=SymbolId\((\d+)\)", line)
-            name_match = re.search(r'name="([^"]*)"', line)
-            if id_match and name_match:
-                symbols_map[int(id_match.group(1))] = name_match.group(1)
+        if line.startswith("(sem "):
+            mem = _parse_sem(line)
+            if mem:
+                memories.append(mem)
+        elif line.startswith("(pro "):
+            mem = _parse_pro(line)
+            if mem:
+                memories.append(mem)
+        elif line.startswith("(checkpoint "):
+            cp = _parse_checkpoint_sexp(line)
+            if cp:
+                checkpoints.append(cp)
 
-        elif line.startswith("CHECKPOINT"):
-            match = re.search(r"episode_id=SymbolId\((\d+)\)", line)
-            at_match = re.search(r"at=(\S+)", line)
-            count_match = re.search(r"memory_count=(\d+)", line)
-            if match:
-                checkpoints.append({
-                    "type": "checkpoint",
-                    "episode_id": int(match.group(1)),
-                    "timestamp": at_match.group(1) if at_match else None,
-                    "memory_count": int(count_match.group(1)) if count_match else 0,
-                })
+    return {"memories": memories, "checkpoints": checkpoints}
 
-        elif line.startswith("SEM "):
-            mem_match = re.search(r"memory_id=SymbolId\((\d+)\)", line)
-            s_match = re.search(r"s=SymbolId\((\d+)\)", line)
-            p_match = re.search(r"p=SymbolId\((\d+)\)", line)
-            v_match = re.search(r"v=(.+)$", line)
-            if mem_match:
-                s_id = int(s_match.group(1)) if s_match else None
-                p_id = int(p_match.group(1)) if p_match else None
-                memories.append({
-                    "type": "semantic",
-                    "memory_id": int(mem_match.group(1)),
-                    "subject_id": s_id,
-                    "predicate_id": p_id,
-                    "subject": symbols_map.get(s_id, f"#{s_id}") if s_id is not None else None,
-                    "predicate": symbols_map.get(p_id, f"#{p_id}") if p_id is not None else None,
-                    "value": v_match.group(1).strip() if v_match else None,
-                })
 
-        elif line.startswith("PRO "):
-            mem_match = re.search(r"memory_id=SymbolId\((\d+)\)", line)
-            rule_match = re.search(r"rule_id=SymbolId\((\d+)\)", line)
-            if mem_match:
-                rule_id = int(rule_match.group(1)) if rule_match else None
-                memories.append({
-                    "type": "procedural",
-                    "memory_id": int(mem_match.group(1)),
-                    "rule_id": rule_id,
-                    "rule": symbols_map.get(rule_id, f"#{rule_id}") if rule_id is not None else None,
-                })
+def _parse_sem(line: str) -> dict[str, Any] | None:
+    """Parse a semantic memory S-expression.
 
-    return {"memories": memories, "checkpoints": checkpoints, "symbols_map": symbols_map}
+    Formats:
+      (sem @subject @predicate "value" :src @source :c 0.9 :v 2026-04-08T...)
+      (sem @subject @predicate @symbol :src @source :c 0.9 :v 2026-04-08T...)
+      (sem @subject @predicate true :src @source :c 0.9 :v 2026-04-08T...)
+    """
+    # Strip outer parens
+    inner = line[1:-1].strip() if line.endswith(")") else line[1:].strip()
+    if not inner.startswith("sem "):
+        return None
+
+    # Tokenize respecting quoted strings
+    tokens = _tokenize_sexp(inner)
+    if len(tokens) < 4:
+        return None
+
+    # tokens[0] = "sem", tokens[1] = subject, tokens[2] = predicate, tokens[3] = object/value
+    subject = _clean_symbol(tokens[1])
+    predicate = _clean_symbol(tokens[2])
+    obj_value = _clean_symbol(tokens[3])
+
+    # Extract keyword args
+    kwargs = _extract_kwargs(tokens[4:])
+
+    return {
+        "type": "semantic",
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj_value,
+        "source": kwargs.get("src"),
+        "confidence": kwargs.get("c"),
+        "timestamp": kwargs.get("v"),
+    }
+
+
+def _parse_pro(line: str) -> dict[str, Any] | None:
+    """Parse a procedural memory S-expression.
+
+    Format: (pro @rule "condition" "action" :scp @scope :src @source :c 0.95)
+    """
+    inner = line[1:-1].strip() if line.endswith(")") else line[1:].strip()
+    if not inner.startswith("pro "):
+        return None
+
+    tokens = _tokenize_sexp(inner)
+    if len(tokens) < 4:
+        return None
+
+    rule = _clean_symbol(tokens[1])
+    condition = _clean_symbol(tokens[2])
+    action = _clean_symbol(tokens[3])
+
+    kwargs = _extract_kwargs(tokens[4:])
+
+    return {
+        "type": "procedural",
+        "rule": rule,
+        "condition": condition,
+        "action": action,
+        "scope": kwargs.get("scp"),
+        "source": kwargs.get("src"),
+        "confidence": kwargs.get("c"),
+    }
+
+
+def _parse_checkpoint_sexp(line: str) -> dict[str, Any] | None:
+    """Parse checkpoint S-expression if present."""
+    inner = line[1:-1].strip() if line.endswith(")") else line[1:].strip()
+    tokens = _tokenize_sexp(inner)
+    kwargs = _extract_kwargs(tokens[1:])
+    return {
+        "type": "checkpoint",
+        "episode": kwargs.get("episode"),
+        "timestamp": kwargs.get("at"),
+        "memory_count": kwargs.get("n"),
+    }
+
+
+def _tokenize_sexp(s: str) -> list[str]:
+    """Tokenize an S-expression body, respecting quoted strings."""
+    tokens = []
+    i = 0
+    while i < len(s):
+        if s[i].isspace():
+            i += 1
+            continue
+        if s[i] == '"':
+            # Quoted string
+            j = i + 1
+            while j < len(s) and s[j] != '"':
+                if s[j] == '\\':
+                    j += 1
+                j += 1
+            tokens.append(s[i + 1:j])
+            i = j + 1
+        else:
+            # Bare token
+            j = i
+            while j < len(s) and not s[j].isspace():
+                j += 1
+            tokens.append(s[i:j])
+            i = j
+    return tokens
+
+
+def _clean_symbol(token: str) -> str:
+    """Strip leading @ from symbol names."""
+    return token[1:] if token.startswith("@") else token
+
+
+def _extract_kwargs(tokens: list[str]) -> dict[str, str | None]:
+    """Extract :key value pairs from token list."""
+    result: dict[str, str | None] = {}
+    i = 0
+    while i < len(tokens):
+        if tokens[i].startswith(":") and i + 1 < len(tokens):
+            key = tokens[i][1:]
+            val = _clean_symbol(tokens[i + 1])
+            # Try to parse confidence as float
+            if key == "c":
+                try:
+                    val = str(round(float(val), 3))
+                except ValueError:
+                    pass
+            result[key] = val
+            i += 2
+        else:
+            i += 1
+    return result
 
 
 def _parse_symbols_output(output: str) -> list[dict[str, Any]]:
@@ -154,8 +251,8 @@ async def get_memories(request: Request):
     if not log_path.exists():
         return {"records": [], "checkpoints": []}
 
-    output = await _run_mimir_cli(request, "log")
-    parsed = _parse_log_output(output)
+    output = await _run_mimir_cli(request, "decode")
+    parsed = _parse_decode_output(output)
     return {"records": parsed["memories"], "checkpoints": parsed["checkpoints"]}
 
 
@@ -201,14 +298,18 @@ async def get_stats(request: Request):
     total_checkpoints = 0
     if log_path.exists():
         try:
-            output = await _run_mimir_cli(request, "log")
+            output = await _run_mimir_cli(request, "decode")
             for line in output.split("\n"):
-                if line.startswith("SEM ") or line.startswith("PRO ") or line.startswith("NAR "):
+                line = line.strip()
+                if line.startswith("(sem ") or line.startswith("(pro ") or line.startswith("(nar "):
                     total_records += 1
-                elif line.startswith("SYMBOL_ALLOC"):
-                    total_symbols += 1
-                elif line.startswith("CHECKPOINT"):
+                elif line.startswith("(checkpoint"):
                     total_checkpoints += 1
+            # Get symbol count from symbols subcommand
+            sym_output = await _run_mimir_cli(request, "symbols")
+            for sline in sym_output.split("\n"):
+                if sline.strip() and re.match(r"SymbolId\(\d+\)", sline.strip()):
+                    total_symbols += 1
         except Exception:
             pass
 

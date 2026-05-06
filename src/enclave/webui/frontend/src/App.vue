@@ -1,27 +1,36 @@
 <template>
   <div class="app">
-    <nav class="sidebar">
+    <!-- Mobile header -->
+    <div class="mobile-header">
+      <button class="hamburger" @click="sidebarOpen = !sidebarOpen">☰</button>
+      <span class="mobile-title">Enclave</span>
+    </div>
+
+    <!-- Sidebar overlay for mobile -->
+    <div v-if="sidebarOpen" class="sidebar-overlay" @click="sidebarOpen = false"></div>
+
+    <nav class="sidebar" :class="{ open: sidebarOpen }">
       <div class="logo">
         <h1>Enclave</h1>
       </div>
       <ul class="nav-links">
         <li>
-          <router-link to="/sessions" active-class="active">
+          <router-link to="/sessions" active-class="active" @click="sidebarOpen = false">
             <span class="icon">⚙</span> Sessions
           </router-link>
         </li>
         <li>
-          <router-link to="/chat" active-class="active">
+          <router-link to="/chat" active-class="active" @click="sidebarOpen = false">
             <span class="icon">💬</span> Chat
           </router-link>
         </li>
         <li>
-          <router-link to="/bugs" active-class="active">
+          <router-link to="/bugs" active-class="active" @click="sidebarOpen = false">
             <span class="icon">🐛</span> Bugs
           </router-link>
         </li>
         <li>
-          <router-link to="/memories" active-class="active">
+          <router-link to="/memories" active-class="active" @click="sidebarOpen = false">
             <span class="icon">🧠</span> Memories
           </router-link>
         </li>
@@ -34,12 +43,23 @@
 </template>
 
 <script setup>
+import { ref } from 'vue'
+
+const sidebarOpen = ref(false)
 </script>
 
 <style scoped>
 .app {
   display: flex;
   height: 100vh;
+}
+
+.mobile-header {
+  display: none;
+}
+
+.sidebar-overlay {
+  display: none;
 }
 
 .sidebar {
@@ -49,6 +69,7 @@
   display: flex;
   flex-direction: column;
   padding: 1rem 0;
+  flex-shrink: 0;
 }
 
 .logo {
@@ -100,5 +121,72 @@
   overflow-y: auto;
   padding: 2rem;
   background: var(--bg-main);
+  min-width: 0;
+}
+
+/* ─── Mobile ─── */
+@media (max-width: 768px) {
+  .app {
+    flex-direction: column;
+  }
+
+  .mobile-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    background: var(--bg-sidebar);
+    border-bottom: 1px solid var(--border);
+    z-index: 60;
+  }
+
+  .hamburger {
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0.25rem;
+  }
+
+  .mobile-title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: -260px;
+    width: 250px;
+    height: 100vh;
+    z-index: 70;
+    transition: left 0.25s ease;
+    padding-top: 1rem;
+  }
+
+  .sidebar.open {
+    left: 0;
+  }
+
+  .sidebar-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 65;
+  }
+
+  .nav-links li a {
+    padding: 0.875rem 1.25rem;
+    font-size: 1rem;
+  }
+
+  .content {
+    padding: 1rem;
+    flex: 1;
+    overflow-y: auto;
+  }
 }
 </style>

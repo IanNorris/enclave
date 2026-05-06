@@ -1,5 +1,5 @@
 <template>
-  <div class="chat-view">
+  <div class="chat-view" @dragover.prevent="onDragOver" @dragleave="onDragLeave" @drop.prevent="onDrop">
     <div class="chat-header">
       <h2>Chat</h2>
       <select v-model="selectedSession" @change="loadHistory">
@@ -8,9 +8,17 @@
           {{ s.name }}{{ s.status === 'running' ? ' (active)' : '' }}
         </option>
       </select>
+      <select v-if="models.available.length" v-model="currentModel" @change="changeModel" class="model-select">
+        <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
+      </select>
     </div>
 
     <div class="chat-container" v-if="selectedSession">
+      <!-- Drop overlay -->
+      <div v-if="dragging" class="drop-overlay">
+        <div class="drop-label">Drop files to attach</div>
+      </div>
+
       <!-- Messages -->
       <div class="messages" ref="messagesEl">
         <div v-for="turn in turns" :key="turn.turn_index" class="turn">
@@ -34,23 +42,30 @@
         </div>
       </div>
 
+      <!-- Pending files -->
+      <div v-if="pendingFiles.length" class="pending-files">
+        <div v-for="(f, i) in pendingFiles" :key="i" class="file-chip">
+          <img v-if="f.preview" :src="f.preview" class="file-thumb" />
+          <span class="file-name">{{ f.file.name }}</span>
+          <span class="file-size">{{ formatSize(f.file.size) }}</span>
+          <button class="chip-remove" @click="removeFile(i)">✕</button>
+        </div>
+      </div>
+
       <!-- Input -->
       <div class="input-bar">
-        <button class="secondary attach-btn" @click="$refs.chatFile.click()" title="Attach file">📎</button>
-        <input type="file" ref="chatFile" style="display:none" @change="attachFile" />
+        <button class="secondary attach-btn" @click="$refs.chatFile.click()" title="Attach files">📎</button>
+        <input type="file" ref="chatFile" style="display:none" @change="attachFiles" multiple accept="image/*,application/pdf,text/*" />
         <textarea
           v-model="draft"
-          placeholder="Send a message…"
+          placeholder="Send a message… (paste or drop images)"
           @keydown.enter.exact.prevent="send"
           @keydown.shift.enter.exact=""
+          @paste="onPaste"
           rows="1"
           ref="inputEl"
         ></textarea>
-        <button class="primary" @click="send" :disabled="!draft.trim() || sending">Send</button>
-      </div>
-      <div v-if="pendingFile" class="pending-file">
-        📎 {{ pendingFile.name }} ({{ formatSize(pendingFile.size) }})
-        <button class="secondary" @click="pendingFile = null" style="padding:0.2rem 0.5rem">✕</button>
+        <button class="primary" @click="send" :disabled="(!draft.trim() && !pendingFiles.length) || sending">Send</button>
       </div>
     </div>
     <div v-else class="empty-state">
@@ -73,12 +88,15 @@ const draft = ref('')
 const sending = ref(false)
 const messagesEl = ref(null)
 const inputEl = ref(null)
-const pendingFile = ref(null)
+const pendingFiles = ref([])
+const dragging = ref(false)
+const models = ref({ current: null, available: [], preferences: [] })
+const currentModel = ref('')
 let ws = null
+let dragCounter = 0
 
 onMounted(async () => {
   sessions.value = await api.getSessions()
-  // Auto-select first running session
   const running = sessions.value.find(s => s.status === 'running')
   if (running) {
     selectedSession.value = running.id
@@ -88,6 +106,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (ws) ws.close()
+  pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
 })
 
 watch(selectedSession, () => {
@@ -102,8 +121,28 @@ async function loadHistory() {
     await nextTick()
     scrollToBottom()
     connectWebSocket()
+    loadModels()
   } catch (e) {
     console.error('Failed to load history:', e)
+  }
+}
+
+async function loadModels() {
+  try {
+    const data = await api.getModels(selectedSession.value)
+    models.value = data
+    currentModel.value = data.current || ''
+  } catch (e) {
+    console.error('Failed to load models:', e)
+  }
+}
+
+async function changeModel() {
+  if (!currentModel.value || !selectedSession.value) return
+  try {
+    await api.setModel(selectedSession.value, currentModel.value)
+  } catch (e) {
+    console.error('Failed to change model:', e)
   }
 }
 
@@ -115,7 +154,6 @@ function connectWebSocket() {
 
   ws.onmessage = async (event) => {
     const turn = JSON.parse(event.data)
-    // Update or append
     const idx = turns.value.findIndex(t => t.turn_index === turn.turn_index)
     if (idx >= 0) {
       turns.value[idx] = turn
@@ -128,7 +166,6 @@ function connectWebSocket() {
   }
 
   ws.onclose = () => {
-    // Reconnect after delay
     setTimeout(() => {
       if (selectedSession.value) connectWebSocket()
     }, 3000)
@@ -136,24 +173,31 @@ function connectWebSocket() {
 }
 
 async function send() {
-  if ((!draft.value.trim() && !pendingFile.value) || !selectedSession.value) return
+  if ((!draft.value.trim() && !pendingFiles.value.length) || !selectedSession.value) return
   const content = draft.value.trim()
   draft.value = ''
   sending.value = true
 
   try {
-    if (pendingFile.value) {
-      // Upload file with optional message
-      const token = localStorage.getItem('enclave_token')
-      const form = new FormData()
-      form.append('file', pendingFile.value)
-      if (content) form.append('message', content)
-      await fetch(`/api/chat/${selectedSession.value}/upload`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: form,
-      })
-      pendingFile.value = null
+    const token = localStorage.getItem('enclave_token')
+    const files = [...pendingFiles.value]
+
+    if (files.length > 0) {
+      // Upload each file sequentially
+      for (let i = 0; i < files.length; i++) {
+        const form = new FormData()
+        form.append('file', files[i].file)
+        // Send the text message with the last file
+        if (i === files.length - 1 && content) {
+          form.append('message', content)
+        }
+        await fetch(`/api/chat/${selectedSession.value}/upload`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: form,
+        })
+      }
+      clearPendingFiles()
     } else {
       await api.sendChatMessage(selectedSession.value, content)
     }
@@ -164,9 +208,67 @@ async function send() {
   }
 }
 
-function attachFile(event) {
-  const file = event.target.files?.[0]
-  if (file) pendingFile.value = file
+function addFiles(fileList) {
+  for (const file of fileList) {
+    const entry = { file, preview: null }
+    if (file.type.startsWith('image/')) {
+      entry.preview = URL.createObjectURL(file)
+    }
+    pendingFiles.value.push(entry)
+  }
+}
+
+function removeFile(index) {
+  const f = pendingFiles.value[index]
+  if (f.preview) URL.revokeObjectURL(f.preview)
+  pendingFiles.value.splice(index, 1)
+}
+
+function clearPendingFiles() {
+  pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
+  pendingFiles.value = []
+}
+
+function attachFiles(event) {
+  const files = event.target.files
+  if (files?.length) addFiles(files)
+  event.target.value = ''
+}
+
+function onPaste(event) {
+  const items = event.clipboardData?.items
+  if (!items) return
+  const imageFiles = []
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      const file = item.getAsFile()
+      if (file) imageFiles.push(file)
+    }
+  }
+  if (imageFiles.length) {
+    event.preventDefault()
+    addFiles(imageFiles)
+  }
+}
+
+function onDragOver(event) {
+  dragCounter++
+  dragging.value = true
+}
+
+function onDragLeave() {
+  dragCounter--
+  if (dragCounter <= 0) {
+    dragging.value = false
+    dragCounter = 0
+  }
+}
+
+function onDrop(event) {
+  dragging.value = false
+  dragCounter = 0
+  const files = event.dataTransfer?.files
+  if (files?.length) addFiles(files)
 }
 
 function formatSize(bytes) {
@@ -183,7 +285,6 @@ function scrollToBottom() {
 
 function renderMarkdown(text) {
   if (!text) return ''
-  // Truncate very long messages for display performance
   const display = text.length > 10000 ? text.slice(0, 10000) + '\n\n…(truncated)' : text
   return md.render(display)
 }
@@ -211,13 +312,7 @@ function formatTime(ts) {
 
 .chat-header h2 { margin: 0; }
 .chat-header select { max-width: 300px; }
-
-.chat-container {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
+.model-select { font-size: 0.8rem; max-width: 220px; }
 
 .messages {
   flex: 1;
@@ -328,13 +423,78 @@ function formatTime(ts) {
   padding: 0.6rem 1.5rem;
 }
 
-.pending-file {
-  padding: 0.3rem 0;
-  font-size: 0.85rem;
-  color: var(--fg-secondary);
+.pending-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+}
+
+.file-chip {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.4rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.file-thumb {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 3px;
+}
+
+.file-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-size {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.chip-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 0.2rem;
+  font-size: 0.9rem;
+}
+
+.chip-remove:hover { color: var(--text-primary); }
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(26, 42, 74, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  border-radius: var(--radius);
+  border: 2px dashed var(--accent);
+}
+
+.drop-label {
+  font-size: 1.2rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chat-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
 }
 
 .empty-state {
@@ -345,4 +505,14 @@ function formatTime(ts) {
 }
 
 .muted { color: var(--text-muted); }
+
+@media (max-width: 768px) {
+  .chat-view { height: calc(100vh - 3.5rem); }
+  .chat-header { flex-direction: column; align-items: stretch; gap: 0.5rem; }
+  .chat-header select { max-width: 100%; }
+  .message { max-width: 95%; }
+  .input-bar { gap: 0.4rem; }
+  .input-bar button { padding: 0.5rem 1rem; }
+  .file-chip .file-name { max-width: 80px; }
+}
 </style>

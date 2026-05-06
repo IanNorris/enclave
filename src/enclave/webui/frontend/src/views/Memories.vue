@@ -30,8 +30,17 @@
 
     <!-- Records tab -->
     <div v-if="tab === 'records'">
-      <div class="search-bar">
-        <input v-model="search" placeholder="Filter by subject, predicate, or rule…" />
+      <div class="filter-row">
+        <input v-model="search" placeholder="Filter memories…" class="search-input" />
+        <select v-model="typeFilter">
+          <option value="">All types</option>
+          <option value="semantic">Semantic</option>
+          <option value="procedural">Procedural</option>
+        </select>
+        <select v-model="sourceFilter">
+          <option value="">All sources</option>
+          <option v-for="s in availableSources" :key="s" :value="s">{{ s }}</option>
+        </select>
       </div>
 
       <div class="card" v-if="filteredRecords.length">
@@ -39,17 +48,21 @@
           <thead>
             <tr>
               <th>Type</th>
-              <th>Subject</th>
-              <th>Predicate / Rule</th>
+              <th>Subject / Rule</th>
+              <th>Predicate</th>
               <th>Value</th>
+              <th>Source</th>
+              <th>Conf</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="(r, i) in filteredRecords" :key="i" class="memory-row" @click="selected = r">
-              <td><span class="badge" :class="r.type">{{ r.type }}</span></td>
-              <td class="symbol-cell">{{ r.subject || '' }}</td>
-              <td class="symbol-cell">{{ r.predicate || r.rule || '' }}</td>
-              <td class="value-cell">{{ truncate(r.value, 60) }}</td>
+              <td><span class="badge" :class="r.type">{{ r.type === 'semantic' ? 'SEM' : 'PRO' }}</span></td>
+              <td class="symbol-cell">{{ r.subject || r.rule || '' }}</td>
+              <td class="symbol-cell">{{ r.predicate || r.condition || '' }}</td>
+              <td class="value-cell">{{ truncate(r.object || r.action || '', 80) }}</td>
+              <td class="source-cell">{{ r.source || '' }}</td>
+              <td class="conf-cell">{{ r.confidence ? (parseFloat(r.confidence) * 100).toFixed(0) + '%' : '' }}</td>
             </tr>
           </tbody>
         </table>
@@ -59,8 +72,8 @@
 
     <!-- Symbols tab -->
     <div v-if="tab === 'symbols'">
-      <div class="search-bar">
-        <input v-model="symbolSearch" placeholder="Filter symbols…" />
+      <div class="filter-row">
+        <input v-model="symbolSearch" placeholder="Filter symbols…" class="search-input" />
       </div>
 
       <div class="card" v-if="filteredSymbols.length">
@@ -89,25 +102,40 @@
       <div class="modal card detail-panel">
         <div class="detail-header">
           <span class="badge" :class="selected.type">{{ selected.type }}</span>
-          <span class="detail-id">memory #{{ selected.memory_id }}</span>
           <button class="secondary" @click="selected = null">✕</button>
         </div>
         <dl class="detail-fields">
-          <template v-if="selected.subject">
+          <template v-if="selected.type === 'semantic'">
             <dt>Subject</dt>
             <dd>{{ selected.subject }}</dd>
-          </template>
-          <template v-if="selected.predicate">
             <dt>Predicate</dt>
             <dd>{{ selected.predicate }}</dd>
+            <dt>Value</dt>
+            <dd class="detail-value">{{ selected.object }}</dd>
           </template>
-          <template v-if="selected.rule">
+          <template v-if="selected.type === 'procedural'">
             <dt>Rule</dt>
             <dd>{{ selected.rule }}</dd>
+            <dt>Condition</dt>
+            <dd class="detail-value">{{ selected.condition }}</dd>
+            <dt>Action</dt>
+            <dd class="detail-value">{{ selected.action }}</dd>
+            <template v-if="selected.scope">
+              <dt>Scope</dt>
+              <dd>{{ selected.scope }}</dd>
+            </template>
           </template>
-          <template v-if="selected.value">
-            <dt>Value</dt>
-            <dd class="detail-value">{{ selected.value }}</dd>
+          <template v-if="selected.source">
+            <dt>Source</dt>
+            <dd>{{ selected.source }}</dd>
+          </template>
+          <template v-if="selected.confidence">
+            <dt>Confidence</dt>
+            <dd>{{ (parseFloat(selected.confidence) * 100).toFixed(1) }}%</dd>
+          </template>
+          <template v-if="selected.timestamp">
+            <dt>Timestamp</dt>
+            <dd>{{ selected.timestamp }}</dd>
           </template>
         </dl>
       </div>
@@ -124,21 +152,38 @@ const records = ref([])
 const symbols = ref([])
 const search = ref('')
 const symbolSearch = ref('')
+const typeFilter = ref('')
+const sourceFilter = ref('')
 const loading = ref(true)
 const symbolsLoading = ref(false)
 const tab = ref('records')
 const selected = ref(null)
 
-const filteredRecords = computed(() => {
+const availableSources = computed(() => {
   const list = Array.isArray(records.value) ? records.value : []
+  const sources = new Set()
+  list.forEach(r => { if (r.source) sources.add(r.source) })
+  return [...sources].sort()
+})
+
+const filteredRecords = computed(() => {
+  let list = Array.isArray(records.value) ? records.value : []
+  if (typeFilter.value) {
+    list = list.filter(r => r.type === typeFilter.value)
+  }
+  if (sourceFilter.value) {
+    list = list.filter(r => r.source === sourceFilter.value)
+  }
   if (!search.value) return list
   const q = search.value.toLowerCase()
   return list.filter(r =>
     r.subject?.toLowerCase().includes(q) ||
     r.predicate?.toLowerCase().includes(q) ||
     r.rule?.toLowerCase().includes(q) ||
-    r.value?.toLowerCase().includes(q) ||
-    r.type?.toLowerCase().includes(q)
+    r.object?.toLowerCase().includes(q) ||
+    r.condition?.toLowerCase().includes(q) ||
+    r.action?.toLowerCase().includes(q) ||
+    r.source?.toLowerCase().includes(q)
   )
 })
 
@@ -230,9 +275,20 @@ onMounted(async () => {
 
 .tabs button:hover { color: var(--text-primary); }
 
-.search-bar {
+.filter-row {
+  display: flex;
+  gap: 0.75rem;
   margin-bottom: 1rem;
-  max-width: 400px;
+  flex-wrap: wrap;
+}
+
+.filter-row .search-input {
+  flex: 1;
+  min-width: 200px;
+}
+
+.filter-row select {
+  min-width: 120px;
 }
 
 .memory-table {
@@ -273,10 +329,23 @@ onMounted(async () => {
 .value-cell {
   max-width: 300px;
   font-size: 0.8rem;
-  color: var(--text-muted);
+  color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.source-cell {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.conf-cell {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-align: right;
+  white-space: nowrap;
 }
 
 .symbol-name {
@@ -345,4 +414,12 @@ onMounted(async () => {
 }
 
 .muted { color: var(--text-muted); }
+
+@media (max-width: 768px) {
+  .stats-bar { grid-template-columns: repeat(2, 1fr); }
+  .filter-row { flex-direction: column; }
+  .memory-table { display: block; overflow-x: auto; }
+  .detail-panel { width: 95vw; }
+  .value-cell { max-width: 150px; }
+}
 </style>

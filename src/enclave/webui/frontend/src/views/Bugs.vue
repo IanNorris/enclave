@@ -133,6 +133,12 @@ async function loadBugs() {
   finally { loading.value = false }
 }
 
+function defaultProject() {
+  // Use the project from the first existing bug, or '.' for workspace root
+  const first = bugs.value.find(b => b.project)
+  return first?.project || '.'
+}
+
 function openCreate() {
   editing.value = false
   editBug.value = { title: '', severity: 'medium', type: 'bug', body: '' }
@@ -164,7 +170,7 @@ async function saveBug() {
       body: editBug.value.body,
     })
   } else {
-    await api.createBug(selectedSession.value, {
+    await api.createBug(selectedSession.value, defaultProject(), {
       title: editBug.value.title,
       severity: editBug.value.severity,
       type: editBug.value.type,
@@ -363,5 +369,11 @@ function formatSize(bytes) {
 .upload-status {
   color: var(--warning);
   font-size: 0.8rem;
+}
+
+@media (max-width: 768px) {
+  .bug-table { display: block; overflow-x: auto; }
+  .modal { width: 95vw !important; max-height: 90vh; }
+  .filter-bar { flex-direction: column; gap: 0.5rem; }
 }
 </style>

@@ -1253,6 +1253,20 @@ async def _configure_model(
     except Exception as e:
         print(f"[agent] set_model failed (non-fatal): {e}", file=sys.stderr)
 
+    # Write available models to workspace for webui consumption
+    try:
+        import json as _json
+        models_info = {
+            "current": target,
+            "available": sorted(_AVAILABLE_MODEL_IDS) if _AVAILABLE_MODEL_IDS else [target],
+            "preferences": list(_MODEL_PREFERENCES),
+        }
+        models_path = Path(os.environ.get("WORKSPACE_DIR", "/workspace")) / ".enclave-models.json"
+        models_path.write_text(_json.dumps(models_info, indent=2))
+        print(f"[agent] Wrote models info to {models_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"[agent] Failed to write models info: {e}", file=sys.stderr)
+
 
 async def try_init_copilot(
     working_directory: str = "/workspace",
@@ -1433,6 +1447,19 @@ async def try_init_copilot(
                     + instructions_text
                 )
                 print(f"[agent] Loaded workspace instructions ({len(instructions_text)} chars)", file=sys.stderr)
+
+        # Load session-specific prompt (.enclave-session-prompt)
+        session_prompt_path = Path(working_directory) / ".enclave-session-prompt"
+        if session_prompt_path.exists():
+            session_prompt_text = session_prompt_path.read_text().strip()
+            if session_prompt_text:
+                prompt_parts.append(
+                    "# Session-Specific Instructions\n\n"
+                    "The following instructions are specific to this session. "
+                    "Follow them unless they conflict with core safety guidelines.\n\n"
+                    + session_prompt_text
+                )
+                print(f"[agent] Loaded session prompt ({len(session_prompt_text)} chars)", file=sys.stderr)
 
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)

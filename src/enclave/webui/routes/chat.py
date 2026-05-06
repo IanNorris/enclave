@@ -205,6 +205,32 @@ async def send_message(request: Request, session_id: str, body: SendMessage):
     return {"sent": True, "event_id": event_id}
 
 
+@router.get("/{session_id}/models")
+async def get_models(request: Request, session_id: str):
+    """Get available models for a session (from agent's .enclave-models.json)."""
+    ws_base = Path(request.app.state.config.container.workspace_base) / session_id
+    models_path = ws_base / ".enclave-models.json"
+    if not models_path.exists():
+        return {"current": None, "available": [], "preferences": []}
+    try:
+        data = json.loads(models_path.read_text())
+        return data
+    except Exception:
+        return {"current": None, "available": [], "preferences": []}
+
+
+@router.post("/{session_id}/model")
+async def set_model(request: Request, session_id: str, body: SendMessage):
+    """Request a model change by sending a /model command to the agent."""
+    room_id = _get_room_id(request, session_id)
+    if not room_id:
+        raise HTTPException(status_code=404, detail="Session room not found")
+
+    config = _matrix_config(request)
+    event_id = await _send_matrix_message(config, room_id, f"/model {body.content}")
+    return {"sent": True, "event_id": event_id, "model": body.content}
+
+
 @router.post("/{session_id}/upload")
 async def upload_file(request: Request, session_id: str, file: UploadFile = File(...), message: str = ""):
     """Upload a file and send it to the agent's Matrix room."""

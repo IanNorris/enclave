@@ -84,4 +84,8 @@ onMounted(async () => {
 .muted {
   color: var(--text-muted);
 }
+
+@media (max-width: 768px) {
+  .session-list { gap: 0.5rem; }
+}
 </style>

@@ -405,3 +405,51 @@ async def stream_logs(websocket: WebSocket, session_id: str):
     finally:
         proc.kill()
         await proc.wait()
+
+
+# ─── System Prompt ──────────────────────────────────────────────────────────
+
+PROMPT_FILENAME = ".enclave-session-prompt"
+
+
+class PromptUpdate(BaseModel):
+    content: str
+
+
+@router.get("/{session_id}/prompt")
+async def get_prompt(request: Request, session_id: str):
+    """Read the session-specific system prompt."""
+    ws = _workspace_base(request) / session_id
+    if not ws.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    prompt_path = ws / PROMPT_FILENAME
+    content = ""
+    if prompt_path.exists():
+        content = prompt_path.read_text(encoding="utf-8")
+
+    # Also return the base prompt files for reference
+    prompts_dir = Path(__file__).parent.parent.parent / "agent" / "prompts"
+    base_parts = {}
+    for name in ("base.md", "guidelines.md", "dev.md", "host.md"):
+        fp = prompts_dir / name
+        if fp.exists():
+            base_parts[name] = fp.read_text(encoding="utf-8")
+
+    return {
+        "session_prompt": content,
+        "base_prompts": base_parts,
+        "path": str(prompt_path),
+    }
+
+
+@router.put("/{session_id}/prompt")
+async def update_prompt(request: Request, session_id: str, body: PromptUpdate):
+    """Write or update the session-specific system prompt."""
+    ws = _workspace_base(request) / session_id
+    if not ws.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    prompt_path = ws / PROMPT_FILENAME
+    prompt_path.write_text(body.content, encoding="utf-8")
+    return {"saved": True, "path": str(prompt_path)}

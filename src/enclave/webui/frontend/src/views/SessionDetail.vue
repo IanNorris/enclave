@@ -74,6 +74,33 @@
       <p v-else class="muted">No snapshots yet.</p>
     </div>
 
+    <!-- Prompt tab -->
+    <div v-if="activeTab === 'Prompt'" class="tab-content">
+      <div class="card prompt-section">
+        <h3>Session Prompt</h3>
+        <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+          Custom instructions for this session. Applied on next agent restart.
+        </p>
+        <textarea
+          v-model="sessionPrompt"
+          class="prompt-editor"
+          placeholder="Add custom instructions for this session…"
+          rows="12"
+        ></textarea>
+        <div class="prompt-actions">
+          <button class="primary" @click="savePrompt" :disabled="promptSaving">
+            {{ promptSaving ? 'Saving…' : 'Save' }}
+          </button>
+          <span v-if="promptSaved" class="save-indicator">✓ Saved</span>
+        </div>
+      </div>
+
+      <details v-for="(content, name) in basePrompts" :key="name" class="card base-prompt">
+        <summary>{{ name }} <span class="muted">(read-only)</span></summary>
+        <pre class="base-prompt-content">{{ content }}</pre>
+      </details>
+    </div>
+
     <!-- Snapshot modal -->
     <div v-if="showSnapshot" class="modal-overlay" @click.self="showSnapshot = false">
       <div class="modal card">
@@ -100,7 +127,7 @@ const route = useRoute()
 const id = route.params.id
 
 const session = ref(null)
-const tabs = ['Logs', 'State', 'Snapshots']
+const tabs = ['Logs', 'State', 'Snapshots', 'Prompt']
 const activeTab = ref('Logs')
 
 const logs = ref('')
@@ -114,6 +141,11 @@ const snapshots = ref([])
 const showSnapshot = ref(false)
 const snapshotName = ref('')
 const snapshotCreating = ref(false)
+
+const sessionPrompt = ref('')
+const promptSaving = ref(false)
+const promptSaved = ref(false)
+const basePrompts = ref({})
 
 onMounted(async () => {
   const sessions = await api.getSessions()
@@ -209,7 +241,32 @@ function formatSize(bytes) {
 import { watch } from 'vue'
 watch(activeTab, (tab) => {
   if (tab === 'State' && !stateFiles.value.length) loadState()
+  if (tab === 'Prompt' && !sessionPrompt.value && !Object.keys(basePrompts.value).length) loadPrompt()
 })
+
+async function loadPrompt() {
+  try {
+    const data = await api.getSessionPrompt(id)
+    sessionPrompt.value = data.session_prompt || ''
+    basePrompts.value = data.base_prompts || {}
+  } catch (e) {
+    console.error('Failed to load prompt:', e)
+  }
+}
+
+async function savePrompt() {
+  promptSaving.value = true
+  promptSaved.value = false
+  try {
+    await api.updateSessionPrompt(id, sessionPrompt.value)
+    promptSaved.value = true
+    setTimeout(() => { promptSaved.value = false }, 3000)
+  } catch (e) {
+    console.error('Failed to save prompt:', e)
+  } finally {
+    promptSaving.value = false
+  }
+}
 </script>
 
 <style scoped>
@@ -353,6 +410,55 @@ watch(activeTab, (tab) => {
 .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
 
 .muted { color: var(--text-muted); }
+
+.prompt-section { margin-bottom: 1rem; }
+.prompt-section h3 { margin: 0 0 0.5rem; }
+
+.prompt-editor {
+  width: 100%;
+  min-height: 200px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  resize: vertical;
+  background: var(--bg-main);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+}
+
+.prompt-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.save-indicator {
+  color: var(--success, #4ade80);
+  font-size: 0.85rem;
+}
+
+.base-prompt {
+  margin-bottom: 0.75rem;
+  cursor: pointer;
+}
+
+.base-prompt summary {
+  font-size: 0.9rem;
+  padding: 0.5rem 0;
+}
+
+.base-prompt-content {
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 400px;
+  overflow-y: auto;
+  margin: 0.5rem 0 0;
+  color: var(--text-secondary);
+}
 
 .creating-status {
   color: var(--warning);
