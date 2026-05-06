@@ -31,7 +31,7 @@
     <!-- Records tab -->
     <div v-if="tab === 'records'">
       <div class="search-bar">
-        <input v-model="search" placeholder="Filter memories…" />
+        <input v-model="search" placeholder="Filter by subject, predicate, or rule…" />
       </div>
 
       <div class="card" v-if="filteredRecords.length">
@@ -39,15 +39,17 @@
           <thead>
             <tr>
               <th>Type</th>
-              <th>Content</th>
-              <th>Symbols</th>
+              <th>Subject</th>
+              <th>Predicate / Rule</th>
+              <th>Value</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="(r, i) in filteredRecords" :key="i" class="memory-row" @click="selected = r">
-              <td><span class="badge" :class="r.type?.toLowerCase()">{{ r.type }}</span></td>
-              <td class="content-cell">{{ truncate(r.content, 120) }}</td>
-              <td class="symbols-cell">{{ r.symbols?.join(', ') || '' }}</td>
+              <td><span class="badge" :class="r.type">{{ r.type }}</span></td>
+              <td class="symbol-cell">{{ r.subject || '' }}</td>
+              <td class="symbol-cell">{{ r.predicate || r.rule || '' }}</td>
+              <td class="value-cell">{{ truncate(r.value, 60) }}</td>
             </tr>
           </tbody>
         </table>
@@ -86,13 +88,28 @@
     <div v-if="selected" class="modal-overlay" @click.self="selected = null">
       <div class="modal card detail-panel">
         <div class="detail-header">
-          <span class="badge" :class="selected.type?.toLowerCase()">{{ selected.type }}</span>
+          <span class="badge" :class="selected.type">{{ selected.type }}</span>
+          <span class="detail-id">memory #{{ selected.memory_id }}</span>
           <button class="secondary" @click="selected = null">✕</button>
         </div>
-        <pre class="detail-content">{{ selected.content }}</pre>
-        <div v-if="selected.symbols?.length" class="detail-symbols">
-          <strong>Symbols:</strong> {{ selected.symbols.join(', ') }}
-        </div>
+        <dl class="detail-fields">
+          <template v-if="selected.subject">
+            <dt>Subject</dt>
+            <dd>{{ selected.subject }}</dd>
+          </template>
+          <template v-if="selected.predicate">
+            <dt>Predicate</dt>
+            <dd>{{ selected.predicate }}</dd>
+          </template>
+          <template v-if="selected.rule">
+            <dt>Rule</dt>
+            <dd>{{ selected.rule }}</dd>
+          </template>
+          <template v-if="selected.value">
+            <dt>Value</dt>
+            <dd class="detail-value">{{ selected.value }}</dd>
+          </template>
+        </dl>
       </div>
     </div>
   </div>
@@ -117,9 +134,11 @@ const filteredRecords = computed(() => {
   if (!search.value) return list
   const q = search.value.toLowerCase()
   return list.filter(r =>
-    r.content?.toLowerCase().includes(q) ||
-    r.type?.toLowerCase().includes(q) ||
-    r.symbols?.some(s => s.toLowerCase().includes(q))
+    r.subject?.toLowerCase().includes(q) ||
+    r.predicate?.toLowerCase().includes(q) ||
+    r.rule?.toLowerCase().includes(q) ||
+    r.value?.toLowerCase().includes(q) ||
+    r.type?.toLowerCase().includes(q)
   )
 })
 
@@ -244,17 +263,20 @@ onMounted(async () => {
 
 .memory-row:hover { background: var(--bg-hover); }
 
-.content-cell {
-  max-width: 500px;
-  white-space: pre-wrap;
-  word-break: break-word;
+.symbol-cell {
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
-.symbols-cell {
-  font-family: monospace;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  max-width: 200px;
+.value-cell {
+  max-width: 300px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .symbol-name {
@@ -262,9 +284,8 @@ onMounted(async () => {
   font-weight: 500;
 }
 
-.badge.sem { background: #1a2a3a; color: #6ca8e8; }
-.badge.pro { background: #2a1a3a; color: #a86ce8; }
-.badge.epi { background: #1a3a2a; color: #6ce8a8; }
+.badge.semantic { background: #1a2a3a; color: #6ca8e8; }
+.badge.procedural { background: #2a1a3a; color: #a86ce8; }
 .badge.checkpoint { background: #2a2a1a; color: #e8d86c; }
 .badge.concept { background: #1a2a3a; color: #6ca8e8; }
 .badge.entity { background: #2a1a3a; color: #a86ce8; }
@@ -278,30 +299,49 @@ onMounted(async () => {
 }
 
 .detail-panel {
-  width: 700px;
+  width: 600px;
   max-height: 80vh;
   overflow-y: auto;
 }
 
 .detail-header {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin-bottom: 1rem;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
 }
 
-.detail-content {
-  font-size: 0.85rem;
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin: 0 0 1rem;
-  line-height: 1.6;
-}
+.detail-header button { margin-left: auto; }
 
-.detail-symbols {
-  font-size: 0.8rem;
-  color: var(--text-secondary);
+.detail-id {
   font-family: monospace;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.detail-fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.5rem 1rem;
+  margin: 0;
+}
+
+.detail-fields dt {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding-top: 0.2rem;
+}
+
+.detail-fields dd {
+  margin: 0;
+  font-family: monospace;
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+
+.detail-value {
+  white-space: pre-wrap;
 }
 
 .muted { color: var(--text-muted); }

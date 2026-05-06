@@ -11,6 +11,11 @@
           </router-link>
         </li>
         <li>
+          <router-link to="/chat" active-class="active">
+            <span class="icon">💬</span> Chat
+          </router-link>
+        </li>
+        <li>
           <router-link to="/bugs" active-class="active">
             <span class="icon">🐛</span> Bugs
           </router-link>

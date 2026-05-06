@@ -28,6 +28,11 @@ const routes = [
     name: 'memories',
     component: () => import('./views/Memories.vue'),
   },
+  {
+    path: '/chat',
+    name: 'chat',
+    component: () => import('./views/Chat.vue'),
+  },
 ]
 
 const router = createRouter({

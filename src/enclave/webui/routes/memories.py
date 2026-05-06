@@ -60,24 +60,29 @@ async def _run_mimir_cli(request: Request, *args: str, timeout: float = 30.0) ->
     return stdout.decode("utf-8", errors="replace")
 
 
-def _parse_log_output(output: str) -> list[dict[str, Any]]:
-    """Parse mimir-cli log output into structured records."""
-    records = []
-    current_episode: str | None = None
+def _parse_log_output(output: str) -> dict[str, Any]:
+    """Parse mimir-cli log output into structured records with resolved symbols."""
+    symbols_map: dict[int, str] = {}
+    memories: list[dict[str, Any]] = []
+    checkpoints: list[dict[str, Any]] = []
 
     for line in output.split("\n"):
         line = line.strip()
         if not line:
             continue
 
-        if line.startswith("CHECKPOINT"):
-            # CHECKPOINT episode_id=SymbolId(X) at=... memory_count=N
+        if line.startswith("SYMBOL_ALLOC"):
+            id_match = re.search(r"id=SymbolId\((\d+)\)", line)
+            name_match = re.search(r'name="([^"]*)"', line)
+            if id_match and name_match:
+                symbols_map[int(id_match.group(1))] = name_match.group(1)
+
+        elif line.startswith("CHECKPOINT"):
             match = re.search(r"episode_id=SymbolId\((\d+)\)", line)
             at_match = re.search(r"at=(\S+)", line)
             count_match = re.search(r"memory_count=(\d+)", line)
             if match:
-                current_episode = match.group(1)
-                records.append({
+                checkpoints.append({
                     "type": "checkpoint",
                     "episode_id": int(match.group(1)),
                     "timestamp": at_match.group(1) if at_match else None,
@@ -85,43 +90,36 @@ def _parse_log_output(output: str) -> list[dict[str, Any]]:
                 })
 
         elif line.startswith("SEM "):
-            # SEM memory_id=SymbolId(X) s=SymbolId(Y) p=SymbolId(Z) v=...
             mem_match = re.search(r"memory_id=SymbolId\((\d+)\)", line)
             s_match = re.search(r"s=SymbolId\((\d+)\)", line)
             p_match = re.search(r"p=SymbolId\((\d+)\)", line)
-            v_match = re.search(r"v=(\S+)", line)
+            v_match = re.search(r"v=(.+)$", line)
             if mem_match:
-                records.append({
+                s_id = int(s_match.group(1)) if s_match else None
+                p_id = int(p_match.group(1)) if p_match else None
+                memories.append({
                     "type": "semantic",
                     "memory_id": int(mem_match.group(1)),
-                    "subject": int(s_match.group(1)) if s_match else None,
-                    "predicate": int(p_match.group(1)) if p_match else None,
-                    "value": v_match.group(1) if v_match else None,
+                    "subject_id": s_id,
+                    "predicate_id": p_id,
+                    "subject": symbols_map.get(s_id, f"#{s_id}") if s_id is not None else None,
+                    "predicate": symbols_map.get(p_id, f"#{p_id}") if p_id is not None else None,
+                    "value": v_match.group(1).strip() if v_match else None,
                 })
 
         elif line.startswith("PRO "):
-            # PRO memory_id=SymbolId(X) rule_id=SymbolId(Y)
             mem_match = re.search(r"memory_id=SymbolId\((\d+)\)", line)
             rule_match = re.search(r"rule_id=SymbolId\((\d+)\)", line)
             if mem_match:
-                records.append({
+                rule_id = int(rule_match.group(1)) if rule_match else None
+                memories.append({
                     "type": "procedural",
                     "memory_id": int(mem_match.group(1)),
-                    "rule_id": int(rule_match.group(1)) if rule_match else None,
+                    "rule_id": rule_id,
+                    "rule": symbols_map.get(rule_id, f"#{rule_id}") if rule_id is not None else None,
                 })
 
-        elif line.startswith("SYMBOL_ALLOC"):
-            # SYMBOL_ALLOC id=SymbolId(X) name="Y"
-            id_match = re.search(r"id=SymbolId\((\d+)\)", line)
-            name_match = re.search(r'name="([^"]*)"', line)
-            if id_match and name_match:
-                records.append({
-                    "type": "symbol",
-                    "id": int(id_match.group(1)),
-                    "name": name_match.group(1),
-                })
-
-    return records
+    return {"memories": memories, "checkpoints": checkpoints, "symbols_map": symbols_map}
 
 
 def _parse_symbols_output(output: str) -> list[dict[str, Any]]:
@@ -154,11 +152,11 @@ async def get_memories(request: Request):
 
     log_path = _canonical_log(request)
     if not log_path.exists():
-        return {"records": [], "symbols": []}
+        return {"records": [], "checkpoints": []}
 
     output = await _run_mimir_cli(request, "log")
-    records = _parse_log_output(output)
-    return {"records": records}
+    parsed = _parse_log_output(output)
+    return {"records": parsed["memories"], "checkpoints": parsed["checkpoints"]}
 
 
 @router.get("/symbols")

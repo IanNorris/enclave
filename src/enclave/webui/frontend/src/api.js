@@ -61,4 +61,12 @@ export const api = {
   getMemories: () => request('/memories'),
   getSymbols: () => request('/memories/symbols'),
   getMemoryStats: () => request('/memories/stats'),
+
+  // Chat
+  getChatHistory: (session, limit = 100, offset = 0) =>
+    request(`/chat/${session}/history?limit=${limit}&offset=${offset}`),
+  sendChatMessage: (session, content) => request(`/chat/${session}/send`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  }),
 }
