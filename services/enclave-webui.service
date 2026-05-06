@@ -1,0 +1,18 @@
+[Unit]
+Description=Enclave Web UI
+After=network-online.target enclave.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/share/enclave/venv/bin:%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/share/enclave/venv/bin/enclave-webui
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=enclave-webui
+WorkingDirectory=%h
+
+[Install]
+WantedBy=default.target

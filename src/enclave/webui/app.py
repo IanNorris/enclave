@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import sys
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 
 from enclave.common.config import EnclaveConfig, load_config
+from enclave.webui.auth import (
+    create_token,
+    create_user,
+    get_current_user,
+    user_count,
+    verify_password,
+)
 
 
 def create_app(config: EnclaveConfig | None = None) -> FastAPI:
@@ -29,26 +38,58 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     # Store config in app state for access in route handlers
     app.state.config = config
 
-    # CORS — localhost only for now
+    # CORS — allow the webui port from any origin (needed when exposed off-localhost)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:8430", "http://127.0.0.1:8430"],
+        allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-    # Register API routers
-    from enclave.webui.routes import sessions, bugs, memories
+    # Auth router (unprotected)
+    auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-    app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
-    app.include_router(bugs.router, prefix="/api/bugs", tags=["bugs"])
-    app.include_router(memories.router, prefix="/api/memories", tags=["memories"])
+    @auth_router.post("/login")
+    async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+        user = verify_password(form_data.username, form_data.password)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = create_token(form_data.username)
+        return {"access_token": token, "token_type": "bearer", "username": form_data.username}
 
-    # Health check
+    @auth_router.get("/me")
+    async def me(user: dict = Depends(get_current_user)):
+        return {"username": user["username"], "is_admin": user.get("is_admin", False)}
+
+    app.include_router(auth_router)
+
+    # Protected API routers — require valid JWT
+    from enclave.webui.routes import bugs, memories, sessions
+
+    app.include_router(
+        sessions.router,
+        prefix="/api/sessions",
+        tags=["sessions"],
+        dependencies=[Depends(get_current_user)],
+    )
+    app.include_router(
+        bugs.router,
+        prefix="/api/bugs",
+        tags=["bugs"],
+        dependencies=[Depends(get_current_user)],
+    )
+    app.include_router(
+        memories.router,
+        prefix="/api/memories",
+        tags=["memories"],
+        dependencies=[Depends(get_current_user)],
+    )
+
+    # Health check (unprotected)
     @app.get("/api/health")
     async def health():
-        return {"status": "ok"}
+        return {"status": "ok", "auth_required": user_count() > 0}
 
     # Serve Vue SPA static files (built output) — must be last
     frontend_dist = Path(__file__).parent / "frontend" / "dist"
@@ -70,8 +111,8 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default="127.0.0.1",
-        help="Bind address (default: 127.0.0.1, localhost only)",
+        default="0.0.0.0",
+        help="Bind address (default: 0.0.0.0)",
     )
     parser.add_argument(
         "--port",
@@ -84,12 +125,38 @@ def main():
         action="store_true",
         help="Enable auto-reload for development",
     )
+    parser.add_argument(
+        "--create-user",
+        metavar="USERNAME",
+        help="Create or reset a user account, then exit",
+    )
+    parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Grant admin privileges (use with --create-user)",
+    )
     args = parser.parse_args()
+
+    # User management mode
+    if args.create_user:
+        password = getpass.getpass(f"Password for '{args.create_user}': ")
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            print("Error: passwords do not match", file=sys.stderr)
+            sys.exit(1)
+        create_user(args.create_user, password, is_admin=args.admin)
+        print(f"[webui] User '{args.create_user}' created/updated"
+              f"{' (admin)' if args.admin else ''}")
+        sys.exit(0)
 
     config = load_config(args.config)
     app = create_app(config)
 
     print(f"[webui] Starting Enclave Web UI on http://{args.host}:{args.port}", file=sys.stderr)
+    if user_count() == 0:
+        print("[webui] WARNING: No users configured — run with --create-user to add one",
+              file=sys.stderr)
+
     uvicorn.run(
         app,
         host=args.host,
