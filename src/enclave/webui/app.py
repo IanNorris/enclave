@@ -94,7 +94,17 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     # Serve Vue SPA static files (built output) — must be last
     frontend_dist = Path(__file__).parent / "frontend" / "dist"
     if frontend_dist.exists():
-        app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="spa")
+        from fastapi.responses import FileResponse
+
+        app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
+
+        @app.get("/{full_path:path}")
+        async def spa_fallback(full_path: str):
+            """Serve index.html for all non-API routes (SPA client-side routing)."""
+            file_path = frontend_dist / full_path
+            if file_path.is_file():
+                return FileResponse(file_path)
+            return FileResponse(frontend_dist / "index.html")
 
     return app
 

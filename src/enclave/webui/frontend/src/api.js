@@ -1,10 +1,25 @@
 const BASE = '/api'
 
+function getToken() {
+  return localStorage.getItem('enclave_token') || ''
+}
+
 async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  })
+  const headers = {
+    'Content-Type': 'application/json',
+    ...options.headers,
+  }
+  const token = getToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  const res = await fetch(`${BASE}${path}`, { ...options, headers })
+  if (res.status === 401) {
+    localStorage.removeItem('enclave_token')
+    localStorage.removeItem('enclave_user')
+    window.location.href = '/login'
+    throw new Error('Session expired')
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     throw new Error(err.detail || res.statusText)
