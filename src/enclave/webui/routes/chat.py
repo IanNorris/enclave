@@ -1,8 +1,8 @@
 """Conversation API routes.
 
 Provides chat history from the session-store.db (turns table) and
-sends messages via the Matrix client-server API so they flow through
-the existing orchestrator pipeline.
+sends messages via the orchestrator control socket (which wakes idle
+agents) with Matrix echo, falling back to direct Matrix send.
 """
 
 from __future__ import annotations
@@ -175,6 +175,45 @@ async def _send_matrix_file(config, room_id: str, mxc_uri: str, filename: str, s
             return data.get("event_id", "")
 
 
+# ─── Control socket helper ───────────────────────────────────────────────────
+
+
+async def _send_via_control_socket(data_dir: Path, session_id: str, content: str) -> bool:
+    """Send a message via the orchestrator control socket (wakes idle agents).
+
+    Returns True if the message was accepted, False on failure.
+    """
+    sock_path = data_dir / "control.sock"
+    if not sock_path.exists():
+        return False
+
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        req = json.dumps({
+            "action": "send",
+            "session": session_id,
+            "content": content,
+            "sender": "WebUI",
+        })
+        writer.write(req.encode() + b"\n")
+        await writer.drain()
+
+        # Read the ack response
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        if line:
+            resp = json.loads(line.decode())
+            if resp.get("ok"):
+                writer.close()
+                await writer.wait_closed()
+                return True
+
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, asyncio.TimeoutError, json.JSONDecodeError):
+        pass
+    return False
+
+
 # ─── Models ─────────────────────────────────────────────────────────────────
 
 
@@ -195,14 +234,21 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
 
 @router.post("/{session_id}/send")
 async def send_message(request: Request, session_id: str, body: SendMessage):
-    """Send a message to a session's agent via Matrix."""
+    """Send a message to a session's agent via control socket (preferred) or Matrix."""
+    # Try control socket first — this properly wakes idle/stopped agents
+    data_dir = Path(request.app.state.config.data_dir)
+    sent = await _send_via_control_socket(data_dir, session_id, body.content)
+    if sent:
+        return {"sent": True, "via": "control_socket"}
+
+    # Fallback: direct Matrix send (won't wake agent if it's idle/stopped)
     room_id = _get_room_id(request, session_id)
     if not room_id:
         raise HTTPException(status_code=404, detail="Session room not found")
 
     config = _matrix_config(request)
     event_id = await _send_matrix_message(config, room_id, body.content)
-    return {"sent": True, "event_id": event_id}
+    return {"sent": True, "event_id": event_id, "via": "matrix"}
 
 
 @router.get("/{session_id}/models")
