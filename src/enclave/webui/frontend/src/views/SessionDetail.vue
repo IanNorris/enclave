@@ -95,6 +95,24 @@
         </div>
       </div>
 
+      <div class="card prompt-section">
+        <h3>Context Analysis</h3>
+        <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+          Ask the agent to analyze its current session context and summarize key information not present in the prompt documents.
+        </p>
+        <button
+          class="secondary"
+          @click="analyzeContext"
+          :disabled="analyzing"
+        >{{ analyzing ? '⏳ Analyzing…' : '🔍 Analyze Context' }}</button>
+        <div v-if="analysisResult" class="analysis-result">
+          <pre class="analysis-content">{{ analysisResult }}</pre>
+        </div>
+        <p v-if="analysisSent" class="muted" style="margin:0.5rem 0 0;font-size:0.85rem">
+          ✓ Request sent — check Chat tab for the agent's response.
+        </p>
+      </div>
+
       <details v-for="(content, name) in basePrompts" :key="name" class="card base-prompt">
         <summary>{{ name }} <span class="muted">(read-only)</span></summary>
         <pre class="base-prompt-content">{{ content }}</pre>
@@ -146,7 +164,9 @@ const sessionPrompt = ref('')
 const promptSaving = ref(false)
 const promptSaved = ref(false)
 const basePrompts = ref({})
-
+const analyzing = ref(false)
+const analysisSent = ref(false)
+const analysisResult = ref('')
 onMounted(async () => {
   const sessions = await api.getSessions()
   session.value = sessions.find(s => s.id === id) || { id, name: id, status: 'unknown' }
@@ -265,6 +285,22 @@ async function savePrompt() {
     console.error('Failed to save prompt:', e)
   } finally {
     promptSaving.value = false
+  }
+}
+
+async function analyzeContext() {
+  analyzing.value = true
+  analysisSent.value = false
+  analysisResult.value = ''
+  try {
+    const message = `/analyze-context Analyze your current session context. Produce a concise summary of:\n1. Key information you have about this session that is NOT in your system prompt documents\n2. Important facts, patterns, or decisions that emerged during conversation\n3. Anything that would be valuable to add to the session prompt for future reference\n\nBe specific and actionable.`
+    await api.sendChatMessage(id, message)
+    analysisSent.value = true
+  } catch (e) {
+    console.error('Failed to send context analysis request:', e)
+    analysisResult.value = `Error: ${e.message}`
+  } finally {
+    analyzing.value = false
   }
 }
 </script>
@@ -457,6 +493,22 @@ async function savePrompt() {
   max-height: 400px;
   overflow-y: auto;
   margin: 0.5rem 0 0;
+  color: var(--text-secondary);
+}
+
+.analysis-result {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.analysis-content {
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
   color: var(--text-secondary);
 }
 
