@@ -309,6 +309,18 @@ async def set_model(request: Request, session_id: str, body: SendMessage):
 
     config = _matrix_config(request)
     event_id = await _send_matrix_message(config, room_id, f"/model {body.content}")
+
+    # Update the current model in the models file
+    ws_base = Path(request.app.state.config.container.workspace_base) / session_id
+    models_path = ws_base / ".enclave-models.json"
+    try:
+        if models_path.exists():
+            data = json.loads(models_path.read_text())
+            data["current"] = body.content
+            models_path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
     return {"sent": True, "event_id": event_id, "model": body.content}
 
 

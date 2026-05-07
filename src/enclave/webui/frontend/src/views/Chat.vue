@@ -2,20 +2,9 @@
   <div class="chat-view" @dragover.prevent="onDragOver" @dragleave="onDragLeave" @drop.prevent="onDrop">
     <div class="chat-header">
       <h2>Chat</h2>
-      <div class="model-picker" v-if="selectedSession">
-        <label class="model-label">Model:</label>
-        <input
-          v-model="currentModel"
-          class="model-input"
-          placeholder="e.g. claude-sonnet-4-20250514"
-          @keydown.enter="changeModel"
-          list="model-suggestions"
-        />
-        <datalist id="model-suggestions">
-          <option v-for="m in models.available" :key="m" :value="m" />
-        </datalist>
-        <button class="model-apply" @click="changeModel" :disabled="!currentModel">Set</button>
-      </div>
+      <select v-if="models.available.length && selectedSession" v-model="currentModel" @change="changeModel" class="model-select">
+        <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
+      </select>
     </div>
 
     <div class="chat-container" v-if="selectedSession">
@@ -614,32 +603,14 @@ function formatTime(ts) {
 
 .chat-header h2 { margin: 0; }
 
-.model-picker {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
+.model-select {
   margin-left: auto;
-}
-
-.model-label {
   font-size: 0.8rem;
-  color: var(--text-secondary);
-  white-space: nowrap;
-}
-
-.model-input {
-  font-size: 0.8rem;
-  padding: 0.3rem 0.5rem;
-  width: 240px;
+  padding: 0.4rem 0.5rem;
   background: var(--bg-main);
   color: var(--text-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm, 4px);
-}
-
-.model-apply {
-  font-size: 0.75rem;
-  padding: 0.3rem 0.6rem;
 }
 
 .messages {
