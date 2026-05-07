@@ -870,6 +870,7 @@ class MessageRouter:
             log.info("Agent %s turn started", session.id)
             self._turn_start_time[session.id] = time.monotonic()
             self._control.cancel_turn_end(session.id)
+            self._control.notify_turn_start(session.id)
             self._start_typing_refresh(session)
         elif msg.type == MessageType.TURN_END:
             elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
@@ -1067,6 +1068,7 @@ class MessageRouter:
         content = msg.payload.get("content", "")
         if not content:
             return
+        self._control.notify_delta(session.id, content)
         reply_to = msg.payload.get("in_reply_to") or msg.reply_to
 
         stream = self._streaming.get(session.id)
@@ -1158,6 +1160,7 @@ class MessageRouter:
         intent = msg.payload.get("intent", "")
         if intent:
             log.debug("Agent %s intent: %s", session.id, intent)
+            self._control.notify_activity(session.id, f"💭 {intent}")
             plain = f"💭 {intent}"
             html = f"💭 <i>{_html_escape(intent)}</i>"
             await self._update_activity(session, plain, thread_id, html=html)
@@ -1166,6 +1169,7 @@ class MessageRouter:
         # Accumulated thinking content (streaming edit-in-place)
         thinking = msg.payload.get("thinking_content", "")
         if thinking:
+            self._control.notify_thinking(session.id, thinking, "delta")
             stream = self._thinking_stream.get(session.id)
             if stream is not None:
                 # Fast path: just update content if longer
@@ -1206,6 +1210,7 @@ class MessageRouter:
         # Full reasoning text (complete thinking block)
         reasoning = msg.payload.get("reasoning", "")
         if reasoning:
+            self._control.notify_thinking(session.id, reasoning, "end")
             # Cancel any pending thinking flush
             self._cancel_stream_flush(session.id, thinking=True)
             async with self._get_stream_lock(session.id):
@@ -1233,6 +1238,7 @@ class MessageRouter:
         if delta:
             preview = delta.strip()[:150].replace("\n", " ")
             if preview:
+                self._control.notify_thinking(session.id, preview, "delta")
                 plain = f"🤔 …{preview}"
                 html = f"🤔 <i>…{_html_escape(preview)}</i>"
                 await self._update_activity(session, plain, thread_id, html=html)
@@ -1268,6 +1274,7 @@ class MessageRouter:
         if tool_name in ("report_intent",):
             return
         log.debug("Agent %s tool start: %s", session.id, tool_name)
+        self._control.notify_tool_start(session.id, tool_name, detail or description or "")
         self._audit.log(
             "tool_start", session_id=session.id,
             tool=tool_name, description=description,
@@ -1299,6 +1306,7 @@ class MessageRouter:
         if tool_name in ("report_intent",):
             return
         log.debug("Agent %s tool complete: %s (success=%s)", session.id, tool_name, success)
+        self._control.notify_tool_complete(session.id, tool_name, success)
         self._audit.log(
             "tool_complete", session_id=session.id,
             tool=tool_name, success=success,

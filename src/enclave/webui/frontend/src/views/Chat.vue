@@ -21,6 +21,7 @@
 
       <!-- Messages -->
       <div class="messages" ref="messagesEl">
+        <!-- Completed turns from SQLite -->
         <div v-for="turn in turns" :key="turn.turn_index" class="turn">
           <div v-if="turn.user_message" class="message user-message">
             <div class="message-meta">
@@ -37,7 +38,52 @@
             <div class="message-body" v-html="renderMarkdown(turn.assistant_response)"></div>
           </div>
         </div>
-        <div v-if="sending" class="message assistant-message typing">
+
+        <!-- Live streaming section -->
+        <div v-if="liveEvents.length || streamingText" class="turn live-turn">
+          <!-- Accumulated events (thinking blocks, tool calls) -->
+          <div v-for="(evt, i) in liveEvents" :key="i" class="live-event" :class="evt.type">
+            <!-- Thinking block -->
+            <div v-if="evt.type === 'thinking'" class="thinking-block" :class="{ collapsed: evt.collapsed }">
+              <div class="event-header" @click="evt.collapsed = !evt.collapsed">
+                <span class="event-icon">🤔</span>
+                <span class="event-label">Thinking</span>
+                <span class="expand-toggle">{{ evt.collapsed ? '▶' : '▼' }}</span>
+              </div>
+              <div v-if="!evt.collapsed" class="event-content thinking-content">{{ evt.content }}</div>
+            </div>
+
+            <!-- Tool call -->
+            <div v-if="evt.type === 'tool'" class="tool-block" :class="{ collapsed: evt.collapsed }">
+              <div class="event-header" @click="evt.collapsed = !evt.collapsed">
+                <span class="event-icon">{{ evt.icon }}</span>
+                <span class="event-label">{{ evt.detail || evt.name }}</span>
+                <span v-if="evt.done" class="tool-status" :class="evt.success ? 'success' : 'fail'">
+                  {{ evt.success ? '✅' : '❌' }}
+                </span>
+                <span v-else class="tool-spinner">⏳</span>
+                <span class="expand-toggle">{{ evt.collapsed ? '▶' : '▼' }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Streaming text with cursor -->
+          <div v-if="streamingText" class="message assistant-message streaming">
+            <div class="message-meta">
+              <span class="sender">Agent</span>
+              <span class="streaming-badge">streaming</span>
+            </div>
+            <div class="message-body" v-html="renderMarkdown(streamingText + ' ▍')"></div>
+          </div>
+        </div>
+
+        <!-- Activity status -->
+        <div v-if="activityText" class="activity-line">
+          {{ activityText }}
+        </div>
+
+        <!-- Sending indicator -->
+        <div v-if="sending && !streamingText && !activityText" class="message assistant-message typing">
           <span class="typing-indicator">●●●</span>
         </div>
       </div>
@@ -75,11 +121,18 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { api } from '../api.js'
 import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+
+const TOOL_ICONS = {
+  bash: '🖥️', read_bash: '📖', write_bash: '⌨️', stop_bash: '⏹️',
+  view: '📄', edit: '✏️', create: '📝', grep: '🔍', glob: '📁',
+  web_fetch: '🌐', web_search: '🔎', task: '🤖', read_agent: '📨',
+  sql: '🗃️', ask_user: '❓', list_bash: '📋',
+}
 
 const sessions = ref([])
 const selectedSession = ref('')
@@ -92,6 +145,13 @@ const pendingFiles = ref([])
 const dragging = ref(false)
 const models = ref({ current: null, available: [], preferences: [] })
 const currentModel = ref('')
+
+// Live streaming state
+const liveEvents = ref([])
+const streamingText = ref('')
+const activityText = ref('')
+let currentThinkingIdx = -1
+
 let ws = null
 let dragCounter = 0
 
@@ -111,7 +171,15 @@ onUnmounted(() => {
 
 watch(selectedSession, () => {
   if (ws) { ws.close(); ws = null }
+  clearLiveState()
 })
+
+function clearLiveState() {
+  liveEvents.value = []
+  streamingText.value = ''
+  activityText.value = ''
+  currentThinkingIdx = -1
+}
 
 async function loadHistory() {
   if (!selectedSession.value) { turns.value = []; return }
@@ -153,14 +221,8 @@ function connectWebSocket() {
   ws = new WebSocket(`${proto}//${location.host}/api/chat/${selectedSession.value}/stream?token=${token}`)
 
   ws.onmessage = async (event) => {
-    const turn = JSON.parse(event.data)
-    const idx = turns.value.findIndex(t => t.turn_index === turn.turn_index)
-    if (idx >= 0) {
-      turns.value[idx] = turn
-    } else {
-      turns.value.push(turn)
-    }
-    sending.value = false
+    const msg = JSON.parse(event.data)
+    handleStreamEvent(msg)
     await nextTick()
     scrollToBottom()
   }
@@ -169,6 +231,112 @@ function connectWebSocket() {
     setTimeout(() => {
       if (selectedSession.value) connectWebSocket()
     }, 3000)
+  }
+}
+
+function handleStreamEvent(msg) {
+  const type = msg.type
+
+  if (type === 'turn') {
+    // Completed turn from SQLite — merge into turns list
+    const idx = turns.value.findIndex(t => t.turn_index === msg.turn_index)
+    if (idx >= 0) {
+      turns.value[idx] = msg
+    } else {
+      turns.value.push(msg)
+    }
+    // Clear live state since the turn is now persisted
+    clearLiveState()
+    sending.value = false
+    return
+  }
+
+  if (type === 'turn_start') {
+    clearLiveState()
+    return
+  }
+
+  if (type === 'delta') {
+    streamingText.value = msg.content || ''
+    activityText.value = ''
+    sending.value = false
+    return
+  }
+
+  if (type === 'thinking') {
+    const phase = msg.phase || 'delta'
+    if (phase === 'end') {
+      // Finalize thinking block — auto-collapse
+      if (currentThinkingIdx >= 0 && currentThinkingIdx < liveEvents.value.length) {
+        liveEvents.value[currentThinkingIdx].content = msg.content || liveEvents.value[currentThinkingIdx].content
+        liveEvents.value[currentThinkingIdx].collapsed = true
+      }
+      currentThinkingIdx = -1
+    } else {
+      // Start or delta
+      if (currentThinkingIdx < 0 || currentThinkingIdx >= liveEvents.value.length) {
+        // Create new thinking block
+        liveEvents.value.push(reactive({
+          type: 'thinking',
+          content: msg.content || '',
+          collapsed: false,
+        }))
+        currentThinkingIdx = liveEvents.value.length - 1
+      } else {
+        liveEvents.value[currentThinkingIdx].content = msg.content || ''
+      }
+    }
+    return
+  }
+
+  if (type === 'tool_start') {
+    currentThinkingIdx = -1  // End any open thinking block
+    const icon = TOOL_ICONS[msg.name] || '🔧'
+    liveEvents.value.push(reactive({
+      type: 'tool',
+      name: msg.name || 'unknown',
+      detail: msg.detail || '',
+      icon,
+      done: false,
+      success: true,
+      collapsed: false,
+    }))
+    activityText.value = ''
+    return
+  }
+
+  if (type === 'tool_complete') {
+    // Find the last tool event with this name that isn't done
+    for (let i = liveEvents.value.length - 1; i >= 0; i--) {
+      const evt = liveEvents.value[i]
+      if (evt.type === 'tool' && evt.name === msg.name && !evt.done) {
+        evt.done = true
+        evt.success = msg.success !== false
+        evt.collapsed = true
+        break
+      }
+    }
+    return
+  }
+
+  if (type === 'activity') {
+    activityText.value = msg.text || ''
+    return
+  }
+
+  if (type === 'response') {
+    // Final response — clear streaming, will be picked up by turn poll
+    streamingText.value = ''
+    activityText.value = ''
+    // Collapse all remaining live events
+    liveEvents.value.forEach(e => { e.collapsed = true })
+    return
+  }
+
+  if (type === 'turn_end') {
+    sending.value = false
+    activityText.value = ''
+    return
   }
 }
 
@@ -505,6 +673,110 @@ function formatTime(ts) {
 }
 
 .muted { color: var(--text-muted); }
+
+/* Live streaming styles */
+.live-turn {
+  border-left: 2px solid var(--accent);
+  padding-left: 0.75rem;
+  margin-left: 0.25rem;
+}
+
+.live-event {
+  margin-bottom: 0.5rem;
+}
+
+.thinking-block,
+.tool-block {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.event-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.event-header:hover {
+  background: var(--bg-main);
+}
+
+.event-icon {
+  flex-shrink: 0;
+}
+
+.event-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.expand-toggle {
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+}
+
+.thinking-content {
+  padding: 0.5rem 0.6rem;
+  font-size: 0.78rem;
+  font-style: italic;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.tool-status { flex-shrink: 0; }
+.tool-status.success { color: var(--success); }
+.tool-status.fail { color: var(--danger); }
+
+.tool-spinner {
+  flex-shrink: 0;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.streaming-badge {
+  font-size: 0.65rem;
+  color: var(--accent);
+  background: rgba(99, 179, 237, 0.15);
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.streaming .message-body {
+  opacity: 0.95;
+}
+
+.activity-line {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  padding: 0.25rem 0;
+  font-style: italic;
+  animation: fadeInOut 2s ease-in-out infinite;
+}
+
+@keyframes fadeInOut {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
 
 @media (max-width: 768px) {
   .chat-view { height: calc(100vh - 3.5rem); }

@@ -1,17 +1,25 @@
 """Control socket for injecting messages into agent sessions.
 
-Allows external tools (e.g. the host Copilot CLI) to send messages
-directly to running agents and receive streamed responses.
+Allows external tools (e.g. the host Copilot CLI, web UI) to send messages
+directly to running agents and receive streamed responses, or passively
+subscribe to a session's event stream.
 
 Protocol: newline-delimited JSON over a Unix domain socket.
 
 Request:
     {"action": "send", "session": "<session_id>", "content": "...", "sender": "..."}
+    {"action": "subscribe", "session": "<session_id>"}
     {"action": "list"}
 
 Response (streamed, one JSON object per line):
     {"ok": true, "type": "ack"}
+    {"ok": true, "type": "delta", "content": "..."}
+    {"ok": true, "type": "thinking", "content": "...", "phase": "start|delta|end"}
+    {"ok": true, "type": "tool_start", "name": "...", "detail": "..."}
+    {"ok": true, "type": "tool_complete", "name": "...", "success": true}
+    {"ok": true, "type": "activity", "text": "..."}
     {"ok": true, "type": "response", "content": "..."}
+    {"ok": true, "type": "turn_start"}
     {"ok": true, "type": "turn_end"}
     {"ok": false, "error": "..."}
 """
@@ -62,8 +70,39 @@ class ControlServer:
 
     def notify_response(self, session_id: str, content: str) -> None:
         """Called by the router when an agent sends a response."""
+        self._emit(session_id, {"ok": True, "type": "response", "content": content})
+
+    def notify_delta(self, session_id: str, content: str) -> None:
+        """Called by the router on streaming text delta."""
+        self._emit(session_id, {"ok": True, "type": "delta", "content": content})
+
+    def notify_thinking(self, session_id: str, content: str, phase: str = "delta") -> None:
+        """Called by the router on thinking/reasoning updates.
+
+        phase: "start" (new thinking block), "delta" (streaming update), "end" (finalized)
+        """
+        self._emit(session_id, {"ok": True, "type": "thinking", "content": content, "phase": phase})
+
+    def notify_tool_start(self, session_id: str, name: str, detail: str = "") -> None:
+        """Called by the router when a tool starts executing."""
+        self._emit(session_id, {"ok": True, "type": "tool_start", "name": name, "detail": detail})
+
+    def notify_tool_complete(self, session_id: str, name: str, success: bool = True) -> None:
+        """Called by the router when a tool finishes."""
+        self._emit(session_id, {"ok": True, "type": "tool_complete", "name": name, "success": success})
+
+    def notify_activity(self, session_id: str, text: str) -> None:
+        """Called by the router for activity/status updates."""
+        self._emit(session_id, {"ok": True, "type": "activity", "text": text})
+
+    def notify_turn_start(self, session_id: str) -> None:
+        """Called by the router when an agent turn begins."""
+        self._emit(session_id, {"ok": True, "type": "turn_start"})
+
+    def _emit(self, session_id: str, event: dict) -> None:
+        """Push an event to all subscribers of a session."""
         for q in self._subscribers.get(session_id, set()):
-            q.put_nowait({"ok": True, "type": "response", "content": content})
+            q.put_nowait(event)
 
     def notify_turn_end(self, session_id: str) -> None:
         """Called by the router when an agent's turn ends.
@@ -82,8 +121,7 @@ class ControlServer:
 
         def _fire() -> None:
             self._turn_end_timers.pop(session_id, None)
-            for q in self._subscribers.get(session_id, set()):
-                q.put_nowait({"ok": True, "type": "turn_end"})
+            self._emit(session_id, {"ok": True, "type": "turn_end"})
 
         loop = asyncio.get_event_loop()
         self._turn_end_timers[session_id] = loop.call_later(2.0, _fire)
@@ -110,6 +148,8 @@ class ControlServer:
                 await self._handle_list(writer)
             elif action == "send":
                 await self._handle_send(req, writer, reader)
+            elif action == "subscribe":
+                await self._handle_subscribe(req, writer, reader)
             elif action == "stop":
                 await self._handle_stop(req, writer)
             elif action == "start":
@@ -206,6 +246,44 @@ class ControlServer:
             await self._write(writer, {"ok": True, "type": "deleted"})
         else:
             await self._write(writer, {"ok": False, "error": "Failed to delete session"})
+
+    async def _handle_subscribe(
+        self,
+        req: dict,
+        writer: asyncio.StreamWriter,
+        reader: asyncio.StreamReader,
+    ) -> None:
+        """Subscribe to a session's event stream without sending a message."""
+        session_id = req.get("session", "")
+        if not session_id:
+            await self._write(writer, {"ok": False, "error": "Missing session"})
+            return
+
+        # Subscribe to events
+        q: asyncio.Queue[dict] = asyncio.Queue()
+        subs = self._subscribers.setdefault(session_id, set())
+        subs.add(q)
+
+        try:
+            await self._write(writer, {"ok": True, "type": "subscribed", "session": session_id})
+
+            # Stream events until client disconnects or timeout
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=600.0)
+                    await self._write(writer, msg)
+                except asyncio.TimeoutError:
+                    # Send keepalive ping
+                    try:
+                        await self._write(writer, {"ok": True, "type": "ping"})
+                    except (ConnectionError, OSError):
+                        break
+                except (ConnectionError, OSError):
+                    break
+        finally:
+            subs.discard(q)
+            if not subs:
+                self._subscribers.pop(session_id, None)
 
     async def _handle_send(
         self,

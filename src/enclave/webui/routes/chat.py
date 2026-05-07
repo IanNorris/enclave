@@ -306,14 +306,20 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
 
 @router.websocket("/{session_id}/stream")
 async def stream_conversation(websocket: WebSocket, session_id: str):
-    """WebSocket: stream new conversation turns as they arrive."""
+    """WebSocket: stream live agent events and completed turns.
+
+    Connects to the orchestrator's control socket to receive real-time
+    events (deltas, thinking, tool calls), and falls back to SQLite
+    polling for completed turns.
+    """
     await websocket.accept()
 
-    # Get the DB path from app config
     config = websocket.app.state.config
+    data_dir = Path(config.data_dir)
     db_path = Path(config.container.workspace_base) / session_id / ".copilot-state" / "session-store.db"
+    sock_path = data_dir / "control.sock"
 
-    # Track last known turn
+    # Track last known turn for SQLite fallback
     last_turn = -1
     if db_path.exists():
         try:
@@ -326,9 +332,45 @@ async def stream_conversation(websocket: WebSocket, session_id: str):
         except sqlite3.Error:
             pass
 
-    try:
+    async def _stream_from_control_socket():
+        """Subscribe to the control socket and forward events to the WebSocket."""
+        if not sock_path.exists():
+            return
+
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(sock_path))
+            req = json.dumps({"action": "subscribe", "session": session_id})
+            writer.write(req.encode() + b"\n")
+            await writer.drain()
+
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line.decode())
+                    if event.get("type") == "ping":
+                        continue
+                    if event.get("type") == "subscribed":
+                        continue
+                    await websocket.send_json(event)
+                except (json.JSONDecodeError, Exception):
+                    continue
+
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _poll_turns():
+        """Poll SQLite for completed turns (fallback for persistence)."""
+        nonlocal last_turn
         while True:
-            await asyncio.sleep(1.5)  # Poll interval
+            await asyncio.sleep(3.0)
 
             if not db_path.exists():
                 continue
@@ -346,13 +388,31 @@ async def stream_conversation(websocket: WebSocket, session_id: str):
                 conn.close()
 
                 for turn in new_turns:
+                    turn["type"] = "turn"
                     await websocket.send_json(turn)
                     last_turn = turn["turn_index"]
 
             except sqlite3.Error:
                 continue
 
-    except WebSocketDisconnect:
-        pass
+    try:
+        # Run both streams concurrently
+        ctrl_task = asyncio.create_task(_stream_from_control_socket())
+        poll_task = asyncio.create_task(_poll_turns())
+
+        # Wait for WebSocket to close (either side)
+        try:
+            while True:
+                # Keep reading from client to detect disconnect
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
     except Exception:
-        await websocket.close()
+        pass
+    finally:
+        ctrl_task.cancel()
+        poll_task.cancel()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
