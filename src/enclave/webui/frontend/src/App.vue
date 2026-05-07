@@ -45,6 +45,11 @@
             <span class="icon">🧠</span> Memories
           </router-link>
         </li>
+        <li>
+          <router-link to="/artifacts" active-class="active" @click="sidebarOpen = false">
+            <span class="icon">📎</span> Artifacts
+          </router-link>
+        </li>
       </ul>
     </nav>
     <main class="content">

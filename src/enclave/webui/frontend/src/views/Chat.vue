@@ -602,8 +602,15 @@ function formatTime(ts) {
 }
 
 .chat-header h2 { margin: 0; }
-.chat-header select { max-width: 300px; }
-.model-select { font-size: 0.8rem; max-width: 220px; }
+.model-select {
+  font-size: 0.8rem;
+  max-width: 280px;
+  padding: 0.4rem 0.5rem;
+  background: var(--bg-main);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+}
 
 .messages {
   flex: 1;

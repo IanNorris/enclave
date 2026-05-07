@@ -33,6 +33,11 @@ const routes = [
     name: 'chat',
     component: () => import('./views/Chat.vue'),
   },
+  {
+    path: '/artifacts',
+    name: 'artifacts',
+    component: () => import('./views/Artifacts.vue'),
+  },
 ]
 
 const router = createRouter({
