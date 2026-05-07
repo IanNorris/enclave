@@ -535,15 +535,42 @@ async def register_artifact(request: Request, session_id: str, body: ArtifactReg
         raise HTTPException(status_code=404, detail=f"File not found in artifacts/: {body.filename}")
 
     entries = _read_manifest(request, session_id)
-    # Check for duplicate
-    existing = [e for e in entries if e["filename"] == body.filename]
+    now = datetime.now(timezone.utc).isoformat()
+
+    existing = next((e for e in entries if e["filename"] == body.filename), None)
     if existing:
-        # Update existing
-        existing[0].update({
+        # Version the old content before updating
+        version = existing.get("version", 1)
+        stem = Path(body.filename).stem
+        ext = Path(body.filename).suffix
+        versioned_name = f"{stem}.v{version}{ext}"
+        versioned_path = art_dir / versioned_name
+        if not versioned_path.exists():
+            # Only version if we haven't already (agent tool may have done it)
+            shutil.copy2(str(target), str(versioned_path))
+
+        versions = existing.get("versions", [])
+        if not versions:
+            versions.append({
+                "version": 1,
+                "created": existing.get("created", now),
+                "size": existing.get("size", 0),
+            })
+        # Add current version to history
+        versions.append({
+            "version": version,
+            "created": existing.get("updated", now),
+            "size": existing.get("size", 0),
+        })
+
+        existing.update({
             "title": body.title,
             "description": body.description,
             "content_type": body.content_type,
-            "updated": datetime.now(timezone.utc).isoformat(),
+            "version": version + 1,
+            "versions": versions,
+            "updated": now,
+            "size": target.stat().st_size,
         })
     else:
         entries.append({
@@ -552,11 +579,79 @@ async def register_artifact(request: Request, session_id: str, body: ArtifactReg
             "filename": body.filename,
             "content_type": body.content_type,
             "size": target.stat().st_size,
-            "created": datetime.now(timezone.utc).isoformat(),
-            "updated": datetime.now(timezone.utc).isoformat(),
+            "version": 1,
+            "versions": [],
+            "created": now,
+            "updated": now,
         })
     _write_manifest(request, session_id, entries)
     return {"registered": True, "filename": body.filename}
+
+
+@router.get("/{session_id}/artifacts/{filename:path}/versions")
+async def get_artifact_versions(request: Request, session_id: str, filename: str):
+    """List version history for an artifact."""
+    entries = _read_manifest(request, session_id)
+    entry = next((e for e in entries if e["filename"] == filename), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    versions = entry.get("versions", [])
+    current_version = entry.get("version", 1)
+    return {
+        "filename": filename,
+        "current_version": current_version,
+        "versions": versions,
+    }
+
+
+@router.get("/{session_id}/artifacts/{filename:path}/diff")
+async def get_artifact_diff(request: Request, session_id: str, filename: str, v1: int = 1, v2: int = 0):
+    """Get a unified diff between two versions of an artifact.
+
+    v2=0 means the current (latest) version.
+    """
+    import difflib
+
+    art_dir = _artifacts_dir(request, session_id)
+    entries = _read_manifest(request, session_id)
+    entry = next((e for e in entries if e["filename"] == filename), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    current_version = entry.get("version", 1)
+    stem = Path(filename).stem
+    ext = Path(filename).suffix
+
+    # Resolve file paths for each version
+    def _version_path(v: int) -> Path:
+        if v == current_version or v == 0:
+            return art_dir / filename
+        return art_dir / f"{stem}.v{v}{ext}"
+
+    path1 = _version_path(v1)
+    path2 = _version_path(v2 if v2 else current_version)
+
+    if not path1.exists():
+        raise HTTPException(status_code=404, detail=f"Version {v1} not found")
+    if not path2.exists():
+        raise HTTPException(status_code=404, detail=f"Version {v2 or current_version} not found")
+
+    try:
+        text1 = path1.read_text(encoding="utf-8").splitlines(keepends=True)
+        text2 = path2.read_text(encoding="utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Cannot diff binary files")
+
+    label1 = f"{filename} (v{v1})"
+    label2 = f"{filename} (v{v2 or current_version})"
+    diff = list(difflib.unified_diff(text1, text2, fromfile=label1, tofile=label2))
+    return {
+        "v1": v1,
+        "v2": v2 or current_version,
+        "diff": "".join(diff),
+        "has_changes": len(diff) > 0,
+    }
 
 
 @router.get("/{session_id}/artifacts/{filename:path}")

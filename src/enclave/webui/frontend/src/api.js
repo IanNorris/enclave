@@ -84,5 +84,7 @@ export const api = {
   // Artifacts
   getArtifacts: (id) => request(`/sessions/${id}/artifacts`),
   getArtifactContent: (id, filename) => request(`/sessions/${id}/artifacts/${filename}`),
+  getArtifactDiff: (id, filename, v1, v2) => request(`/sessions/${id}/artifacts/${filename}/diff?v1=${v1}&v2=${v2}`),
+  getArtifactVersions: (id, filename) => request(`/sessions/${id}/artifacts/${filename}/versions`),
   artifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}`,
 }

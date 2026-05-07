@@ -3556,6 +3556,150 @@ async def try_init_copilot(
         )
         custom_tools.append(bug_get_tool)
 
+        # Custom tool: publish_artifact — create/update a versioned artifact document
+        async def _publish_artifact_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            title = args.get("title", "").strip()
+            filename = args.get("filename", "").strip()
+            content = args.get("content", "")
+            description = args.get("description", "")
+
+            if not title or not filename or not content:
+                return ToolResult(
+                    text_result_for_llm="Error: 'title', 'filename', and 'content' are required",
+                    result_type="error",
+                )
+
+            # Security: prevent path traversal
+            if "/" in filename or "\\" in filename or filename.startswith("."):
+                return ToolResult(
+                    text_result_for_llm="Error: filename must be a simple name (no paths, no leading dot)",
+                    result_type="error",
+                )
+
+            import json as _json
+            art_dir = Path(working_directory) / "artifacts"
+            art_dir.mkdir(parents=True, exist_ok=True)
+            target = art_dir / filename
+            manifest_path = Path(working_directory) / ".enclave-artifacts.json"
+
+            # Load manifest
+            entries: list[dict] = []
+            if manifest_path.exists():
+                try:
+                    entries = _json.loads(manifest_path.read_text())
+                except Exception:
+                    entries = []
+
+            from datetime import datetime as _dt, timezone as _tz
+            now = _dt.now(_tz.utc).isoformat()
+
+            # Check if this is an update (file already exists)
+            existing = next((e for e in entries if e["filename"] == filename), None)
+            if existing and target.exists():
+                # Version the old file
+                version = existing.get("version", 1)
+                stem = target.stem
+                ext = target.suffix
+                versioned_name = f"{stem}.v{version}{ext}"
+                versioned_path = art_dir / versioned_name
+                # Rename current to versioned
+                import shutil
+                shutil.copy2(str(target), str(versioned_path))
+                # Record version in history
+                versions = existing.get("versions", [])
+                if not versions:
+                    # Retroactively create v1 entry
+                    versions.append({
+                        "version": 1,
+                        "created": existing.get("created", now),
+                        "size": existing.get("size", 0),
+                    })
+                versions.append({
+                    "version": version,
+                    "created": existing.get("updated", now),
+                    "size": existing.get("size", 0),
+                })
+                # Update entry
+                existing["version"] = version + 1
+                existing["versions"] = versions
+                existing["title"] = title
+                existing["description"] = description
+                existing["updated"] = now
+                existing["size"] = len(content.encode("utf-8"))
+            elif existing:
+                # Entry exists but file doesn't (shouldn't happen, but handle gracefully)
+                existing["title"] = title
+                existing["description"] = description
+                existing["version"] = existing.get("version", 1)
+                existing["updated"] = now
+                existing["size"] = len(content.encode("utf-8"))
+            else:
+                # New artifact
+                entries.append({
+                    "title": title,
+                    "description": description,
+                    "filename": filename,
+                    "content_type": "text/markdown" if filename.endswith(".md") else "text/plain",
+                    "size": len(content.encode("utf-8")),
+                    "version": 1,
+                    "versions": [],
+                    "created": now,
+                    "updated": now,
+                })
+
+            # Write the file
+            target.write_text(content, encoding="utf-8")
+
+            # Write manifest
+            manifest_path.write_text(_json.dumps(entries, indent=2))
+
+            version_num = next((e["version"] for e in entries if e["filename"] == filename), 1)
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Artifact published: {title} (v{version_num})\n"
+                    f"File: artifacts/{filename}\n"
+                    f"Link for user: [📎 {title}](/artifacts) — visible in the Artifacts panel"
+                ),
+            )
+
+        publish_artifact_tool = Tool(
+            name="publish_artifact",
+            description=(
+                "Create or update a versioned artifact document (report, investigation, "
+                "analysis, design doc). The artifact is shown in the web UI's Artifacts "
+                "panel. Use this when the user asks for a report, investigation, document, "
+                "summary, or any long-form content they'll want to reference later. "
+                "Previous versions are preserved automatically for diff comparison. "
+                "Do NOT use for code files (those go through git)."
+            ),
+            handler=_publish_artifact_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Human-readable title for the artifact",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Simple filename (e.g. 'investigation.md'). No paths. Prefer .md extension.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full content of the artifact (markdown recommended)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Brief one-line description of the artifact",
+                    },
+                },
+                "required": ["title", "filename", "content"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(publish_artifact_tool)
+
         # Custom tool: consult_panel — get second opinions from expert sub-agents
         # Each panelist plays a distinct archetype to surface orthogonal concerns.
         async def _consult_panel_handler(invocation: object) -> ToolResult:

@@ -135,3 +135,17 @@ Severity: critical (data loss/security), high (feature broken),
 medium (workaround exists), low (cosmetic).
 
 Include observed vs expected, error messages, file paths, commit context.
+
+## Artifacts
+
+Use `publish_artifact` when the user asks for a report, investigation,
+document, analysis, summary, or any long-form reference content.
+
+- Artifacts appear in the web UI's **Artifacts** panel for easy access.
+- Previous versions are preserved — the user can view diffs between versions.
+- Use markdown (`.md`) for best rendering.
+- Include a link in your chat response: "📎 See [Title](/artifacts)"
+- **NOT** for code files — those go through git.
+
+Good candidates: investigation reports, architecture docs, meeting notes,
+research summaries, troubleshooting guides, analysis results.

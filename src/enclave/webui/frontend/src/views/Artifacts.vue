@@ -24,26 +24,53 @@
               <span class="artifact-desc" v-if="art.description">{{ art.description }}</span>
             </div>
             <div class="artifact-meta">
+              <span v-if="art.version > 1" class="version-badge">v{{ art.version }}</span>
               <span class="file-size">{{ formatSize(art.size) }}</span>
-              <span class="artifact-date">{{ new Date(art.created).toLocaleDateString() }}</span>
+              <span class="artifact-date">{{ new Date(art.updated || art.created).toLocaleDateString() }}</span>
             </div>
           </div>
         </div>
       </div>
-      <div class="card file-content" v-if="selectedArtifact && artifactContent !== null">
+
+      <!-- Content panel -->
+      <div class="card file-content" v-if="selectedArtifact && (artifactContent !== null || diffContent !== null)">
         <div class="artifact-header-bar">
           <h3>{{ selectedArtifact.title || selectedArtifact.filename }}</h3>
-          <a :href="api.artifactUrl(selectedSession, selectedArtifact.filename)" target="_blank" class="secondary open-link">Open ↗</a>
+          <div class="header-actions">
+            <button v-if="selectedArtifact.version > 1 && !showingDiff" class="btn-sm" @click="showVersionHistory">⏱ History</button>
+            <button v-if="showingDiff" class="btn-sm" @click="closeDiff">✕ Close diff</button>
+            <a :href="api.artifactUrl(selectedSession, selectedArtifact.filename)" target="_blank" class="secondary open-link">Open ↗</a>
+          </div>
         </div>
-        <div v-if="selectedArtifact.filename.endsWith('.md')" class="artifact-rendered" v-html="renderMarkdown(artifactContent)"></div>
-        <pre v-else>{{ artifactContent }}</pre>
+
+        <!-- Diff view -->
+        <div v-if="showingDiff && diffContent !== null" class="diff-panel">
+          <div class="diff-controls">
+            <label>Compare: </label>
+            <select v-model="diffV1" @change="loadDiff">
+              <option v-for="v in versionOptions" :key="v" :value="v">v{{ v }}</option>
+            </select>
+            <span>→</span>
+            <select v-model="diffV2" @change="loadDiff">
+              <option v-for="v in versionOptions" :key="v" :value="v">v{{ v }}</option>
+            </select>
+          </div>
+          <pre v-if="diffContent" class="diff-output">{{ diffContent }}</pre>
+          <p v-else class="muted">No changes between these versions.</p>
+        </div>
+
+        <!-- Normal content view -->
+        <template v-else>
+          <div v-if="selectedArtifact.filename.endsWith('.md')" class="artifact-rendered" v-html="renderMarkdown(artifactContent)"></div>
+          <pre v-else>{{ artifactContent }}</pre>
+        </template>
       </div>
       <div class="card file-content" v-else-if="artifactLoading">
         <p class="muted">Loading…</p>
       </div>
     </div>
 
-    <p v-else class="muted">No artifacts yet. Agents can register files in the <code>artifacts/</code> folder.</p>
+    <p v-else class="muted">No artifacts yet. Agents can publish artifacts using the <code>publish_artifact</code> tool.</p>
   </div>
 </template>
 
@@ -62,6 +89,13 @@ const selectedArtifact = ref(null)
 const artifactContent = ref(null)
 const artifactLoading = ref(false)
 
+// Versioning state
+const showingDiff = ref(false)
+const diffContent = ref(null)
+const diffV1 = ref(1)
+const diffV2 = ref(2)
+const versionOptions = ref([])
+
 onMounted(() => {
   if (selectedSession.value) loadArtifacts()
 })
@@ -69,6 +103,7 @@ onMounted(() => {
 watch(selectedSession, (v) => {
   selectedArtifact.value = null
   artifactContent.value = null
+  closeDiff()
   if (v) loadArtifacts()
   else artifacts.value = []
 })
@@ -82,6 +117,7 @@ async function loadArtifacts() {
 async function viewArtifact(art) {
   selectedArtifact.value = art
   artifactContent.value = null
+  closeDiff()
   artifactLoading.value = true
   try {
     if (art.filename.match(/\.(md|txt|json|yaml|yml|csv|log)$/i)) {
@@ -98,11 +134,46 @@ async function viewArtifact(art) {
   }
 }
 
+async function showVersionHistory() {
+  const art = selectedArtifact.value
+  if (!art) return
+  const currentVersion = art.version || 1
+  // Build version options: 1 .. currentVersion
+  const opts = []
+  for (let i = 1; i <= currentVersion; i++) opts.push(i)
+  versionOptions.value = opts
+  diffV1.value = currentVersion - 1
+  diffV2.value = currentVersion
+  showingDiff.value = true
+  await loadDiff()
+}
+
+async function loadDiff() {
+  if (!selectedArtifact.value) return
+  try {
+    const data = await api.getArtifactDiff(
+      selectedSession.value,
+      selectedArtifact.value.filename,
+      diffV1.value,
+      diffV2.value
+    )
+    diffContent.value = data.diff || ''
+  } catch (e) {
+    diffContent.value = `Error loading diff: ${e.message}`
+  }
+}
+
+function closeDiff() {
+  showingDiff.value = false
+  diffContent.value = null
+}
+
 function renderMarkdown(text) {
   return md.render(text || '')
 }
 
 function formatSize(bytes) {
+  if (!bytes) return '0 B'
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
@@ -190,6 +261,15 @@ function formatSize(bytes) {
   gap: 0.1rem;
 }
 
+.version-badge {
+  font-size: 0.65rem;
+  background: var(--accent);
+  color: var(--bg-main);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-weight: 600;
+}
+
 .artifact-date {
   font-size: 0.65rem;
   color: var(--text-muted);
@@ -206,10 +286,63 @@ function formatSize(bytes) {
   font-size: 0.9rem;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.btn-sm {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  color: var(--text);
+  cursor: pointer;
+}
+.btn-sm:hover { background: var(--bg-hover); }
+
 .open-link {
   font-size: 0.8rem;
   padding: 0.25rem 0.5rem;
   text-decoration: none;
+}
+
+.diff-panel {
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.diff-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.8rem;
+}
+.diff-controls select {
+  padding: 0.2rem 0.4rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  color: var(--text);
+}
+
+.diff-output {
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 500px;
+  overflow-y: auto;
+  margin: 0;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem;
+  line-height: 1.4;
 }
 
 .file-content h3 {
