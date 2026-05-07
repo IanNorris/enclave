@@ -207,6 +207,9 @@ async def get_bug(request: Request, session_id: str, bug_id: str):
 async def create_bug(request: Request, session_id: str, project_path: str, body: BugCreate):
     """Create a new bug in a project."""
     ws_base = _workspace_base(request)
+    # '_root' is a sentinel for the workspace root (avoids URL path issues with '.')
+    if project_path == "_root":
+        project_path = "."
     project_dir = ws_base / session_id / project_path
     if not project_dir.exists():
         raise HTTPException(status_code=404, detail="Project directory not found")

@@ -134,9 +134,9 @@ async function loadBugs() {
 }
 
 function defaultProject() {
-  // Use the project from the first existing bug, or '.' for workspace root
+  // Use the project from the first existing bug, or '_root' as fallback
   const first = bugs.value.find(b => b.project)
-  return first?.project || '.'
+  return first?.project || '_root'
 }
 
 function openCreate() {
