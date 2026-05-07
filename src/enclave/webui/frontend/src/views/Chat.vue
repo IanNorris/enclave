@@ -2,9 +2,14 @@
   <div class="chat-view" @dragover.prevent="onDragOver" @dragleave="onDragLeave" @drop.prevent="onDrop">
     <div class="chat-header">
       <h2>Chat</h2>
-      <select v-if="models.available.length && selectedSession" v-model="currentModel" @change="changeModel" class="model-select">
-        <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
-      </select>
+      <div class="model-picker" v-if="selectedSession">
+        <select v-if="models.available.length" v-model="currentModel" @change="changeModel" class="model-select">
+          <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <button class="model-refresh" @click="refreshModels" :disabled="modelsRefreshing" title="Refresh model list">
+          {{ modelsRefreshing ? '⟳' : '↻' }}
+        </button>
+      </div>
     </div>
 
     <div class="chat-container" v-if="selectedSession">
@@ -176,6 +181,7 @@ const pendingFiles = ref([])
 const dragging = ref(false)
 const models = ref({ current: null, available: [], preferences: [] })
 const currentModel = ref('')
+const modelsRefreshing = ref(false)
 
 // Live streaming state
 const liveEvents = ref([])
@@ -261,6 +267,20 @@ async function loadModels() {
     currentModel.value = data.current || ''
   } catch (e) {
     console.error('Failed to load models:', e)
+  }
+}
+
+async function refreshModels() {
+  if (!selectedSession.value) return
+  modelsRefreshing.value = true
+  try {
+    const data = await api.getModels(selectedSession.value, true)
+    models.value = data
+    currentModel.value = data.current || currentModel.value || ''
+  } catch (e) {
+    console.error('Failed to refresh models:', e)
+  } finally {
+    modelsRefreshing.value = false
   }
 }
 
@@ -603,8 +623,14 @@ function formatTime(ts) {
 
 .chat-header h2 { margin: 0; }
 
-.model-select {
+.model-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
   margin-left: auto;
+}
+
+.model-select {
   width: auto;
   max-width: 260px;
   font-size: 0.8rem;
@@ -614,6 +640,19 @@ function formatTime(ts) {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm, 4px);
 }
+
+.model-refresh {
+  font-size: 1rem;
+  padding: 0.25rem 0.4rem;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm, 4px);
+  cursor: pointer;
+  line-height: 1;
+}
+.model-refresh:hover { color: var(--text-primary); background: var(--bg-hover); }
+.model-refresh:disabled { opacity: 0.5; cursor: wait; }
 
 .messages {
   flex: 1;

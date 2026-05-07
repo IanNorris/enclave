@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -164,6 +165,8 @@ class ControlServer:
                 await self._handle_start(req, writer)
             elif action == "delete":
                 await self._handle_delete(req, writer)
+            elif action == "models":
+                await self._handle_models(req, writer)
             else:
                 await self._write(writer, {"ok": False, "error": f"Unknown action: {action}"})
         except asyncio.TimeoutError:
@@ -254,6 +257,80 @@ class ControlServer:
             await self._write(writer, {"ok": True, "type": "deleted"})
         else:
             await self._write(writer, {"ok": False, "error": "Failed to delete session"})
+
+    async def _handle_models(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Query available models live from the agent's Copilot SDK."""
+        session_id = req.get("session", "")
+        if not session_id:
+            await self._write(writer, {"ok": False, "error": "Missing session"})
+            return
+
+        session = self._router.containers.get_session(session_id)
+        if not session:
+            await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
+            return
+
+        script = (
+            "import asyncio, json\n"
+            "from copilot import CopilotClient\n"
+            "async def main():\n"
+            "    c = CopilotClient()\n"
+            "    await c.start()\n"
+            "    try:\n"
+            "        ms = await c.list_models()\n"
+            "        print(json.dumps(sorted([m.id for m in ms])))\n"
+            "    except Exception:\n"
+            "        raw = await c.rpc('models.list', {})\n"
+            "        print(json.dumps(sorted([m.get('id') for m in raw.get('models',[]) if m.get('id')])))\n"
+            "    await c.stop()\n"
+            "asyncio.run(main())\n"
+        )
+
+        try:
+            runtime = self._router.sessions.config.runtime
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [runtime, "exec", session_id, "python3", "-c", script],
+                    capture_output=True, text=True, timeout=20,
+                ),
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                available = json.loads(result.stdout.strip())
+                # Read current model from workspace file if it exists
+                ws_base = Path(self._router.sessions.config.workspace_base) / session_id
+                models_path = ws_base / ".enclave-models.json"
+                current = None
+                if models_path.exists():
+                    try:
+                        current = json.loads(models_path.read_text()).get("current")
+                    except Exception:
+                        pass
+
+                # Update the file with fresh data
+                models_data = {
+                    "current": current,
+                    "available": available,
+                    "preferences": [],
+                }
+                try:
+                    models_path.write_text(json.dumps(models_data, indent=2))
+                except Exception:
+                    pass
+
+                await self._write(writer, {
+                    "ok": True,
+                    "type": "models",
+                    "current": current,
+                    "available": available,
+                })
+                return
+
+            log.warning("Models query failed for %s: %s", session_id, result.stderr[:200])
+            await self._write(writer, {"ok": False, "error": "Failed to query models from agent"})
+        except Exception as e:
+            log.warning("Models query error for %s: %s", session_id, e)
+            await self._write(writer, {"ok": False, "error": str(e)})
 
     async def _handle_subscribe(
         self,

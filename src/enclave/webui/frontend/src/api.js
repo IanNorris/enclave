@@ -75,7 +75,7 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ content }),
   }),
-  getModels: (session) => request(`/chat/${session}/models`),
+  getModels: (session, refresh = false) => request(`/chat/${session}/models${refresh ? '?refresh=true' : ''}`),
   setModel: (session, model) => request(`/chat/${session}/model`, {
     method: 'POST',
     body: JSON.stringify({ content: model }),

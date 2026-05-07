@@ -287,10 +287,42 @@ async def send_message(request: Request, session_id: str, body: SendMessage):
 
 
 @router.get("/{session_id}/models")
-async def get_models(request: Request, session_id: str):
-    """Get available models for a session (from agent's .enclave-models.json)."""
+async def get_models(request: Request, session_id: str, refresh: bool = False):
+    """Get available models for a session.
+
+    Reads from the cached .enclave-models.json file by default.
+    Pass ?refresh=true to query live from the agent's Copilot SDK
+    (updates the cache file as a side effect).
+    """
     ws_base = Path(request.app.state.config.container.workspace_base) / session_id
     models_path = ws_base / ".enclave-models.json"
+
+    if refresh:
+        # Query live via control socket
+        data_dir = Path(request.app.state.config.data_dir)
+        sock_path = data_dir / "control.sock"
+        if sock_path.exists():
+            try:
+                reader, writer = await asyncio.open_unix_connection(str(sock_path))
+                req = json.dumps({"action": "models", "session": session_id})
+                writer.write(req.encode() + b"\n")
+                await writer.drain()
+                line = await asyncio.wait_for(reader.readline(), timeout=25.0)
+                writer.close()
+                await writer.wait_closed()
+                if line:
+                    resp = json.loads(line.decode())
+                    if resp.get("ok"):
+                        return {
+                            "current": resp.get("current"),
+                            "available": resp.get("available", []),
+                            "preferences": [],
+                        }
+            except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                import logging
+                logging.getLogger("enclave.webui").warning("Models refresh failed: %s", e)
+
+    # Fall back to cached file
     if not models_path.exists():
         return {"current": None, "available": [], "preferences": []}
     try:
