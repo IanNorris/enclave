@@ -327,6 +327,11 @@ function handleStreamEvent(msg) {
         const qIdx = turns.value.findIndex(t => t.source === 'queued' && t.user_message === msg.user_message)
         if (qIdx >= 0) turns.value.splice(qIdx, 1)
       }
+      // Remove any live-cache entry that matches this turn's assistant_response
+      if (msg.assistant_response) {
+        const lIdx = turns.value.findIndex(t => t.source === 'live' && t.assistant_response === msg.assistant_response)
+        if (lIdx >= 0) turns.value.splice(lIdx, 1)
+      }
       turns.value.push(msg)
     }
     // Only clear live state if this turn has an assistant response
