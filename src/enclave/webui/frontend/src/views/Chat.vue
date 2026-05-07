@@ -605,6 +605,8 @@ function formatTime(ts) {
 
 .model-select {
   margin-left: auto;
+  width: auto;
+  max-width: 260px;
   font-size: 0.8rem;
   padding: 0.4rem 0.5rem;
   background: var(--bg-main);
