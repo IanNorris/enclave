@@ -91,6 +91,12 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
         tags=["chat"],
         dependencies=[Depends(get_current_user)],
     )
+    # WebSocket routes handle auth via query param (OAuth2 deps don't work with WS)
+    app.include_router(
+        chat.ws_router,
+        prefix="/api/chat",
+        tags=["chat"],
+    )
 
     # Health check (unprotected)
     @app.get("/api/health")

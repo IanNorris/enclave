@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile, File, WebSock
 from pydantic import BaseModel
 
 router = APIRouter()
+ws_router = APIRouter()  # Separate router for WebSocket (no OAuth2 dependency)
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -304,14 +305,24 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
     return {"sent": True, "event_id": event_id, "filename": filename}
 
 
-@router.websocket("/{session_id}/stream")
-async def stream_conversation(websocket: WebSocket, session_id: str):
+@ws_router.websocket("/{session_id}/stream")
+async def stream_conversation(websocket: WebSocket, session_id: str, token: str = ""):
     """WebSocket: stream live agent events and completed turns.
 
     Connects to the orchestrator's control socket to receive real-time
     events (deltas, thinking, tool calls), and falls back to SQLite
     polling for completed turns.
+
+    Auth is via ?token= query param (OAuth2 bearer deps don't work with WS).
     """
+    # Validate token manually — OAuth2PasswordBearer doesn't handle WebSocket
+    from enclave.webui.auth import validate_token
+    try:
+        validate_token(token)
+    except Exception:
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+
     await websocket.accept()
 
     config = websocket.app.state.config

@@ -85,6 +85,15 @@ def create_token(username: str) -> str:
 
 async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> dict:
     """FastAPI dependency: validate JWT and return user info."""
+    return validate_token(token)
+
+
+def validate_token(token: str) -> dict:
+    """Validate a JWT token string and return user info.
+
+    Raises HTTPException if token is invalid.  Used directly for WebSocket
+    auth where OAuth2PasswordBearer is not available.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired token",

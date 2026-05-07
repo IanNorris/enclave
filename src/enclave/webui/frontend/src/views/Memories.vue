@@ -26,6 +26,7 @@
     <div class="tabs">
       <button :class="{ active: tab === 'records' }" @click="tab = 'records'">Records</button>
       <button :class="{ active: tab === 'symbols' }" @click="tab = 'symbols'; loadSymbols()">Symbols</button>
+      <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'; initGraph()">Graph</button>
     </div>
 
     <!-- Records tab -->
@@ -97,6 +98,17 @@
       <p v-else-if="!symbolsLoading" class="muted">No symbols found.</p>
     </div>
 
+    <!-- Graph tab -->
+    <div v-if="tab === 'graph'" class="graph-container">
+      <div class="graph-controls">
+        <label><input type="checkbox" v-model="graphShowLabels" @change="updateGraphLabels"> Labels</label>
+        <label>Min connections: <input type="number" v-model.number="graphMinRefs" min="0" max="20" style="width:50px" @change="rebuildGraph"></label>
+        <button class="secondary" @click="resetGraphZoom">Reset zoom</button>
+      </div>
+      <div ref="graphEl" class="graph-svg-wrap"></div>
+      <p v-if="!records.length && !loading" class="muted">No memories to visualize.</p>
+    </div>
+
     <!-- Detail panel -->
     <div v-if="selected" class="modal-overlay" @click.self="selected = null">
       <div class="modal card detail-panel">
@@ -144,8 +156,9 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { api } from '../api.js'
+import * as d3 from 'd3'
 
 const stats = ref(null)
 const records = ref([])
@@ -158,6 +171,13 @@ const loading = ref(true)
 const symbolsLoading = ref(false)
 const tab = ref('records')
 const selected = ref(null)
+
+// Graph state
+const graphEl = ref(null)
+const graphShowLabels = ref(true)
+const graphMinRefs = ref(1)
+let simulation = null
+let svgSelection = null
 
 const availableSources = computed(() => {
   const list = Array.isArray(records.value) ? records.value : []
@@ -226,6 +246,204 @@ onMounted(async () => {
     loading.value = false
   }
 })
+
+onUnmounted(() => {
+  if (simulation) simulation.stop()
+})
+
+// ─── Graph ────────────────────────────────────────────
+
+function buildGraphData() {
+  const nodeMap = new Map()
+  const links = []
+  const list = Array.isArray(records.value) ? records.value : []
+
+  function ensureNode(name, kind) {
+    if (!name) return null
+    if (!nodeMap.has(name)) {
+      nodeMap.set(name, { id: name, kind, refCount: 0 })
+    }
+    const n = nodeMap.get(name)
+    n.refCount++
+    return n
+  }
+
+  for (const r of list) {
+    if (r.type === 'semantic') {
+      const s = ensureNode(r.subject, 'subject')
+      const o = ensureNode(r.object, 'object')
+      if (s && o && s.id !== o.id) {
+        links.push({ source: s.id, target: o.id, label: r.predicate || '' })
+      }
+    } else if (r.type === 'procedural') {
+      const s = ensureNode(r.rule, 'rule')
+      const o = ensureNode(r.action, 'action')
+      if (s && o && s.id !== o.id) {
+        links.push({ source: s.id, target: o.id, label: r.condition || '' })
+      }
+    }
+  }
+
+  // Filter by min refs
+  const minR = graphMinRefs.value || 0
+  const validIds = new Set()
+  for (const [id, node] of nodeMap) {
+    if (node.refCount >= minR) validIds.add(id)
+  }
+
+  const nodes = [...nodeMap.values()].filter(n => validIds.has(n.id))
+  const filteredLinks = links.filter(l => validIds.has(l.source) && validIds.has(l.target))
+
+  return { nodes, links: filteredLinks }
+}
+
+const KIND_COLORS = {
+  subject: '#6ca8e8',
+  object: '#a86ce8',
+  rule: '#e8a86c',
+  action: '#6ce8a8',
+}
+
+async function initGraph() {
+  await nextTick()
+  rebuildGraph()
+}
+
+function rebuildGraph() {
+  if (!graphEl.value) return
+  if (simulation) { simulation.stop(); simulation = null }
+
+  const container = graphEl.value
+  container.innerHTML = ''
+
+  const { nodes, links } = buildGraphData()
+  if (!nodes.length) return
+
+  const width = container.clientWidth || 800
+  const height = Math.max(400, container.clientHeight || 500)
+
+  const svg = d3.select(container).append('svg')
+    .attr('width', width)
+    .attr('height', height)
+    .attr('viewBox', [0, 0, width, height])
+
+  svgSelection = svg
+
+  const g = svg.append('g')
+
+  // Zoom
+  const zoom = d3.zoom()
+    .scaleExtent([0.1, 5])
+    .on('zoom', (event) => g.attr('transform', event.transform))
+  svg.call(zoom)
+  svg.__zoomBehavior = zoom
+
+  // Arrow marker
+  svg.append('defs').append('marker')
+    .attr('id', 'arrow')
+    .attr('viewBox', '0 -5 10 10')
+    .attr('refX', 20)
+    .attr('refY', 0)
+    .attr('markerWidth', 6)
+    .attr('markerHeight', 6)
+    .attr('orient', 'auto')
+    .append('path')
+    .attr('d', 'M0,-5L10,0L0,5')
+    .attr('fill', '#555')
+
+  simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(100))
+    .force('charge', d3.forceManyBody().strength(-200))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(30))
+
+  const link = g.append('g')
+    .selectAll('line')
+    .data(links)
+    .join('line')
+    .attr('stroke', '#444')
+    .attr('stroke-opacity', 0.6)
+    .attr('marker-end', 'url(#arrow)')
+
+  const node = g.append('g')
+    .selectAll('circle')
+    .data(nodes)
+    .join('circle')
+    .attr('r', d => 4 + Math.min(d.refCount * 2, 16))
+    .attr('fill', d => KIND_COLORS[d.kind] || '#888')
+    .attr('stroke', '#222')
+    .attr('stroke-width', 1)
+    .call(drag(simulation))
+
+  node.append('title').text(d => `${d.id} (${d.kind}, ${d.refCount} refs)`)
+
+  // Click node to select memories containing it
+  node.on('click', (event, d) => {
+    const matching = (records.value || []).filter(r =>
+      r.subject === d.id || r.object === d.id || r.rule === d.id || r.action === d.id
+    )
+    if (matching.length === 1) {
+      selected.value = matching[0]
+    } else if (matching.length > 0) {
+      // Switch to records tab filtered by this node
+      search.value = d.id
+      tab.value = 'records'
+    }
+  })
+
+  const label = g.append('g')
+    .selectAll('text')
+    .data(nodes)
+    .join('text')
+    .text(d => d.id.length > 20 ? d.id.slice(0, 18) + '…' : d.id)
+    .attr('font-size', '10px')
+    .attr('fill', '#ccc')
+    .attr('dx', 12)
+    .attr('dy', 4)
+    .attr('display', graphShowLabels.value ? null : 'none')
+
+  simulation.on('tick', () => {
+    link
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y)
+    node
+      .attr('cx', d => d.x)
+      .attr('cy', d => d.y)
+    label
+      .attr('x', d => d.x)
+      .attr('y', d => d.y)
+  })
+}
+
+function updateGraphLabels() {
+  if (!graphEl.value) return
+  const svg = d3.select(graphEl.value).select('svg')
+  svg.selectAll('text').attr('display', graphShowLabels.value ? null : 'none')
+}
+
+function resetGraphZoom() {
+  if (!graphEl.value) return
+  const svg = d3.select(graphEl.value).select('svg')
+  const zoom = svg.node()?.__zoomBehavior
+  if (zoom) svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity)
+}
+
+function drag(sim) {
+  return d3.drag()
+    .on('start', (event, d) => {
+      if (!event.active) sim.alphaTarget(0.3).restart()
+      d.fx = d.x; d.fy = d.y
+    })
+    .on('drag', (event, d) => {
+      d.fx = event.x; d.fy = event.y
+    })
+    .on('end', (event, d) => {
+      if (!event.active) sim.alphaTarget(0)
+      d.fx = null; d.fy = null
+    })
+}
 </script>
 
 <style scoped>
@@ -414,6 +632,43 @@ onMounted(async () => {
 }
 
 .muted { color: var(--text-muted); }
+
+/* Graph */
+.graph-container {
+  position: relative;
+}
+
+.graph-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.graph-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--text-secondary);
+}
+
+.graph-svg-wrap {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  min-height: 500px;
+  overflow: hidden;
+}
+
+.graph-svg-wrap svg {
+  display: block;
+  cursor: grab;
+}
+
+.graph-svg-wrap svg:active {
+  cursor: grabbing;
+}
 
 @media (max-width: 768px) {
   .stats-bar { grid-template-columns: repeat(2, 1fr); }

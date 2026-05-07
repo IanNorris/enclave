@@ -245,14 +245,20 @@ function handleStreamEvent(msg) {
     } else {
       turns.value.push(msg)
     }
-    // Clear live state since the turn is now persisted
-    clearLiveState()
+    // Only clear live state if this turn has an assistant response
+    // (meaning the agent finished and we have the persisted version)
+    if (msg.assistant_response) {
+      clearLiveState()
+    }
     sending.value = false
     return
   }
 
   if (type === 'turn_start') {
-    clearLiveState()
+    // New turn — reset streaming text but keep accumulated live events
+    streamingText.value = ''
+    activityText.value = ''
+    currentThinkingIdx = -1
     return
   }
 
@@ -325,8 +331,10 @@ function handleStreamEvent(msg) {
   }
 
   if (type === 'response') {
-    // Final response — clear streaming, will be picked up by turn poll
-    streamingText.value = ''
+    // Final response text — keep it visible until the turn poll picks it up
+    if (msg.content) {
+      streamingText.value = msg.content
+    }
     activityText.value = ''
     // Collapse all remaining live events
     liveEvents.value.forEach(e => { e.collapsed = true })
