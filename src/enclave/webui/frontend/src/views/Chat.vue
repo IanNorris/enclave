@@ -22,7 +22,7 @@
       <!-- Messages -->
       <div class="messages" ref="messagesEl">
         <!-- Completed turns from SQLite -->
-        <div v-for="turn in turns" :key="turn.turn_index" class="turn">
+        <div v-for="(turn, idx) in turns" :key="turn.turn_index ?? `m-${idx}`" class="turn">
           <div v-if="turn.user_message" class="message user-message">
             <div class="message-meta">
               <span class="sender">User</span>

@@ -20,6 +20,11 @@ from pydantic import BaseModel
 router = APIRouter()
 ws_router = APIRouter()  # Separate router for WebSocket (no OAuth2 dependency)
 
+# In-memory cache of recent agent responses not yet in session-store.db.
+# Keyed by session_id → list of {role, content, timestamp}.
+# Populated by the WebSocket control socket listener, consumed by history endpoint.
+_response_cache: dict[str, list[dict]] = {}
+
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -227,9 +232,38 @@ class SendMessage(BaseModel):
 
 @router.get("/{session_id}/history")
 async def get_history(request: Request, session_id: str, limit: int = 100, offset: int = 0):
-    """Get conversation history for a session."""
+    """Get conversation history for a session.
+
+    Primary source: session-store.db (SDK turns).
+    Supplement: in-memory response cache for recent agent activity not yet in DB.
+    """
     db_path = _session_store_db(request, session_id)
     turns = _read_turns(db_path, limit=limit, offset=offset)
+
+    # Append cached responses that are newer than the last DB turn
+    if offset == 0 and session_id in _response_cache:
+        last_db_ts = ""
+        if turns:
+            last_db_ts = turns[-1].get("timestamp", "")
+
+        cached = _response_cache.get(session_id, [])
+        for entry in cached:
+            if entry["timestamp"] <= last_db_ts:
+                continue
+            turns.append({
+                "turn_index": None,
+                "user_message": None,
+                "assistant_response": entry["content"],
+                "timestamp": entry["timestamp"],
+                "source": "live",
+            })
+
+        # Prune cache entries that are now in the DB
+        if last_db_ts and cached:
+            _response_cache[session_id] = [
+                e for e in cached if e["timestamp"] > last_db_ts
+            ]
+
     return {"turns": turns, "session_id": session_id}
 
 
@@ -345,37 +379,61 @@ async def stream_conversation(websocket: WebSocket, session_id: str, token: str 
 
     async def _stream_from_control_socket():
         """Subscribe to the control socket and forward events to the WebSocket."""
-        if not sock_path.exists():
-            return
+        while True:
+            if not sock_path.exists():
+                await asyncio.sleep(2.0)
+                continue
 
-        try:
-            reader, writer = await asyncio.open_unix_connection(str(sock_path))
-            req = json.dumps({"action": "subscribe", "session": session_id})
-            writer.write(req.encode() + b"\n")
-            await writer.drain()
-
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                try:
-                    event = json.loads(line.decode())
-                    if event.get("type") == "ping":
-                        continue
-                    if event.get("type") == "subscribed":
-                        continue
-                    await websocket.send_json(event)
-                except (json.JSONDecodeError, Exception):
-                    continue
-
-        except (OSError, ConnectionError):
-            pass
-        finally:
             try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
+                reader, writer = await asyncio.open_unix_connection(str(sock_path))
+                req = json.dumps({"action": "subscribe", "session": session_id})
+                writer.write(req.encode() + b"\n")
+                await writer.drain()
+
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    try:
+                        event = json.loads(line.decode())
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") in ("ping", "subscribed"):
+                        continue
+
+                    # Cache response events for history supplement
+                    if event.get("type") == "response" and event.get("content"):
+                        from datetime import datetime, timezone
+                        ts = datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%S.%f"
+                        )[:-3] + "Z"
+                        cache = _response_cache.setdefault(session_id, [])
+                        cache.append({
+                            "role": "assistant",
+                            "content": event["content"],
+                            "timestamp": ts,
+                        })
+                        # Keep cache bounded
+                        if len(cache) > 200:
+                            _response_cache[session_id] = cache[-100:]
+
+                    try:
+                        await websocket.send_json(event)
+                    except Exception:
+                        # WebSocket dead — exit entirely
+                        return
+
+            except (OSError, ConnectionError):
                 pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+            # Reconnect after a brief delay
+            await asyncio.sleep(1.0)
 
     async def _poll_turns():
         """Poll SQLite for completed turns (fallback for persistence)."""
