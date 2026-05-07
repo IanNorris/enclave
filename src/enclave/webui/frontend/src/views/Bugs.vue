@@ -2,12 +2,8 @@
   <div class="bugs-view">
     <h2>Bug & Task Tracker</h2>
 
-    <!-- Session selector + filters -->
+    <!-- Filters -->
     <div class="filter-bar">
-      <select v-model="selectedSession" @change="loadBugs">
-        <option value="">Select a session…</option>
-        <option v-for="s in sessions" :key="s.id" :value="s.id">{{ s.name }}</option>
-      </select>
       <label class="filter-toggle">
         <input type="checkbox" v-model="showOpenOnly" /> Open only
       </label>
@@ -95,11 +91,13 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { api } from '../api.js'
+import { useSessionStore } from '../stores/session.js'
 
-const sessions = ref([])
-const selectedSession = ref('')
+const { selectedSessionId } = useSessionStore()
+const selectedSession = computed(() => selectedSessionId.value)
+
 const bugs = ref([])
 const loading = ref(false)
 const showOpenOnly = ref(true)
@@ -116,19 +114,26 @@ const filteredBugs = computed(() => {
 })
 
 onMounted(async () => {
-  sessions.value = await api.getSessions()
-  const running = sessions.value.find(s => s.status === 'running')
-  if (running) {
-    selectedSession.value = running.id
-    loadBugs()
-  }
+  if (selectedSession.value) loadBugs()
+})
+
+watch(selectedSession, (newVal) => {
+  if (newVal) loadBugs()
+  else bugs.value = []
 })
 
 async function loadBugs() {
   if (!selectedSession.value) { bugs.value = []; return }
   loading.value = true
   try {
-    bugs.value = await api.getBugs(selectedSession.value)
+    const raw = await api.getBugs(selectedSession.value)
+    // Sort by most recently edited first
+    raw.sort((a, b) => {
+      const aDate = a.updated || a.created || ''
+      const bDate = b.updated || b.created || ''
+      return bDate.localeCompare(aDate)
+    })
+    bugs.value = raw
   } catch { bugs.value = [] }
   finally { loading.value = false }
 }

@@ -2,12 +2,6 @@
   <div class="chat-view" @dragover.prevent="onDragOver" @dragleave="onDragLeave" @drop.prevent="onDrop">
     <div class="chat-header">
       <h2>Chat</h2>
-      <select v-model="selectedSession" @change="loadHistory">
-        <option value="">Select a session…</option>
-        <option v-for="s in sessions" :key="s.id" :value="s.id">
-          {{ s.name }}{{ s.status === 'running' ? ' (active)' : '' }}
-        </option>
-      </select>
       <select v-if="models.available.length" v-model="currentModel" @change="changeModel" class="model-select">
         <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
       </select>
@@ -21,11 +15,19 @@
 
       <!-- Messages -->
       <div class="messages" ref="messagesEl">
+        <!-- Load earlier button -->
+        <div v-if="hasMore" class="load-earlier">
+          <button class="secondary" @click="loadEarlier" :disabled="loadingMore">
+            {{ loadingMore ? 'Loading…' : '↑ Load earlier messages' }}
+          </button>
+        </div>
+
         <!-- Completed turns from SQLite -->
         <div v-for="(turn, idx) in turns" :key="turn.turn_index ?? `m-${idx}`" class="turn">
           <div v-if="turn.user_message" class="message user-message">
             <div class="message-meta">
               <span class="sender">User</span>
+              <span v-if="turn.source === 'queued'" class="queued-badge">queued</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
             </div>
             <div class="message-body" v-html="renderMarkdown(turn.user_message)"></div>
@@ -82,6 +84,31 @@
           {{ activityText }}
         </div>
 
+        <!-- Ask user prompt -->
+        <div v-if="askUserPrompt" class="message assistant-message ask-user-block">
+          <div class="message-meta">
+            <span class="sender">Agent</span>
+            <span class="ask-badge">question</span>
+          </div>
+          <div class="ask-question">{{ askUserPrompt.question }}</div>
+          <div v-if="askUserPrompt.choices.length" class="ask-choices">
+            <button
+              v-for="(choice, i) in askUserPrompt.choices"
+              :key="i"
+              class="secondary ask-choice-btn"
+              @click="answerAskUser(choice)"
+            >{{ choice }}</button>
+          </div>
+          <div class="ask-freeform">
+            <input
+              v-model="askUserAnswer"
+              placeholder="Type your answer…"
+              @keydown.enter.prevent="answerAskUser(askUserAnswer)"
+            />
+            <button class="primary" @click="answerAskUser(askUserAnswer)" :disabled="!askUserAnswer.trim()">Reply</button>
+          </div>
+        </div>
+
         <!-- Sending indicator -->
         <div v-if="sending && !streamingText && !activityText" class="message assistant-message typing">
           <span class="typing-indicator">●●●</span>
@@ -121,8 +148,9 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
 import { api } from '../api.js'
+import { useSessionStore } from '../stores/session.js'
 import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
@@ -134,9 +162,12 @@ const TOOL_ICONS = {
   sql: '🗃️', ask_user: '❓', list_bash: '📋',
 }
 
-const sessions = ref([])
-const selectedSession = ref('')
+const { selectedSessionId } = useSessionStore()
+const selectedSession = computed(() => selectedSessionId.value)
 const turns = ref([])
+const hasMore = ref(false)
+const loadingMore = ref(false)
+const INITIAL_LIMIT = 50
 const draft = ref('')
 const sending = ref(false)
 const messagesEl = ref(null)
@@ -150,16 +181,15 @@ const currentModel = ref('')
 const liveEvents = ref([])
 const streamingText = ref('')
 const activityText = ref('')
+const askUserPrompt = ref(null)
+const askUserAnswer = ref('')
 let currentThinkingIdx = -1
 
 let ws = null
 let dragCounter = 0
 
 onMounted(async () => {
-  sessions.value = await api.getSessions()
-  const running = sessions.value.find(s => s.status === 'running')
-  if (running) {
-    selectedSession.value = running.id
+  if (selectedSession.value) {
     loadHistory()
   }
 })
@@ -169,29 +199,58 @@ onUnmounted(() => {
   pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
 })
 
-watch(selectedSession, () => {
+watch(selectedSession, (newVal) => {
   if (ws) { ws.close(); ws = null }
   clearLiveState()
+  if (newVal) loadHistory()
 })
 
 function clearLiveState() {
   liveEvents.value = []
   streamingText.value = ''
   activityText.value = ''
+  askUserPrompt.value = null
+  askUserAnswer.value = ''
   currentThinkingIdx = -1
 }
 
 async function loadHistory() {
   if (!selectedSession.value) { turns.value = []; return }
   try {
-    const data = await api.getChatHistory(selectedSession.value, 200)
+    const data = await api.getChatHistory(selectedSession.value, INITIAL_LIMIT)
     turns.value = data.turns || []
+    // If we got exactly INITIAL_LIMIT turns, there may be more
+    hasMore.value = turns.value.length >= INITIAL_LIMIT
     await nextTick()
     scrollToBottom()
     connectWebSocket()
     loadModels()
   } catch (e) {
     console.error('Failed to load history:', e)
+  }
+}
+
+async function loadEarlier() {
+  if (loadingMore.value || !selectedSession.value) return
+  loadingMore.value = true
+  try {
+    const data = await api.getChatHistory(selectedSession.value, INITIAL_LIMIT, turns.value.length)
+    const older = data.turns || []
+    if (older.length) {
+      // Prepend older turns, preserve scroll position
+      const el = messagesEl.value
+      const prevHeight = el ? el.scrollHeight : 0
+      turns.value = [...older, ...turns.value]
+      hasMore.value = older.length >= INITIAL_LIMIT
+      await nextTick()
+      if (el) el.scrollTop = el.scrollHeight - prevHeight
+    } else {
+      hasMore.value = false
+    }
+  } catch (e) {
+    console.error('Failed to load earlier messages:', e)
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -243,10 +302,14 @@ function handleStreamEvent(msg) {
     if (idx >= 0) {
       turns.value[idx] = msg
     } else {
+      // Remove any queued message that matches this turn's user_message
+      if (msg.user_message) {
+        const qIdx = turns.value.findIndex(t => t.source === 'queued' && t.user_message === msg.user_message)
+        if (qIdx >= 0) turns.value.splice(qIdx, 1)
+      }
       turns.value.push(msg)
     }
     // Only clear live state if this turn has an assistant response
-    // (meaning the agent finished and we have the persisted version)
     if (msg.assistant_response) {
       clearLiveState()
     }
@@ -330,6 +393,15 @@ function handleStreamEvent(msg) {
     return
   }
 
+  if (type === 'ask_user') {
+    askUserPrompt.value = {
+      question: msg.question || '',
+      choices: msg.choices || [],
+    }
+    askUserAnswer.value = ''
+    return
+  }
+
   if (type === 'response') {
     // Final response text — keep it visible until the turn poll picks it up
     if (msg.content) {
@@ -354,16 +426,28 @@ async function send() {
   draft.value = ''
   sending.value = true
 
+  // Immediately show the message as "queued"
+  if (content) {
+    const ts = new Date().toISOString()
+    turns.value.push({
+      turn_index: null,
+      user_message: content,
+      assistant_response: null,
+      timestamp: ts,
+      source: 'queued',
+    })
+    await nextTick()
+    scrollToBottom()
+  }
+
   try {
     const token = localStorage.getItem('enclave_token')
     const files = [...pendingFiles.value]
 
     if (files.length > 0) {
-      // Upload each file sequentially
       for (let i = 0; i < files.length; i++) {
         const form = new FormData()
         form.append('file', files[i].file)
-        // Send the text message with the last file
         if (i === files.length - 1 && content) {
           form.append('message', content)
         }
@@ -380,7 +464,32 @@ async function send() {
   } catch (e) {
     console.error('Send failed:', e)
     draft.value = content
+    // Remove the queued message on failure
+    const idx = turns.value.findIndex(t => t.source === 'queued' && t.user_message === content)
+    if (idx >= 0) turns.value.splice(idx, 1)
     sending.value = false
+  }
+}
+
+async function answerAskUser(answer) {
+  if (!answer?.trim() || !selectedSession.value) return
+  const text = answer.trim()
+  askUserPrompt.value = null
+  askUserAnswer.value = ''
+  // Show as queued user message
+  turns.value.push({
+    turn_index: null,
+    user_message: text,
+    assistant_response: null,
+    timestamp: new Date().toISOString(),
+    source: 'queued',
+  })
+  await nextTick()
+  scrollToBottom()
+  try {
+    await api.sendChatMessage(selectedSession.value, text)
+  } catch (e) {
+    console.error('Failed to send answer:', e)
   }
 }
 
@@ -461,7 +570,13 @@ function scrollToBottom() {
 
 function renderMarkdown(text) {
   if (!text) return ''
-  const display = text.length > 10000 ? text.slice(0, 10000) + '\n\n…(truncated)' : text
+  // Strip <current_datetime>...</current_datetime> tags injected by the system
+  let cleaned = text.replace(/<current_datetime>[^<]*<\/current_datetime>/g, '')
+  // Trim excessive whitespace left behind
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim()
+  // Convert mxc:// URLs to proxied URLs for images
+  cleaned = cleaned.replace(/mxc:\/\/([^/\s]+)\/([^)\s]+)/g, '/api/chat/media/$1/$2')
+  const display = cleaned.length > 10000 ? cleaned.slice(0, 10000) + '\n\n…(truncated)' : cleaned
   return md.render(display)
 }
 
@@ -681,6 +796,73 @@ function formatTime(ts) {
 }
 
 .muted { color: var(--text-muted); }
+
+.load-earlier {
+  text-align: center;
+  padding: 0.5rem 0;
+}
+
+.load-earlier button {
+  font-size: 0.8rem;
+}
+
+.queued-badge {
+  font-size: 0.65rem;
+  color: #e8a735;
+  background: rgba(232, 167, 53, 0.15);
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.ask-user-block {
+  max-width: 90%;
+}
+
+.ask-badge {
+  font-size: 0.65rem;
+  color: #e8a735;
+  background: rgba(232, 167, 53, 0.15);
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.ask-question {
+  font-size: 0.9rem;
+  margin-bottom: 0.75rem;
+  line-height: 1.5;
+}
+
+.ask-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.ask-choice-btn {
+  font-size: 0.8rem;
+  padding: 0.4rem 0.8rem;
+}
+
+.ask-freeform {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.ask-freeform input {
+  flex: 1;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.ask-freeform button {
+  padding: 0.4rem 0.8rem;
+  font-size: 0.8rem;
+}
 
 /* Live streaming styles */
 .live-turn {

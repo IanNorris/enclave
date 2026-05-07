@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -63,13 +63,15 @@ def _discover_sessions(request: Request) -> list[dict[str, Any]]:
         socket_path = _socket_dir(request) / f"{session_id}.sock"
         is_running = socket_path.exists()
 
-        # Try to get session name from config
+        # Try to get session name and archived status from config
         name = session_id
+        archived = False
         config_file = entry / ".enclave-session.json"
         if config_file.exists():
             try:
                 data = json.loads(config_file.read_text())
                 name = data.get("name", session_id)
+                archived = data.get("archived", False)
             except Exception:
                 pass
 
@@ -77,6 +79,7 @@ def _discover_sessions(request: Request) -> list[dict[str, Any]]:
             "id": session_id,
             "name": name,
             "status": "running" if is_running else "stopped",
+            "archived": archived,
             "workspace": str(entry),
         })
 
@@ -156,6 +159,26 @@ async def restart_session(request: Request, session_id: str):
     )
     await proc.communicate()
     return {"status": "restarting", "session_id": session_id}
+
+
+@router.post("/{session_id}/archive")
+async def archive_session(request: Request, session_id: str):
+    """Toggle the archived status of a session."""
+    ws = _workspace_base(request) / session_id
+    if not ws.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    config_file = ws / ".enclave-session.json"
+    data = {}
+    if config_file.exists():
+        try:
+            data = json.loads(config_file.read_text())
+        except Exception:
+            pass
+
+    data["archived"] = not data.get("archived", False)
+    config_file.write_text(json.dumps(data, indent=2))
+    return {"session_id": session_id, "archived": data["archived"]}
 
 
 # ─── State Inspection ───────────────────────────────────────────────────────
@@ -453,3 +476,113 @@ async def update_prompt(request: Request, session_id: str, body: PromptUpdate):
     prompt_path = ws / PROMPT_FILENAME
     prompt_path.write_text(body.content, encoding="utf-8")
     return {"saved": True, "path": str(prompt_path)}
+
+
+# ─── Artifacts ──────────────────────────────────────────────────────────────
+
+ARTIFACTS_MANIFEST = ".enclave-artifacts.json"
+
+
+def _artifacts_dir(request: Request, session_id: str) -> Path:
+    ws = _workspace_base(request) / session_id / "artifacts"
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
+def _read_manifest(request: Request, session_id: str) -> list[dict]:
+    manifest_path = _workspace_base(request) / session_id / ARTIFACTS_MANIFEST
+    if not manifest_path.exists():
+        return []
+    try:
+        return json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _write_manifest(request: Request, session_id: str, entries: list[dict]) -> None:
+    manifest_path = _workspace_base(request) / session_id / ARTIFACTS_MANIFEST
+    manifest_path.write_text(json.dumps(entries, indent=2))
+
+
+class ArtifactRegister(BaseModel):
+    title: str
+    description: str = ""
+    filename: str
+    content_type: str = "text/markdown"
+
+
+@router.get("/{session_id}/artifacts")
+async def list_artifacts(request: Request, session_id: str):
+    """List all registered artifacts, most recent first."""
+    entries = _read_manifest(request, session_id)
+    entries.sort(key=lambda e: e.get("created", ""), reverse=True)
+    return entries
+
+
+@router.post("/{session_id}/artifacts")
+async def register_artifact(request: Request, session_id: str, body: ArtifactRegister):
+    """Register a new artifact. The file must already exist in the artifacts/ dir."""
+    art_dir = _artifacts_dir(request, session_id)
+    target = art_dir / body.filename
+
+    # Security: prevent traversal
+    try:
+        target.resolve().relative_to(art_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"File not found in artifacts/: {body.filename}")
+
+    entries = _read_manifest(request, session_id)
+    # Check for duplicate
+    existing = [e for e in entries if e["filename"] == body.filename]
+    if existing:
+        # Update existing
+        existing[0].update({
+            "title": body.title,
+            "description": body.description,
+            "content_type": body.content_type,
+            "updated": datetime.now(timezone.utc).isoformat(),
+        })
+    else:
+        entries.append({
+            "title": body.title,
+            "description": body.description,
+            "filename": body.filename,
+            "content_type": body.content_type,
+            "size": target.stat().st_size,
+            "created": datetime.now(timezone.utc).isoformat(),
+            "updated": datetime.now(timezone.utc).isoformat(),
+        })
+    _write_manifest(request, session_id, entries)
+    return {"registered": True, "filename": body.filename}
+
+
+@router.get("/{session_id}/artifacts/{filename:path}")
+async def get_artifact(request: Request, session_id: str, filename: str):
+    """Serve an artifact file."""
+    art_dir = _artifacts_dir(request, session_id)
+    target = art_dir / filename
+
+    try:
+        target.resolve().relative_to(art_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # For text files, return content as JSON
+    if filename.endswith(('.md', '.txt', '.json', '.yaml', '.yml', '.csv', '.log')):
+        try:
+            content = target.read_text(encoding="utf-8")
+            return {"filename": filename, "content": content, "encoding": "utf-8"}
+        except UnicodeDecodeError:
+            pass
+
+    # For images and binary files, serve directly
+    import mimetypes
+    ct = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return FileResponse(target, media_type=ct)
+

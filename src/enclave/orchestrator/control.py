@@ -95,6 +95,14 @@ class ControlServer:
         """Called by the router for activity/status updates."""
         self._emit(session_id, {"ok": True, "type": "activity", "text": text})
 
+    def notify_ask_user(self, session_id: str, question: str, choices: list[str] | None = None) -> None:
+        """Called by the router when the agent asks the user a question."""
+        self._emit(session_id, {
+            "ok": True, "type": "ask_user",
+            "question": question,
+            "choices": choices or [],
+        })
+
     def notify_turn_start(self, session_id: str) -> None:
         """Called by the router when an agent turn begins."""
         self._emit(session_id, {"ok": True, "type": "turn_start"})

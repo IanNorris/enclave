@@ -339,6 +339,25 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
     return {"sent": True, "event_id": event_id, "filename": filename}
 
 
+@router.get("/media/{server_name}/{media_id}")
+async def proxy_matrix_media(request: Request, server_name: str, media_id: str):
+    """Proxy Matrix media (mxc://) so the browser can display images."""
+    config = _matrix_config(request)
+    token = await _get_matrix_token(config)
+
+    # Use the authenticated media download endpoint
+    url = f"{config.homeserver}/_matrix/client/v1/media/download/{server_name}/{media_id}"
+    async with aiohttp.ClientSession() as session:
+        headers = {"Authorization": f"Bearer {token}"}
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                raise HTTPException(status_code=resp.status, detail="Media not found")
+            content = await resp.read()
+            ct = resp.headers.get("Content-Type", "application/octet-stream")
+            from fastapi.responses import Response
+            return Response(content=content, media_type=ct)
+
+
 @ws_router.websocket("/{session_id}/stream")
 async def stream_conversation(websocket: WebSocket, session_id: str, token: str = ""):
     """WebSocket: stream live agent events and completed turns.

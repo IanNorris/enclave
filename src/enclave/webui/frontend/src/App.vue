@@ -13,6 +13,17 @@
       <div class="logo">
         <h1>Enclave</h1>
       </div>
+
+      <!-- Global session selector -->
+      <div class="session-selector">
+        <select v-model="selectedSessionId" class="session-select">
+          <option value="">No session</option>
+          <option v-for="s in activeSessions" :key="s.id" :value="s.id">
+            {{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
+          </option>
+        </select>
+      </div>
+
       <ul class="nav-links">
         <li>
           <router-link to="/sessions" active-class="active" @click="sidebarOpen = false">
@@ -43,9 +54,16 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, computed, onMounted } from 'vue'
+import { useSessionStore } from './stores/session.js'
 
 const sidebarOpen = ref(false)
+const { sessions, selectedSessionId, loadSessions } = useSessionStore()
+const activeSessions = computed(() => sessions.value.filter(s => !s.archived))
+
+onMounted(() => {
+  loadSessions()
+})
 </script>
 
 <style scoped>
@@ -82,6 +100,21 @@ const sidebarOpen = ref(false)
   font-weight: 600;
   color: var(--text-primary);
   margin: 0;
+}
+
+.session-selector {
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-select {
+  width: 100%;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.5rem;
+  background: var(--bg-main);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
 }
 
 .nav-links {

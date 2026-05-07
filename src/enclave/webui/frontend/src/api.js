@@ -33,8 +33,9 @@ export const api = {
   getSession: (id) => request(`/sessions/${id}`),
   stopSession: (id) => request(`/sessions/${id}/stop`, { method: 'POST' }),
   restartSession: (id) => request(`/sessions/${id}/restart`, { method: 'POST' }),
+  archiveSession: (id) => request(`/sessions/${id}/archive`, { method: 'POST' }),
   getState: (id) => request(`/sessions/${id}/state`),
-  getStateFile: (id, path) => request(`/sessions/${id}/state/file?path=${encodeURIComponent(path)}`),
+  getStateFile: (id, path) => request(`/sessions/${id}/state/${path.split('/').map(encodeURIComponent).join('/')}`),
   clearState: (id) => request(`/sessions/${id}/state/clear`, { method: 'POST' }),
   getSnapshots: (id) => request(`/sessions/${id}/snapshots`),
   createSnapshot: (id, name) => request(`/sessions/${id}/snapshots`, {
@@ -79,4 +80,9 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ content: model }),
   }),
+
+  // Artifacts
+  getArtifacts: (id) => request(`/sessions/${id}/artifacts`),
+  getArtifactContent: (id, filename) => request(`/sessions/${id}/artifacts/${filename}`),
+  artifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}`,
 }

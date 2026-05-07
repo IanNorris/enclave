@@ -937,6 +937,11 @@ class MessageRouter:
             question = msg.payload.get("question", "")
             choices = msg.payload.get("choices") or []
             log.info("Agent %s asking user: %s", session.id, question[:80])
+
+            # Notify control socket subscribers (web UI)
+            if self.control:
+                self.control.notify_ask_user(session.id, question, choices)
+
             thread_id = self._thread_events.get(session.id)
             user_mxid = self._get_user_for_session(session)
             if user_mxid:
