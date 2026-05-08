@@ -301,7 +301,9 @@ class MessageRouter:
         self._perm_db.close()
         log.info("Router stopped")
 
-    async def inject_message(self, session_id: str, content: str) -> bool:
+    async def inject_message(
+        self, session_id: str, content: str, attachments: list[dict] | None = None
+    ) -> bool:
         """Inject a user message into a session (from control socket).
 
         Also echoes the message to the agent's Matrix room so users can
@@ -311,6 +313,14 @@ class MessageRouter:
         session = self.containers.get_session(session_id)
         if not session:
             return False
+
+        resolved_attachments = attachments or []
+        # Pre-download attachments if they have URLs but no local_path
+        if resolved_attachments and session.workspace_path:
+            resolved_attachments = await self._predownload_attachments(
+                session, resolved_attachments
+            )
+
         msg = Message(
             type=MessageType.USER_MESSAGE,
             payload={
@@ -318,7 +328,7 @@ class MessageRouter:
                 "sender": "control",
                 "room_id": session.room_id,
                 "thread_id": None,
-                "attachments": [],
+                "attachments": resolved_attachments,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "priority": True,
             },

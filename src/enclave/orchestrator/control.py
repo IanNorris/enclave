@@ -379,8 +379,9 @@ class ControlServer:
         session_id = req.get("session", "")
         content = req.get("content", "")
         sender = req.get("sender", "[Orchestrator]")
+        attachments = req.get("attachments")  # optional list of attachment dicts
 
-        if not session_id or not content:
+        if not session_id or (not content and not attachments):
             await self._write(writer, {"ok": False, "error": "Missing session or content"})
             return
 
@@ -396,8 +397,8 @@ class ControlServer:
 
         try:
             # Tag the message so the agent knows it's from the orchestrator
-            tagged = f"[{sender}] {content}"
-            ok = await self._router.inject_message(session_id, tagged)
+            tagged = f"[{sender}] {content}" if content else f"[{sender}] [Sent a file]"
+            ok = await self._router.inject_message(session_id, tagged, attachments=attachments)
             if not ok:
                 await self._write(writer, {"ok": False, "error": "Failed to send to agent"})
                 return

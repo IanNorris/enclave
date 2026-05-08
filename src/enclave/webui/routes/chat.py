@@ -184,7 +184,9 @@ async def _send_matrix_file(config, room_id: str, mxc_uri: str, filename: str, s
 # ─── Control socket helper ───────────────────────────────────────────────────
 
 
-async def _send_via_control_socket(data_dir: Path, session_id: str, content: str) -> bool:
+async def _send_via_control_socket(
+    data_dir: Path, session_id: str, content: str, attachments: list[dict] | None = None
+) -> bool:
     """Send a message via the orchestrator control socket (wakes idle agents).
 
     Returns True if the message was accepted, False on failure.
@@ -195,12 +197,15 @@ async def _send_via_control_socket(data_dir: Path, session_id: str, content: str
 
     try:
         reader, writer = await asyncio.open_unix_connection(str(sock_path))
-        req = json.dumps({
+        req_data: dict = {
             "action": "send",
             "session": session_id,
             "content": content,
             "sender": "WebUI",
-        })
+        }
+        if attachments:
+            req_data["attachments"] = attachments
+        req = json.dumps(req_data)
         writer.write(req.encode() + b"\n")
         await writer.drain()
 
@@ -358,29 +363,51 @@ async def set_model(request: Request, session_id: str, body: SendMessage):
 
 @router.post("/{session_id}/upload")
 async def upload_file(request: Request, session_id: str, file: UploadFile = File(...), message: str = ""):
-    """Upload a file and send it to the agent's Matrix room."""
-    from fastapi import Form
+    """Upload a file and send it to the agent via control socket (with attachment metadata).
 
+    Also uploads to Matrix for the conversation record.
+    """
     room_id = _get_room_id(request, session_id)
     if not room_id:
         raise HTTPException(status_code=404, detail="Session room not found")
 
-    config = _matrix_config(request)
+    config = request.app.state.config
     content = await file.read()
     content_type = file.content_type or "application/octet-stream"
     filename = file.filename or "attachment"
 
-    # Upload to Matrix
-    mxc_uri = await _upload_matrix_file(config, filename, content, content_type)
+    # Save to workspace attachments dir so agent can read it directly
+    ws_base = Path(config.container.workspace_base) / session_id
+    attach_dir = ws_base / ".attachments"
+    attach_dir.mkdir(parents=True, exist_ok=True)
+    local_path = attach_dir / filename
+    local_path.write_bytes(content)
 
-    # Send as file message
-    event_id = await _send_matrix_file(config, room_id, mxc_uri, filename, len(content), content_type)
+    # Send to agent via control socket with attachment metadata
+    data_dir = Path(config.data_dir)
+    attachment_meta = {
+        "filename": filename,
+        "content_type": content_type,
+        "local_path": str(Path("/workspace/.attachments") / filename),  # path inside container
+    }
+    text_content = message.strip() if message.strip() else f"[Sent a file: {filename}]"
+    sent_to_agent = await _send_via_control_socket(
+        data_dir, session_id, text_content, attachments=[attachment_meta]
+    )
 
-    # If there's an accompanying text message, send that too
-    if message.strip():
-        await _send_matrix_message(config, room_id, message.strip())
+    # Also upload to Matrix for the conversation record
+    try:
+        mat_config = _matrix_config(request)
+        mxc_uri = await _upload_matrix_file(mat_config, filename, content, content_type)
+        await _send_matrix_file(mat_config, room_id, mxc_uri, filename, len(content), content_type)
+    except Exception:
+        pass  # Matrix upload is best-effort for the record
 
-    return {"sent": True, "event_id": event_id, "filename": filename}
+    if sent_to_agent:
+        return {"sent": True, "via": "control_socket", "filename": filename}
+
+    # Fallback: if control socket failed, at least it's in Matrix
+    return {"sent": True, "via": "matrix_only", "filename": filename}
 
 
 @router.get("/media/{server_name}/{media_id}")
