@@ -23,7 +23,29 @@ ws_router = APIRouter()  # Separate router for WebSocket (no OAuth2 dependency)
 # In-memory cache of recent agent responses not yet in session-store.db.
 # Keyed by session_id → list of {role, content, timestamp}.
 # Populated by the WebSocket control socket listener, consumed by history endpoint.
+# Persisted to disk so responses survive webui restarts.
 _response_cache: dict[str, list[dict]] = {}
+_response_cache_path: Path | None = None
+
+
+def _load_response_cache(data_dir: Path) -> None:
+    """Load persisted response cache from disk on startup."""
+    global _response_cache, _response_cache_path
+    _response_cache_path = data_dir / ".webui-response-cache.json"
+    if _response_cache_path.exists():
+        try:
+            _response_cache.update(json.loads(_response_cache_path.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+
+def _persist_response_cache() -> None:
+    """Write response cache to disk (called on updates)."""
+    if _response_cache_path:
+        try:
+            _response_cache_path.write_text(json.dumps(_response_cache))
+        except OSError:
+            pass
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -245,16 +267,44 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
     db_path = _session_store_db(request, session_id)
     turns = _read_turns(db_path, limit=limit, offset=offset)
 
-    # Append cached responses that are newer than the last DB turn
+    # Supplement turns that have NULL assistant_response with cached responses.
+    # Also append any truly new responses not yet in the DB.
     if offset == 0 and session_id in _response_cache:
         last_db_ts = ""
         if turns:
             last_db_ts = turns[-1].get("timestamp", "")
 
+        # Collect assistant responses from DB turns for dedup
+        db_responses = set()
+        for t in turns:
+            resp = t.get("assistant_response")
+            if resp:
+                db_responses.add(resp)
+
         cached = _response_cache.get(session_id, [])
+        unmatched_cache = []
+
         for entry in cached:
-            if entry["timestamp"] <= last_db_ts:
-                continue
+            if entry["content"] in db_responses:
+                continue  # Already in DB, skip
+
+            # Try to match to a turn with NULL assistant_response
+            # Find the turn whose timestamp is closest-before this cache entry
+            matched = False
+            for t in reversed(turns):
+                if t.get("assistant_response") is not None:
+                    continue
+                turn_ts = t.get("timestamp", "")
+                if turn_ts and turn_ts <= entry["timestamp"]:
+                    t["assistant_response"] = entry["content"]
+                    matched = True
+                    break
+
+            if not matched and entry["timestamp"] > last_db_ts:
+                unmatched_cache.append(entry)
+
+        # Append any unmatched responses newer than the last DB turn
+        for entry in unmatched_cache:
             turns.append({
                 "turn_index": None,
                 "user_message": None,
@@ -263,11 +313,12 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
                 "source": "live",
             })
 
-        # Prune cache entries that are now in the DB
-        if last_db_ts and cached:
+        # Prune cache entries whose content is already in the DB
+        if cached:
             _response_cache[session_id] = [
-                e for e in cached if e["timestamp"] > last_db_ts
+                e for e in cached if e["content"] not in db_responses
             ]
+            _persist_response_cache()
 
     return {"turns": turns, "session_id": session_id}
 
@@ -506,6 +557,7 @@ async def stream_conversation(websocket: WebSocket, session_id: str, token: str 
                         # Keep cache bounded
                         if len(cache) > 200:
                             _response_cache[session_id] = cache[-100:]
+                        _persist_response_cache()
 
                     try:
                         await websocket.send_json(event)

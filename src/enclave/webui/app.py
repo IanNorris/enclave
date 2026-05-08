@@ -107,10 +107,13 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     @app.on_event("startup")
     async def _start_response_cacher():
         import asyncio
-        from enclave.webui.routes.chat import _response_cache
+        from enclave.webui.routes.chat import _response_cache, _load_response_cache, _persist_response_cache
 
         data_dir = Path(config.data_dir)
         sock_path = data_dir / "control.sock"
+
+        # Load persisted cache from disk
+        _load_response_cache(data_dir)
 
         async def _cache_subscriber():
             """Persistent subscriber that caches all agent responses."""
@@ -178,6 +181,7 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
                         })
                         if len(cache) > 200:
                             _response_cache[session_id] = cache[-100:]
+                        _persist_response_cache()
             except (OSError, ConnectionError, asyncio.CancelledError):
                 pass
             finally:
