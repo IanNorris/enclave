@@ -202,7 +202,7 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     # Serve Vue SPA static files (built output) — must be last
     frontend_dist = Path(__file__).parent / "frontend" / "dist"
     if frontend_dist.exists():
-        from fastapi.responses import FileResponse
+        from fastapi.responses import FileResponse, HTMLResponse
 
         app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
 
@@ -212,7 +212,17 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
             file_path = frontend_dist / full_path
             if file_path.is_file():
                 return FileResponse(file_path)
-            return FileResponse(frontend_dist / "index.html")
+            # Serve index.html with no-cache so browsers always get the
+            # latest JS bundle references (asset files use content hashes).
+            html = (frontend_dist / "index.html").read_text()
+            return HTMLResponse(
+                html,
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
 
     return app
 
