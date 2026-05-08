@@ -60,6 +60,7 @@ class MessageType(str, Enum):
 
     # Environment management
     NIX_SHELL_REQUEST = "nix_shell_request"
+    PORT_REQUEST = "port_request"
 
     # Agent lifecycle signals
     TASK_DONE = "task_done"

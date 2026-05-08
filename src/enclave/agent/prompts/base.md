@@ -149,3 +149,15 @@ document, analysis, summary, or any long-form reference content.
 
 Good candidates: investigation reports, architecture docs, meeting notes,
 research summaries, troubleshooting guides, analysis results.
+
+## Port Mapping
+
+Use `request_port` to expose a service running in your container (e.g. a
+dev server, web app, or game server) so the user can access it from their
+browser or other tools.
+
+- Specify the container port your service listens on.
+- The orchestrator allocates a host port and returns the hostname + port.
+- **A session restart is required** to activate new port mappings.
+- Bind your service to `0.0.0.0` inside the container, not `127.0.0.1`.
+- Mappings are permanent and persist across restarts.

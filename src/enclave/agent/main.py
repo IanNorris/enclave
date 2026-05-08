@@ -2957,6 +2957,105 @@ async def try_init_copilot(
         )
         custom_tools.append(nix_shell_tool)
 
+        # Custom tool: request_port — request a host port mapping for this container
+        async def _request_port_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            container_port = args.get("container_port")
+            protocol = args.get("protocol", "tcp").lower()
+
+            if not container_port or not isinstance(container_port, int):
+                return ToolResult(
+                    text_result_for_llm="Error: 'container_port' must be an integer (1-65535)",
+                    result_type="error",
+                )
+            if protocol not in ("tcp", "udp"):
+                return ToolResult(
+                    text_result_for_llm="Error: 'protocol' must be 'tcp' or 'udp'",
+                    result_type="error",
+                )
+            if not ipc or not ipc.is_connected:
+                return ToolResult(
+                    text_result_for_llm="Error: not connected to orchestrator",
+                    result_type="error",
+                )
+
+            try:
+                reply = await ipc.request(Message(
+                    type=MessageType.PORT_REQUEST,
+                    payload={
+                        "container_port": container_port,
+                        "protocol": protocol,
+                    },
+                ), timeout=15.0)
+            except asyncio.TimeoutError:
+                return ToolResult(
+                    text_result_for_llm="Error: port request timed out",
+                    result_type="error",
+                )
+
+            payload = reply.payload
+            if "error" in payload:
+                return ToolResult(
+                    text_result_for_llm=f"Error: {payload['error']}",
+                    result_type="error",
+                )
+
+            host_port = payload["host_port"]
+            hostname = payload["hostname"]
+            active = payload.get("active", False)
+            restart_required = payload.get("restart_required", False)
+            already_existed = payload.get("already_existed", False)
+
+            lines = [
+                f"Port mapping {'already exists' if already_existed else 'created'}:",
+                f"  Container port: {container_port}/{protocol}",
+                f"  Accessible at:  {hostname}:{host_port}",
+                f"  Status:         {'Active' if active else 'Inactive (restart required)'}",
+            ]
+            if restart_required:
+                lines.append("")
+                lines.append("⚠️ The session must be restarted for this mapping to take effect.")
+            if not active:
+                lines.append("")
+                lines.append(
+                    f"IMPORTANT: When starting your service, bind to 0.0.0.0:{container_port} "
+                    f"(not 127.0.0.1) inside the container for the port to be reachable."
+                )
+            lines.append("")
+            lines.append(f"Tell the user to access the service at: {hostname}:{host_port}")
+
+            return ToolResult(text_result_for_llm="\n".join(lines))
+
+        request_port_tool = Tool(
+            name="request_port",
+            description=(
+                "Request a host port mapping for this container session. "
+                "Maps a container port to a host port so users can access "
+                "services running inside the container (e.g., dev servers, "
+                "web apps, game servers). The mapping is permanent and "
+                "persists across restarts. A session restart is required "
+                "to activate new mappings. Use this when you need to expose "
+                "a service for the user to connect to."
+            ),
+            handler=_request_port_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "container_port": {
+                        "type": "integer",
+                        "description": "Port number inside the container (1-65535)",
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["tcp", "udp"],
+                        "description": "Protocol: 'tcp' (default) or 'udp'",
+                    },
+                },
+                "required": ["container_port"],
+            },
+        )
+        custom_tools.append(request_port_tool)
+
         # ── Mimir recall tool ────────────────────────────────────────
         # Spawns mimir-cli per call (no persistent process) and substring-
         # greps the decoded canonical log. v1 uses substring match because

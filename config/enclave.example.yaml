@@ -28,6 +28,12 @@ containers:
   # Where session workspaces live on the host
   workspace_root: "/home/aeon/workspaces"
   session_root: "/home/aeon/sessions"
+  # Port mapping: agents can request ports in this range
+  # public_hostname: "dev.local"  # hostname reported to users (auto-detected if empty)
+  # port_range_start: 9000
+  # port_range_end: 9200
+  # port_bind_address: "127.0.0.1"  # bind published ports to localhost only
+  # port_network: "slirp4netns"  # network mode when ports are mapped
 
 display:
   compositor: hyprland

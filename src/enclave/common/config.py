@@ -63,6 +63,12 @@ class ContainerConfig:
     socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
     nix_store: str = str(Path.home() / ".local" / "share" / "enclave" / "nix")
     github_token: str = ""
+    # Port mapping settings
+    public_hostname: str = ""  # hostname reported to users (e.g. "dev.local"); auto-detected if empty
+    port_range_start: int = 9000
+    port_range_end: int = 9200
+    port_bind_address: str = "127.0.0.1"  # bind address for published ports
+    port_network: str = "slirp4netns"  # network mode when ports are mapped
     # Named container profiles (e.g., "dev", "light", "host")
     profiles: dict[str, ContainerProfile] = field(default_factory=lambda: {
         "dev": ContainerProfile(
@@ -108,6 +114,13 @@ class ContainerConfig:
     def profile_names(self) -> list[str]:
         """Return list of available profile names."""
         return list(self.profiles.keys())
+
+    def get_public_hostname(self) -> str:
+        """Return the public hostname for port mappings."""
+        if self.public_hostname:
+            return self.public_hostname
+        import socket
+        return socket.gethostname()
 
 
 @dataclass

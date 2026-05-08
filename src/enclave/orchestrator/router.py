@@ -159,6 +159,9 @@ class MessageRouter:
         # ask_user polls: poll_event_id → session_id
         self._ask_user_polls: dict[str, str] = {}
 
+        # Port allocation lock (prevents concurrent allocations of the same port)
+        self._port_alloc_lock = asyncio.Lock()
+
         # Rooms waiting for a user to join before sending queued messages
         # room_id → list of message strings to send once the user joins
         self._awaiting_join: dict[str, list[str]] = {}
@@ -935,6 +938,8 @@ class MessageRouter:
             )
         elif msg.type == MessageType.NIX_SHELL_REQUEST:
             await self._handle_nix_shell_request(session, msg)
+        elif msg.type == MessageType.PORT_REQUEST:
+            await self._handle_port_request(session, msg)
         elif msg.type == MessageType.TASK_DONE:
             summary = msg.payload.get("summary", "")
             log.info("Agent %s marked task done: %s", session.id, summary[:80])
@@ -2033,6 +2038,144 @@ class MessageRouter:
                 session.room_id,
                 f"❌ Restart failed: {error}",
             )
+
+    async def _handle_port_request(
+        self, session: Session, msg: Message,
+    ) -> None:
+        """Handle an agent's request to map a container port to a host port.
+
+        The allocation is idempotent and permanent — persisted across restarts.
+        The port only becomes active after the next container restart.
+        """
+        container_port = msg.payload.get("container_port")
+        protocol = msg.payload.get("protocol", "tcp").lower()
+
+        # Validate inputs
+        if not container_port or not isinstance(container_port, int):
+            await self._reply_port_request(session, msg, error="container_port must be an integer")
+            return
+        if container_port < 1 or container_port > 65535:
+            await self._reply_port_request(session, msg, error="container_port must be 1-65535")
+            return
+        if protocol not in ("tcp", "udp"):
+            await self._reply_port_request(session, msg, error="protocol must be 'tcp' or 'udp'")
+            return
+
+        # Reject host-mode sessions (no container namespace to publish)
+        profile = self.sessions.config.get_profile(session.profile)
+        if profile.image == "":
+            await self._reply_port_request(
+                session, msg,
+                error="Port mapping is not available for host-mode sessions (no container).",
+            )
+            return
+
+        async with self._port_alloc_lock:
+            # Idempotent: check if this mapping already exists
+            for pm in session.port_mappings:
+                if pm["container_port"] == container_port and pm.get("protocol", "tcp") == protocol:
+                    host_port = pm["host_port"]
+                    hostname = self.sessions.config.get_public_hostname()
+                    is_active = session.status == "running"
+                    await self._reply_port_request(
+                        session, msg,
+                        host_port=host_port, hostname=hostname,
+                        active=is_active, restart_required=False,
+                        already_existed=True,
+                    )
+                    return
+
+            # Allocate a free host port from the configured range
+            used_ports = set()
+            for s in self.sessions.list_sessions():
+                for pm in s.port_mappings:
+                    used_ports.add(pm["host_port"])
+
+            host_port = None
+            range_start = self.sessions.config.port_range_start
+            range_end = self.sessions.config.port_range_end
+            bind_addr = self.sessions.config.port_bind_address
+
+            for candidate in range(range_start, range_end + 1):
+                if candidate in used_ports:
+                    continue
+                # Check if port is actually available on the host
+                import socket as _socket
+                try:
+                    sock_type = _socket.SOCK_STREAM if protocol == "tcp" else _socket.SOCK_DGRAM
+                    with _socket.socket(_socket.AF_INET, sock_type) as s:
+                        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                        s.bind((bind_addr, candidate))
+                    host_port = candidate
+                    break
+                except OSError:
+                    continue
+
+            if host_port is None:
+                await self._reply_port_request(
+                    session, msg,
+                    error=f"No free ports in range {range_start}-{range_end}",
+                )
+                return
+
+            # Persist the mapping
+            session.port_mappings.append({
+                "container_port": container_port,
+                "host_port": host_port,
+                "protocol": protocol,
+            })
+            self.sessions.save_sessions()
+
+        hostname = self.sessions.config.get_public_hostname()
+        log.info(
+            "Port mapped for %s: %s:%d → container:%d/%s",
+            session.id, hostname, host_port, container_port, protocol,
+        )
+
+        # Notify Matrix
+        await self.matrix.send_message(
+            session.room_id,
+            f"🔌 Port mapped: `{hostname}:{host_port}` → container `{container_port}/{protocol}`\n"
+            f"⚠️ Restart required to activate.",
+        )
+
+        await self._reply_port_request(
+            session, msg,
+            host_port=host_port, hostname=hostname,
+            active=False, restart_required=True,
+        )
+
+    async def _reply_port_request(
+        self, session: Session, msg: Message, *,
+        host_port: int | None = None,
+        hostname: str = "",
+        active: bool = False,
+        restart_required: bool = False,
+        already_existed: bool = False,
+        error: str = "",
+    ) -> None:
+        """Send a reply to a PORT_REQUEST message."""
+        ipc_conn = self.ipc.get_connection(session.id) if self.ipc else None
+        if not ipc_conn:
+            log.warning("Cannot reply to port_request for %s: no IPC connection", session.id)
+            return
+        payload: dict[str, Any] = {}
+        if error:
+            payload["error"] = error
+        else:
+            payload.update({
+                "host_port": host_port,
+                "hostname": hostname,
+                "active": active,
+                "restart_required": restart_required,
+                "already_existed": already_existed,
+            })
+        reply = Message(
+            type=MessageType.PORT_REQUEST,
+            payload=payload,
+            reply_to=msg.id,
+        )
+        await ipc_conn.send(reply)
 
     async def _handle_permission_request(
         self, session: Session, msg: Message

@@ -64,9 +64,16 @@ class ContainerManager:
 
         # Select network mode:
         # - Copilot SDK containers need network for API access
+        # - Sessions with port mappings need network for published ports
         # - Default containers are network-isolated
         has_copilot = bool(self.config.github_token)
-        network = self.config.copilot_network if has_copilot else self.config.network
+        has_ports = bool(session.port_mappings)
+        if has_ports:
+            network = self.config.port_network
+        elif has_copilot:
+            network = self.config.copilot_network
+        else:
+            network = self.config.network
 
         # Use session-specific image, falling back to profile → global default
         image = session.image or profile.image or self.config.image
@@ -85,6 +92,14 @@ class ContainerManager:
             "-e", f"SESSION_ID={session.id}",
             "-e", f"SESSION_NAME={session.name}",
         ]
+
+        # Publish port mappings
+        bind_addr = self.config.port_bind_address
+        for pm in session.port_mappings:
+            cp = pm["container_port"]
+            hp = pm["host_port"]
+            proto = pm.get("protocol", "tcp")
+            cmd.extend(["-p", f"{bind_addr}:{hp}:{cp}/{proto}"])
 
         # Nix store mount (only for profiles that use nix)
         if profile.nix_store:
