@@ -30,7 +30,10 @@
 
     <!-- Create/Edit modal -->
     <div v-if="showModal" class="modal-overlay" @click.self="closeModal">
-      <div class="modal card">
+      <div class="modal card"
+           @dragover.prevent="dragOver = true"
+           @dragleave.prevent="dragOver = false"
+           @drop.prevent="handleDrop">
         <h3>{{ editing ? `Edit ${editBug.id}` : 'New Item' }}</h3>
         <input v-model="editBug.title" placeholder="Title" />
         <div class="form-row">
@@ -60,28 +63,48 @@
             </select>
           </div>
         </div>
-        <textarea v-model="editBug.body" placeholder="Description (markdown)" rows="10"></textarea>
+        <div class="textarea-wrap" :class="{ 'drag-active': dragOver }">
+          <textarea ref="bodyTextarea" v-model="editBug.body"
+                    placeholder="Description (markdown) — paste images or drag & drop files"
+                    rows="10"
+                    @paste="handlePaste"></textarea>
+          <div v-if="dragOver" class="drop-overlay">Drop files here</div>
+        </div>
 
-        <!-- Attachments section (edit mode only) -->
-        <div v-if="editing" class="attachments-section">
+        <!-- Pending files (queued for upload on save) -->
+        <div v-if="pendingFiles.length" class="attachments-section">
+          <label>Pending uploads ({{ pendingFiles.length }})</label>
+          <div class="attachment-list">
+            <div v-for="(pf, i) in pendingFiles" :key="i" class="attachment-item pending">
+              <img v-if="pf.preview" :src="pf.preview" class="att-preview" />
+              <span>📎 {{ pf.file.name }} <span class="att-size">({{ formatSize(pf.file.size) }})</span></span>
+              <button class="btn-x" @click="pendingFiles.splice(i, 1)">✕</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Existing attachments (edit mode) -->
+        <div v-if="editing && attachments.length" class="attachments-section">
           <label>Attachments</label>
-          <div v-if="attachments.length" class="attachment-list">
+          <div class="attachment-list">
             <a v-for="att in attachments" :key="att.name"
                :href="`/api/bugs/${selectedSession}/${editBug.id}/attachments/${att.name}`"
                target="_blank" class="attachment-item">
-              📎 {{ att.name }} <span class="att-size">({{ formatSize(att.size) }})</span>
+              <img v-if="isImage(att.name)" :src="`/api/bugs/${selectedSession}/${editBug.id}/attachments/${att.name}`" class="att-preview" />
+              <span>📎 {{ att.name }} <span class="att-size">({{ formatSize(att.size) }})</span></span>
             </a>
           </div>
-          <div class="upload-row">
-            <input type="file" ref="fileInput" @change="uploadFile" />
-            <span v-if="uploading" class="upload-status">Uploading…</span>
-          </div>
+        </div>
+
+        <div class="upload-row">
+          <input type="file" ref="fileInput" @change="addFiles" multiple />
+          <span v-if="uploading" class="upload-status">Uploading…</span>
         </div>
 
         <div class="modal-actions">
           <button class="danger" v-if="editing" @click="deleteBug" style="margin-right:auto">Delete</button>
           <button class="secondary" @click="closeModal">Cancel</button>
-          <button class="primary" @click="saveBug" :disabled="!editBug.title?.trim()">
+          <button class="primary" @click="saveBug" :disabled="!editBug.title?.trim() || uploading">
             {{ editing ? 'Save' : 'Create' }}
           </button>
         </div>
@@ -107,6 +130,9 @@ const editBug = ref({})
 const attachments = ref([])
 const uploading = ref(false)
 const fileInput = ref(null)
+const bodyTextarea = ref(null)
+const pendingFiles = ref([])
+const dragOver = ref(false)
 
 const filteredBugs = computed(() => {
   if (!showOpenOnly.value) return bugs.value
@@ -149,6 +175,7 @@ function defaultProject() {
 function openCreate() {
   editing.value = false
   editBug.value = { title: '', severity: 'medium', type: 'bug', body: '' }
+  pendingFiles.value = []
   showModal.value = true
 }
 
@@ -156,6 +183,7 @@ function openEdit(bug) {
   editing.value = true
   editBug.value = { ...bug }
   attachments.value = []
+  pendingFiles.value = []
   showModal.value = true
   loadAttachments(bug.id)
 }
@@ -164,10 +192,13 @@ function closeModal() {
   showModal.value = false
   editBug.value = {}
   attachments.value = []
+  pendingFiles.value = []
+  dragOver.value = false
 }
 
 async function saveBug() {
   if (!editBug.value.title?.trim()) return
+  let bugId = editBug.value.id
   if (editing.value) {
     await api.updateBug(selectedSession.value, editBug.value.id, {
       title: editBug.value.title,
@@ -177,13 +208,27 @@ async function saveBug() {
       body: editBug.value.body,
     })
   } else {
-    await api.createBug(selectedSession.value, defaultProject(), {
+    const result = await api.createBug(selectedSession.value, defaultProject(), {
       title: editBug.value.title,
       severity: editBug.value.severity,
       type: editBug.value.type,
       body: editBug.value.body,
     })
+    bugId = result?.id || result?.bug_id
   }
+
+  // Upload any pending files
+  if (bugId && pendingFiles.value.length) {
+    uploading.value = true
+    try {
+      for (const pf of pendingFiles.value) {
+        await uploadFileForBug(bugId, pf.file)
+      }
+    } finally {
+      uploading.value = false
+    }
+  }
+
   closeModal()
   loadBugs()
 }
@@ -205,24 +250,127 @@ async function loadAttachments(bugId) {
   } catch { attachments.value = [] }
 }
 
-async function uploadFile() {
-  const file = fileInput.value?.files?.[0]
-  if (!file) return
+async function uploadFileForBug(bugId, file) {
+  const token = localStorage.getItem('enclave_token')
+  const form = new FormData()
+  form.append('file', file)
+  await fetch(`/api/bugs/${selectedSession.value}/${bugId}/attachments`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+}
+
+function addFiles() {
+  const files = fileInput.value?.files
+  if (!files?.length) return
+
+  for (const file of files) {
+    const preview = file.type.startsWith('image/') ? URL.createObjectURL(file) : null
+    pendingFiles.value.push({ file, preview })
+  }
+
+  // If editing, upload immediately
+  if (editing.value && editBug.value.id) {
+    uploadPendingNow()
+  }
+
+  if (fileInput.value) fileInput.value.value = ''
+}
+
+async function uploadPendingNow() {
+  if (!pendingFiles.value.length || !editBug.value.id) return
   uploading.value = true
   try {
-    const token = localStorage.getItem('enclave_token')
-    const form = new FormData()
-    form.append('file', file)
-    const res = await fetch(`/api/bugs/${selectedSession.value}/${editBug.value.id}/attachments`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: form,
-    })
-    if (res.ok) {
-      await loadAttachments(editBug.value.id)
-      fileInput.value.value = ''
+    for (const pf of [...pendingFiles.value]) {
+      await uploadFileForBug(editBug.value.id, pf.file)
     }
-  } finally { uploading.value = false }
+    pendingFiles.value = []
+    await loadAttachments(editBug.value.id)
+  } finally {
+    uploading.value = false
+  }
+}
+
+function handlePaste(e) {
+  const items = e.clipboardData?.items
+  if (!items) return
+
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault()
+      const file = item.getAsFile()
+      if (!file) continue
+      const ext = file.type.split('/')[1] || 'png'
+      const name = `paste-${Date.now()}.${ext}`
+      const named = new File([file], name, { type: file.type })
+      const preview = URL.createObjectURL(named)
+      pendingFiles.value.push({ file: named, preview })
+
+      // If editing, upload immediately and insert markdown reference
+      if (editing.value && editBug.value.id) {
+        uploadAndInsertImage(named)
+      } else {
+        // Insert a placeholder that will become valid after save
+        insertAtCursor(`![${name}](attachment:${name})`)
+      }
+      return
+    }
+  }
+}
+
+function handleDrop(e) {
+  dragOver.value = false
+  const files = e.dataTransfer?.files
+  if (!files?.length) return
+
+  for (const file of files) {
+    const preview = file.type.startsWith('image/') ? URL.createObjectURL(file) : null
+    pendingFiles.value.push({ file, preview })
+  }
+
+  if (editing.value && editBug.value.id) {
+    uploadPendingNow()
+  }
+}
+
+async function uploadAndInsertImage(file) {
+  uploading.value = true
+  try {
+    await uploadFileForBug(editBug.value.id, file)
+    const url = `/api/bugs/${selectedSession.value}/${editBug.value.id}/attachments/${file.name}`
+    insertAtCursor(`![${file.name}](${url})`)
+    pendingFiles.value = pendingFiles.value.filter(pf => pf.file !== file)
+    await loadAttachments(editBug.value.id)
+  } finally {
+    uploading.value = false
+  }
+}
+
+function insertAtCursor(text) {
+  const ta = bodyTextarea.value
+  if (!ta) {
+    editBug.value.body = (editBug.value.body || '') + '\n' + text
+    return
+  }
+  const start = ta.selectionStart
+  const end = ta.selectionEnd
+  const val = editBug.value.body || ''
+  const before = val.substring(0, start)
+  const after = val.substring(end)
+  const insert = (before && !before.endsWith('\n') ? '\n' : '') + text + '\n'
+  editBug.value.body = before + insert + after
+  // Restore cursor after inserted text
+  const newPos = start + insert.length
+  requestAnimationFrame(() => {
+    ta.selectionStart = newPos
+    ta.selectionEnd = newPos
+    ta.focus()
+  })
+}
+
+function isImage(name) {
+  return /\.(png|jpg|jpeg|gif|webp|svg|bmp)$/i.test(name)
 }
 
 function formatSize(bytes) {
@@ -354,13 +502,68 @@ function formatSize(bytes) {
   font-size: 0.85rem;
   color: var(--accent);
   text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.attachment-item.pending {
+  color: var(--text);
 }
 
 .attachment-item:hover { text-decoration: underline; }
 
+.att-preview {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.btn-x {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 0.1rem 0.3rem;
+  margin-left: auto;
+}
+.btn-x:hover { color: var(--danger, #e55); }
+
 .att-size {
   color: var(--text-muted);
   font-size: 0.75rem;
+}
+
+.textarea-wrap {
+  position: relative;
+}
+
+.textarea-wrap textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.textarea-wrap.drag-active textarea {
+  opacity: 0.4;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--accent);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-sm);
+  background: rgba(var(--accent-rgb, 100, 149, 237), 0.08);
+  pointer-events: none;
 }
 
 .upload-row {
