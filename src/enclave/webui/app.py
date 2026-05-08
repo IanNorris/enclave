@@ -73,6 +73,12 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
         tags=["sessions"],
         dependencies=[Depends(get_current_user)],
     )
+    # Artifact file download accepts ?token= query param (browser links can't send headers)
+    app.include_router(
+        sessions.public_router,
+        prefix="/api/sessions",
+        tags=["sessions"],
+    )
     app.include_router(
         bugs.router,
         prefix="/api/bugs",

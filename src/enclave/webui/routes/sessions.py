@@ -16,11 +16,16 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from enclave.webui.auth import validate_token
+
 router = APIRouter()
+# Separate router for endpoints that accept ?token= query-param auth
+# (browser <img src> / <a href> can't send Authorization headers).
+public_router = APIRouter()
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -656,9 +661,30 @@ async def get_artifact_diff(request: Request, session_id: str, filename: str, v1
     }
 
 
-@router.get("/{session_id}/artifacts/{filename:path}")
-async def get_artifact(request: Request, session_id: str, filename: str):
-    """Serve an artifact file."""
+@public_router.get("/{session_id}/artifacts/{filename:path}")
+async def get_artifact(
+    request: Request,
+    session_id: str,
+    filename: str,
+    token: str = Query(None),
+):
+    """Serve an artifact file.
+
+    Auth via ``?token=`` query parameter so that ``<a href>`` and
+    ``window.open()`` links work without JavaScript fetch.
+    """
+    if token:
+        validate_token(token)
+    else:
+        # If no query token, require the normal Authorization header
+        from enclave.webui.auth import get_current_user, oauth2_scheme
+        from fastapi import Depends
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            validate_token(auth_header[7:])
+        else:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
     art_dir = _artifacts_dir(request, session_id)
     target = art_dir / filename
 

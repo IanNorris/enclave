@@ -9,8 +9,12 @@
     </div>
 
     <div v-else-if="artifacts.length" class="artifacts-grid">
-      <div class="card file-list">
-        <h3>Files ({{ artifacts.length }})</h3>
+      <!-- File list (collapsible on mobile) -->
+      <div class="card file-list" :class="{ collapsed: mobileContentVisible }">
+        <div class="file-list-header" @click="toggleFileList">
+          <h3>Files ({{ artifacts.length }})</h3>
+          <span class="collapse-indicator">{{ mobileContentVisible ? '▶' : '▼' }}</span>
+        </div>
         <div class="file-tree">
           <div
             v-for="art in artifacts"
@@ -39,7 +43,7 @@
           <div class="header-actions">
             <button v-if="selectedArtifact.version > 1 && !showingDiff" class="btn-sm" @click="showVersionHistory">⏱ History</button>
             <button v-if="showingDiff" class="btn-sm" @click="closeDiff">✕ Close diff</button>
-            <a :href="api.artifactUrl(selectedSession, selectedArtifact.filename)" target="_blank" class="secondary open-link">Open ↗</a>
+            <a :href="authArtifactUrl(selectedArtifact.filename)" target="_blank" class="secondary open-link">Open ↗</a>
           </div>
         </div>
 
@@ -55,7 +59,7 @@
               <option v-for="v in versionOptions" :key="v" :value="v">v{{ v }}</option>
             </select>
           </div>
-          <pre v-if="diffContent" class="diff-output">{{ diffContent }}</pre>
+          <div v-if="diffContent" class="diff-output" v-html="renderDiff(diffContent)"></div>
           <p v-else class="muted">No changes between these versions.</p>
         </div>
 
@@ -88,6 +92,7 @@ const artifacts = ref([])
 const selectedArtifact = ref(null)
 const artifactContent = ref(null)
 const artifactLoading = ref(false)
+const mobileContentVisible = ref(false)
 
 // Versioning state
 const showingDiff = ref(false)
@@ -96,6 +101,16 @@ const diffV1 = ref(1)
 const diffV2 = ref(2)
 const versionOptions = ref([])
 
+function authArtifactUrl(filename) {
+  const token = localStorage.getItem('enclave_token')
+  const base = api.artifactUrl(selectedSession.value, filename)
+  return `${base}?token=${encodeURIComponent(token)}`
+}
+
+function toggleFileList() {
+  if (selectedArtifact.value) mobileContentVisible.value = !mobileContentVisible.value
+}
+
 onMounted(() => {
   if (selectedSession.value) loadArtifacts()
 })
@@ -103,6 +118,7 @@ onMounted(() => {
 watch(selectedSession, (v) => {
   selectedArtifact.value = null
   artifactContent.value = null
+  mobileContentVisible.value = false
   closeDiff()
   if (v) loadArtifacts()
   else artifacts.value = []
@@ -117,6 +133,7 @@ async function loadArtifacts() {
 async function viewArtifact(art) {
   selectedArtifact.value = art
   artifactContent.value = null
+  mobileContentVisible.value = true
   closeDiff()
   artifactLoading.value = true
   try {
@@ -124,8 +141,9 @@ async function viewArtifact(art) {
       const data = await api.getArtifactContent(selectedSession.value, art.filename)
       artifactContent.value = data.content || ''
     } else {
-      window.open(api.artifactUrl(selectedSession.value, art.filename), '_blank')
+      window.open(authArtifactUrl(art.filename), '_blank')
       selectedArtifact.value = null
+      mobileContentVisible.value = false
     }
   } catch (e) {
     artifactContent.value = `Error: ${e.message}`
@@ -138,7 +156,6 @@ async function showVersionHistory() {
   const art = selectedArtifact.value
   if (!art) return
   const currentVersion = art.version || 1
-  // Build version options: 1 .. currentVersion
   const opts = []
   for (let i = 1; i <= currentVersion; i++) opts.push(i)
   versionOptions.value = opts
@@ -172,6 +189,28 @@ function renderMarkdown(text) {
   return md.render(text || '')
 }
 
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function renderDiff(diffText) {
+  if (!diffText) return ''
+  return diffText.split('\n').map(line => {
+    const escaped = escapeHtml(line)
+    if (line.startsWith('+++') || line.startsWith('---')) {
+      return `<div class="diff-line diff-file">${escaped}</div>`
+    } else if (line.startsWith('@@')) {
+      return `<div class="diff-line diff-hunk">${escaped}</div>`
+    } else if (line.startsWith('+')) {
+      return `<div class="diff-line diff-add">${escaped}</div>`
+    } else if (line.startsWith('-')) {
+      return `<div class="diff-line diff-del">${escaped}</div>`
+    } else {
+      return `<div class="diff-line diff-ctx">${escaped}</div>`
+    }
+  }).join('')
+}
+
 function formatSize(bytes) {
   if (!bytes) return '0 B'
   if (bytes < 1024) return `${bytes} B`
@@ -196,14 +235,20 @@ function formatSize(bytes) {
 
 .artifacts-grid {
   display: grid;
-  grid-template-columns: 380px 1fr;
+  grid-template-columns: 300px 1fr;
   gap: 1rem;
 }
 
-.file-list h3 {
+.file-list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.file-list-header h3 {
   margin: 0 0 0.75rem;
   font-size: 0.9rem;
 }
+.collapse-indicator { display: none; }
 
 .file-tree {
   max-height: 600px;
@@ -280,16 +325,23 @@ function formatSize(bytes) {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 .artifact-header-bar h3 {
   margin: 0;
   font-size: 0.9rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  flex-shrink: 0;
 }
 
 .btn-sm {
@@ -333,16 +385,41 @@ function formatSize(bytes) {
 .diff-output {
   font-size: 0.75rem;
   font-family: 'JetBrains Mono', monospace;
-  white-space: pre-wrap;
-  word-break: break-all;
   max-height: 500px;
   overflow-y: auto;
   margin: 0;
-  background: var(--bg-main);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 0.5rem;
   line-height: 1.4;
+}
+
+.diff-line {
+  padding: 0 0.5rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.diff-file {
+  background: var(--bg-sidebar, #1e1e2e);
+  color: var(--text-muted);
+  font-weight: 600;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+.diff-hunk {
+  background: rgba(100, 149, 237, 0.15);
+  color: cornflowerblue;
+  padding: 0.15rem 0.5rem;
+}
+.diff-add {
+  background: rgba(80, 200, 120, 0.15);
+  color: #50c878;
+}
+.diff-del {
+  background: rgba(255, 99, 71, 0.15);
+  color: #ff6347;
+}
+.diff-ctx {
+  color: var(--text-secondary, #999);
 }
 
 .file-content h3 {
@@ -385,4 +462,45 @@ function formatSize(bytes) {
 }
 .artifact-rendered :deep(a) { color: var(--accent); }
 .artifact-rendered :deep(img) { max-width: 100%; border-radius: var(--radius-sm); }
+
+/* ─── Mobile ─── */
+@media (max-width: 768px) {
+  .artifacts-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .collapse-indicator {
+    display: inline;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+  }
+
+  .file-list-header {
+    cursor: pointer;
+  }
+  .file-list-header h3 {
+    margin-bottom: 0;
+  }
+
+  .file-list.collapsed .file-tree {
+    display: none;
+  }
+
+  .file-tree {
+    max-height: 250px;
+  }
+
+  .artifact-rendered {
+    max-height: none;
+  }
+
+  .diff-output {
+    max-height: none;
+  }
+
+  .artifact-header-bar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
 </style>
