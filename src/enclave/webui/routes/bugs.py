@@ -16,11 +16,16 @@ from pathlib import Path
 from typing import Any
 
 import aiofiles
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import FileResponse
+
+from enclave.webui.auth import validate_token
 from pydantic import BaseModel
 
 router = APIRouter()
+# Separate router for endpoints that accept ?token= query-param auth
+# (browser <img src> / <a href> can't send Authorization headers).
+public_router = APIRouter()
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -366,9 +371,21 @@ async def upload_attachment(
     raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
 
 
-@router.get("/{session_id}/{bug_id}/attachments/{filename}")
-async def download_attachment(request: Request, session_id: str, bug_id: str, filename: str):
-    """Download a specific attachment."""
+@public_router.get("/{session_id}/{bug_id}/attachments/{filename}")
+async def download_attachment(
+    request: Request,
+    session_id: str,
+    bug_id: str,
+    filename: str,
+    token: str = Query(...),
+):
+    """Download a specific attachment.
+
+    Auth via ``?token=`` query parameter so that ``<img src>`` and
+    ``<a href>`` links work without JavaScript fetch.
+    """
+    validate_token(token)  # raises 401 on failure
+
     ws_base = _workspace_base(request)
     session_dir = ws_base / session_id
 

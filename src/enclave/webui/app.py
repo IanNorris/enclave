@@ -79,6 +79,12 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
         tags=["bugs"],
         dependencies=[Depends(get_current_user)],
     )
+    # Attachment download accepts ?token= query param (browser <img>/<a> can't send headers)
+    app.include_router(
+        bugs.public_router,
+        prefix="/api/bugs",
+        tags=["bugs"],
+    )
     app.include_router(
         memories.router,
         prefix="/api/memories",

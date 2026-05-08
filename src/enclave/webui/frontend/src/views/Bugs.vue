@@ -88,9 +88,9 @@
           <label>Attachments</label>
           <div class="attachment-list">
             <a v-for="att in attachments" :key="att.name"
-               :href="`/api/bugs/${selectedSession}/${editBug.id}/attachments/${att.name}`"
+               :href="attachUrl(editBug.id, att.name)"
                target="_blank" class="attachment-item">
-              <img v-if="isImage(att.name)" :src="`/api/bugs/${selectedSession}/${editBug.id}/attachments/${att.name}`" class="att-preview" />
+              <img v-if="isImage(att.name)" :src="attachUrl(editBug.id, att.name)" class="att-preview" />
               <span>📎 {{ att.name }} <span class="att-size">({{ formatSize(att.size) }})</span></span>
             </a>
           </div>
@@ -133,6 +133,11 @@ const fileInput = ref(null)
 const bodyTextarea = ref(null)
 const pendingFiles = ref([])
 const dragOver = ref(false)
+
+function attachUrl(bugId, filename) {
+  const token = localStorage.getItem('enclave_token')
+  return `/api/bugs/${selectedSession.value}/${bugId}/attachments/${encodeURIComponent(filename)}?token=${encodeURIComponent(token)}`
+}
 
 const filteredBugs = computed(() => {
   if (!showOpenOnly.value) return bugs.value
