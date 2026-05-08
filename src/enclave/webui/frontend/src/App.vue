@@ -1,5 +1,8 @@
 <template>
-  <div class="app">
+  <div v-if="isLoginPage">
+    <router-view />
+  </div>
+  <div v-else class="app">
     <!-- Mobile header -->
     <div class="mobile-header">
       <button class="hamburger" @click="sidebarOpen = !sidebarOpen">☰</button>
@@ -59,15 +62,22 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { useSessionStore } from './stores/session.js'
 
+const route = useRoute()
 const sidebarOpen = ref(false)
 const { sessions, selectedSessionId, loadSessions } = useSessionStore()
 const activeSessions = computed(() => sessions.value.filter(s => !s.archived))
+const isLoginPage = computed(() => route.name === 'login')
 
+// Only load sessions when not on login page
 onMounted(() => {
-  loadSessions()
+  if (!isLoginPage.value) loadSessions()
+})
+watch(isLoginPage, (isLogin) => {
+  if (!isLogin) loadSessions()
 })
 </script>
 
