@@ -1,5 +1,5 @@
 <template>
-  <div v-if="isLoginPage">
+  <div v-if="isLoginPage || !hasToken">
     <router-view />
   </div>
   <div v-else class="app">
@@ -71,13 +71,17 @@ const sidebarOpen = ref(false)
 const { sessions, selectedSessionId, loadSessions } = useSessionStore()
 const activeSessions = computed(() => sessions.value.filter(s => !s.archived))
 const isLoginPage = computed(() => route.name === 'login')
+const hasToken = ref(!!localStorage.getItem('enclave_token'))
 
-// Only load sessions when not on login page
+// Only load sessions when authenticated and not on login page
 onMounted(() => {
-  if (!isLoginPage.value) loadSessions()
+  if (!isLoginPage.value && hasToken.value) loadSessions()
 })
 watch(isLoginPage, (isLogin) => {
-  if (!isLogin) loadSessions()
+  if (!isLogin) {
+    hasToken.value = !!localStorage.getItem('enclave_token')
+    if (hasToken.value) loadSessions()
+  }
 })
 </script>
 

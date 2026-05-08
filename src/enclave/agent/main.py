@@ -3599,27 +3599,29 @@ async def try_init_copilot(
             if existing and target.exists():
                 # Version the old file
                 version = existing.get("version", 1)
+                old_size = target.stat().st_size  # actual file size, not manifest cache
                 stem = target.stem
                 ext = target.suffix
                 versioned_name = f"{stem}.v{version}{ext}"
                 versioned_path = art_dir / versioned_name
-                # Rename current to versioned
+                # Copy current to versioned
                 import shutil
                 shutil.copy2(str(target), str(versioned_path))
                 # Record version in history
                 versions = existing.get("versions", [])
                 if not versions:
-                    # Retroactively create v1 entry
+                    # Retroactively create v1 entry for the original version
                     versions.append({
                         "version": 1,
                         "created": existing.get("created", now),
-                        "size": existing.get("size", 0),
+                        "size": old_size if version == 1 else existing.get("size", 0),
                     })
-                versions.append({
-                    "version": version,
-                    "created": existing.get("updated", now),
-                    "size": existing.get("size", 0),
-                })
+                if version > 1 or not versions:
+                    versions.append({
+                        "version": version,
+                        "created": existing.get("updated", now),
+                        "size": old_size,
+                    })
                 # Update entry
                 existing["version"] = version + 1
                 existing["versions"] = versions

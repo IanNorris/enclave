@@ -541,6 +541,7 @@ async def register_artifact(request: Request, session_id: str, body: ArtifactReg
     if existing:
         # Version the old content before updating
         version = existing.get("version", 1)
+        old_size = target.stat().st_size  # actual file size
         stem = Path(body.filename).stem
         ext = Path(body.filename).suffix
         versioned_name = f"{stem}.v{version}{ext}"
@@ -554,14 +555,15 @@ async def register_artifact(request: Request, session_id: str, body: ArtifactReg
             versions.append({
                 "version": 1,
                 "created": existing.get("created", now),
-                "size": existing.get("size", 0),
+                "size": old_size if version == 1 else existing.get("size", 0),
             })
-        # Add current version to history
-        versions.append({
-            "version": version,
-            "created": existing.get("updated", now),
-            "size": existing.get("size", 0),
-        })
+        # Add current version to history (avoid duplicate v1)
+        if version > 1 or not versions:
+            versions.append({
+                "version": version,
+                "created": existing.get("updated", now),
+                "size": old_size,
+            })
 
         existing.update({
             "title": body.title,

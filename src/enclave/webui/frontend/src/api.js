@@ -1,5 +1,7 @@
 const BASE = '/api'
 
+let _redirecting = false  // prevent cascading 401 reloads
+
 function getToken() {
   return localStorage.getItem('enclave_token') || ''
 }
@@ -17,7 +19,10 @@ async function request(path, options = {}) {
   if (res.status === 401) {
     localStorage.removeItem('enclave_token')
     localStorage.removeItem('enclave_user')
-    window.location.href = '/login'
+    if (!_redirecting && window.location.pathname !== '/login') {
+      _redirecting = true
+      window.location.href = '/login'
+    }
     throw new Error('Session expired')
   }
   if (!res.ok) {
