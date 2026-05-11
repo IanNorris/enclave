@@ -321,6 +321,11 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 nix_store=c.get("nix_store", config.container.nix_store),
                 github_token=c.get("github_token", ""),
                 default_profile=c.get("default_profile", config.container.default_profile),
+                public_hostname=c.get("public_hostname", config.container.public_hostname),
+                port_range_start=c.get("port_range_start", config.container.port_range_start),
+                port_range_end=c.get("port_range_end", config.container.port_range_end),
+                port_bind_address=c.get("port_bind_address", config.container.port_bind_address),
+                port_network=c.get("port_network", config.container.port_network),
                 **({"profiles": profiles} if profiles else {}),
             )
 
