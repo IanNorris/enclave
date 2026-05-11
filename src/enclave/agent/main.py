@@ -7,6 +7,7 @@ and routes messages between the orchestrator and the AI model.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -709,6 +710,25 @@ def setup_session_listener(
                     # Reset lifecycle flags for next task
                     agent_state.task_done = False
                     agent_state.asked_user = False
+
+                    # Check file-based inbox for notifications from in-container services
+                    inbox_dir = Path("/workspace/.enclave/inbox")
+                    if inbox_dir.is_dir():
+                        inbox_files = sorted(inbox_dir.glob("*.json"))
+                        for inbox_file in inbox_files:
+                            try:
+                                data = json.loads(inbox_file.read_text())
+                                content = data.get("content", "")
+                                if content:
+                                    print(f"[agent] Inbox notification: {content[:80]}", file=sys.stderr)
+                                    await sdk_session.send(f"[Service Notification] {content}")
+                            except Exception as e:
+                                print(f"[agent] Inbox file error {inbox_file.name}: {e}", file=sys.stderr)
+                            finally:
+                                try:
+                                    inbox_file.unlink()
+                                except OSError:
+                                    pass
 
                     if should_continue:
                         print(
@@ -4227,6 +4247,9 @@ async def main() -> None:
         sys.exit(1)
 
     print("[agent] Connected to orchestrator", file=sys.stderr)
+
+    # Create inbox directory for in-container service notifications
+    Path("/workspace/.enclave/inbox").mkdir(parents=True, exist_ok=True)
 
     # Try to init Copilot SDK
     state = AgentState()
