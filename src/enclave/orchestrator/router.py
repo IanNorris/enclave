@@ -2155,10 +2155,6 @@ class MessageRouter:
         error: str = "",
     ) -> None:
         """Send a reply to a PORT_REQUEST message."""
-        ipc_conn = self.ipc.get_connection(session.id) if self.ipc else None
-        if not ipc_conn:
-            log.warning("Cannot reply to port_request for %s: no IPC connection", session.id)
-            return
         payload: dict[str, Any] = {}
         if error:
             payload["error"] = error
@@ -2175,7 +2171,7 @@ class MessageRouter:
             payload=payload,
             reply_to=msg.id,
         )
-        await ipc_conn.send(reply)
+        await self.ipc.send_to(session.id, reply)
 
     async def _handle_permission_request(
         self, session: Session, msg: Message
