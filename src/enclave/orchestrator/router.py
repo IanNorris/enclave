@@ -146,6 +146,9 @@ class MessageRouter:
         # Sessions currently being restored (prevent double-restore)
         self._restoring: set[str] = set()
 
+        # Sessions needing a continuation nudge after nix-shell restart
+        self._nix_shell_nudge: set[str] = set()
+
         # File watchers for workspace change notifications
         self._watchers: dict[str, WorkspaceWatcher] = {}  # session_id → watcher
 
@@ -1719,6 +1722,24 @@ class MessageRouter:
                 "Agent %s ready (copilot=%s)", session.id, copilot
             )
 
+            # Send continuation nudge after nix-shell restart
+            if session.id in self._nix_shell_nudge:
+                self._nix_shell_nudge.discard(session.id)
+                nix_path = session.nix_shell_path or "unknown"
+                nudge = Message(
+                    type=MessageType.USER_MESSAGE,
+                    payload={
+                        "content": (
+                            "[Enclave Coordinator] You have been restarted under "
+                            f"`nix-shell {nix_path}`. Your environment is now "
+                            "active. Please continue with your current task."
+                        ),
+                        "sender": "system",
+                        "room_id": session.room_id,
+                    },
+                )
+                await self.ipc.send_to(session.id, nudge)
+
             # Flush any messages queued during session restore
             pending = self._pending_messages.pop(session.id, [])
             for queued in pending:
@@ -2038,6 +2059,9 @@ class MessageRouter:
                 session.room_id,
                 f"❌ Restart failed: {error}",
             )
+        else:
+            # Mark for continuation nudge when the agent reports ready
+            self._nix_shell_nudge.add(session.id)
 
     async def _handle_port_request(
         self, session: Session, msg: Message,
