@@ -63,7 +63,7 @@ class AgentState:
     DOOM_LOOP_TIME_GATE = 300.0  # 5 minutes of continuous work before checking
     DOOM_LOOP_MIN_TURNS = 30  # don't even consider nudging below this turn count
     DOOM_LOOP_CONSECUTIVE_FAILURES = 3  # back-to-back tool failures signal distress
-    DOOM_LOOP_WINDOWED_EDITS = 5  # same file edited this many times in recent edits
+    DOOM_LOOP_WINDOWED_EDITS = 8  # same file edited this many times in recent edits
     DOOM_LOOP_EDIT_WINDOW = 15  # how many recent edits we keep for windowed detection
     DOOM_LOOP_WINDOWED_BASH = 4  # same bash command run this many times in recent bash
     DOOM_LOOP_BASH_WINDOW = 10  # how many recent bash commands we keep
@@ -373,7 +373,14 @@ def setup_session_listener(
                     # Normalise to catch minor variations: first two whitespace-
                     # separated tokens, lowercased.
                     norm = " ".join(cmd.split()[:2]).lower()[:80]
-                    agent_state.recent_bash_commands.append(norm)
+                    # Skip trivial navigation/inspection commands that
+                    # repeat naturally without indicating a loop.
+                    first_word = norm.split()[0] if norm else ""
+                    if first_word not in (
+                        "cd", "ls", "pwd", "cat", "head", "tail",
+                        "echo", "which", "type", "file", "wc",
+                    ):
+                        agent_state.recent_bash_commands.append(norm)
 
         elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:
             _set_phase("thinking")  # back to thinking between tools
