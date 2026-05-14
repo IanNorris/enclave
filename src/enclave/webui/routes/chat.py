@@ -410,13 +410,15 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
         # Sort fill responses chronologically
         unique_fill.sort(key=lambda e: e["timestamp"])
 
-        # For each NULL turn, find ALL responses in its time window and use
-        # the LAST one (intermediate responses are shown inline in event segments).
-        null_turns = [(i, t) for i, t in enumerate(turns) if t.get("assistant_response") is None]
-        for turn_pos, (turn_i, turn) in enumerate(null_turns):
+        # For each NULL turn, find responses in its time window (between this
+        # turn's timestamp and the NEXT turn's timestamp — regardless of whether
+        # the next turn has a response or not).  Use the last candidate as the
+        # main response for this turn.
+        for i, turn in enumerate(turns):
+            if turn.get("assistant_response") is not None:
+                continue
             turn_ts = turn.get("timestamp", "")
-            next_turn_ts = null_turns[turn_pos + 1][1].get("timestamp", "") if turn_pos + 1 < len(null_turns) else "9999"
-            # Collect all responses in this turn's window
+            next_turn_ts = turns[i + 1].get("timestamp", "") if i + 1 < len(turns) else "9999"
             candidates = [
                 e for e in unique_fill
                 if e["content"] not in db_responses
@@ -424,13 +426,9 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
                 and e["timestamp"] < next_turn_ts
             ]
             if candidates:
-                # Use the last response as the turn's assistant_response
                 best = candidates[-1]
                 turn["assistant_response"] = best["content"]
                 db_responses.add(best["content"])
-
-        # Any remaining unmatched responses beyond the last turn: skip them
-        # (they'll appear as event-store segment responses instead)
 
     # Prune in-memory cache entries whose content is now in the DB
     if offset == 0 and session_id in _response_cache:

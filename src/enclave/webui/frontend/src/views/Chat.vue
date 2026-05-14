@@ -446,7 +446,12 @@ async function loadHistory() {
 async function loadEvents() {
   if (!selectedSession.value) return
   try {
-    const data = await api.getChatEvents(selectedSession.value, { limit: 2000 })
+    // Only load events for the displayed turn range
+    const firstTs = turns.value.length > 0 ? turns.value[0].timestamp : null
+    const data = await api.getChatEvents(selectedSession.value, {
+      limit: 5000,
+      sinceTimestamp: firstTs || undefined,
+    })
     const events = data.events || []
     // Group events by turn, then split into segments separated by responses.
     // Each segment: { tools: [...], response: null | string }
@@ -454,12 +459,13 @@ async function loadEvents() {
     const grouped = {}
     for (const evt of events) {
       if (!['tool_start', 'tool_complete', 'file_send', 'response', 'structured_response'].includes(evt.type)) continue
-      // Find the best matching turn
+      // Find the best matching turn (latest turn that started before this event)
       let bestTurn = null
       for (const t of turns.value) {
-        if (t.turn_index == null) continue
+        const ti = t.turn_index
+        if (ti == null) continue
         if (t.timestamp && t.timestamp <= evt.timestamp) {
-          bestTurn = t.turn_index
+          bestTurn = ti
         }
       }
       if (bestTurn == null) continue

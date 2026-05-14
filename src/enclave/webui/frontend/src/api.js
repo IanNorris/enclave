@@ -76,9 +76,10 @@ export const api = {
   // Chat
   getChatHistory: (session, limit = 100, offset = 0) =>
     request(`/chat/${session}/history?limit=${limit}&offset=${offset}`),
-  getChatEvents: (session, { sinceId, level, types, limit } = {}) => {
+  getChatEvents: (session, { sinceId, sinceTimestamp, level, types, limit } = {}) => {
     const params = new URLSearchParams()
     if (sinceId != null) params.set('since_id', sinceId)
+    if (sinceTimestamp) params.set('since_timestamp', sinceTimestamp)
     if (level) params.set('level', level)
     if (types) params.set('types', types)
     if (limit) params.set('limit', limit)
