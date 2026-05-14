@@ -289,7 +289,70 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
     Supplement: event store (persisted response events) and in-memory cache.
     """
     db_path = _session_store_db(request, session_id)
-    turns = _read_turns(db_path, limit=limit, offset=offset)
+    sdk_turns = _read_turns(db_path, limit=limit, offset=offset)
+    turns = sdk_turns
+
+    # Fallback: if the SDK DB has no turns, synthesize from event store.
+    # This covers sessions where the SDK doesn't persist a session-store.db.
+    if not sdk_turns and offset == 0:
+        try:
+            from enclave.webui.event_store import get_event_store
+
+            workspace_base = _workspace_base(request)
+            store = get_event_store(workspace_base, session_id)
+            all_events = store.get_events(
+                types=["user_message", "response", "ask_user", "structured_response"],
+                limit=2000,
+            )
+            # Walk events chronologically, building synthetic turns
+            synthetic: list[dict] = []
+            current_user: str | None = None
+            current_ts: str = ""
+            responses: list[str] = []
+            for evt in all_events:
+                data = evt.get("data", {})
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except (json.JSONDecodeError, TypeError):
+                        data = {}
+                etype = evt.get("type", "")
+                if etype == "user_message":
+                    # Close previous turn
+                    if current_user is not None:
+                        synthetic.append({
+                            "turn_index": len(synthetic),
+                            "user_message": current_user,
+                            "assistant_response": "\n\n".join(responses) if responses else None,
+                            "timestamp": current_ts,
+                        })
+                        responses = []
+                    current_user = data.get("content", "")
+                    current_ts = evt.get("timestamp", "")
+                elif etype == "response":
+                    content = data.get("content", "")
+                    if content:
+                        responses.append(content)
+                elif etype == "ask_user":
+                    q = data.get("question", "")
+                    if q:
+                        responses.append(f"**Question:** {q}")
+            # Close last turn
+            if current_user is not None:
+                synthetic.append({
+                    "turn_index": len(synthetic),
+                    "user_message": current_user,
+                    "assistant_response": "\n\n".join(responses) if responses else None,
+                    "timestamp": current_ts,
+                })
+            turns = synthetic[-limit:] if len(synthetic) > limit else synthetic
+        except Exception:
+            pass
+
+    # Synthetic turns already have responses filled in — return early.
+    # Only fall through to the response-filling logic for SDK turns.
+    if not sdk_turns:
+        return {"turns": turns, "session_id": session_id}
 
     # Build a list of response content to fill NULL assistant_response fields.
     # Sources: 1) event store (persisted), 2) in-memory response cache.
