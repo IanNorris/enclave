@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-import socket
+import logging
 from pathlib import Path
-from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/asks", tags=["asks"])
 
 
@@ -22,21 +23,36 @@ def _get_store(request: Request):
     return get_deferred_asks_store(workspace_base)
 
 
-def _get_sessions(request: Request) -> dict[str, str]:
-    """Get session id → name mapping from orchestrator."""
+def _control_sock_path(request: Request) -> Path:
+    """Resolve the orchestrator control socket path."""
     config = request.app.state.config
+    return Path(config.data_dir) / "control.sock"
+
+
+async def _control_request(sock_path: Path, payload: dict, timeout: float = 5.0) -> dict | None:
+    """Send a JSON request to the control socket and return the first response."""
+    if not sock_path.exists():
+        return None
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
-        sock.connect(config.orchestrator.control_socket)
-        sock.sendall(json.dumps({"action": "list"}).encode() + b"\n")
-        data = sock.recv(65536)
-        sock.close()
-        result = json.loads(data.decode())
-        if result.get("ok"):
-            return {s["id"]: s.get("name", s["id"]) for s in result.get("sessions", [])}
-    except Exception:
-        pass
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        writer.write(json.dumps(payload).encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        if line:
+            return json.loads(line.decode())
+    except Exception as e:
+        log.warning("Control socket error: %s", e)
+    return None
+
+
+async def _get_sessions(request: Request) -> dict[str, str]:
+    """Get session id → name mapping from orchestrator."""
+    sock_path = _control_sock_path(request)
+    result = await _control_request(sock_path, {"action": "list"})
+    if result and result.get("ok"):
+        return {s["id"]: s.get("name", s["id"]) for s in result.get("sessions", [])}
     return {}
 
 
@@ -56,7 +72,7 @@ async def list_asks(
         asks = store.list_all(session_id=session_id, limit=limit)
 
     # Enrich with session names
-    sessions = _get_sessions(request)
+    sessions = await _get_sessions(request)
     for ask in asks:
         ask["session_name"] = sessions.get(ask["session_id"], ask["session_id"])
 
@@ -88,34 +104,23 @@ async def answer_ask(request: Request, ask_id: str, body: AnswerRequest):
     updated = store.answer(ask_id, body.answer)
 
     # Deliver the answer to the agent via control socket
-    config = request.app.state.config
-    try:
-        # Build a contextual message so the agent can resume
-        parts = [f'[Deferred answer] Re: "{ask["question"]}"']
-        if ask.get("context"):
-            parts.append(f"Context: {ask['context']}")
-        parts.append(f"Answer: {body.answer}")
-        message = "\n".join(parts)
+    parts = [f'[Deferred answer] Re: "{ask["question"]}"']
+    if ask.get("context"):
+        parts.append(f"Context: {ask['context']}")
+    parts.append(f"Answer: {body.answer}")
+    message = "\n".join(parts)
 
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect(config.orchestrator.control_socket)
-        sock.sendall(
-            json.dumps({
-                "action": "send",
-                "session": ask["session_id"],
-                "content": message,
-            }).encode()
-            + b"\n"
-        )
-        # Read response
-        data = sock.recv(65536)
-        sock.close()
-    except Exception as e:
-        # Answer is saved even if delivery fails
-        pass
+    sock_path = _control_sock_path(request)
+    result = await _control_request(
+        sock_path,
+        {"action": "send", "session": ask["session_id"], "content": message},
+        timeout=10.0,
+    )
+    delivered = result is not None and result.get("ok", False)
+    if not delivered:
+        log.warning("Failed to deliver deferred answer to %s: %s", ask["session_id"], result)
 
-    return {"ok": True, "ask": updated}
+    return {"ok": True, "ask": updated, "delivered": delivered}
 
 
 @router.post("/{ask_id}/dismiss")
