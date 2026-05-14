@@ -391,10 +391,27 @@ function handleStreamEvent(msg) {
     if (idx >= 0) {
       turns.value[idx] = msg
     } else {
-      // Remove any queued message that matches this turn's user_message
+      // Remove any queued message that matches this turn's user_message.
+      // The SDK wraps messages with <current_datetime>, so check if the
+      // turn's user_message contains the queued text (or vice versa).
       if (msg.user_message) {
-        const qIdx = turns.value.findIndex(t => t.source === 'queued' && t.user_message === msg.user_message)
+        const qIdx = turns.value.findIndex(t =>
+          t.source === 'queued' && (
+            t.user_message === msg.user_message ||
+            msg.user_message.includes(t.user_message)
+          )
+        )
         if (qIdx >= 0) turns.value.splice(qIdx, 1)
+      }
+      // If no exact match found, remove the most recent queued message
+      // (the agent can only respond to the latest queued message)
+      if (msg.user_message) {
+        for (let i = turns.value.length - 1; i >= 0; i--) {
+          if (turns.value[i].source === 'queued') {
+            turns.value.splice(i, 1)
+            break
+          }
+        }
       }
       // Remove any live-cache entry that matches this turn's assistant_response
       if (msg.assistant_response) {
