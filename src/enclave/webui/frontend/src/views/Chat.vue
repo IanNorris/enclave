@@ -67,7 +67,7 @@
             </div>
           </template>
 
-          <div v-if="turn.assistant_response" class="message assistant-message">
+          <div v-if="turn.assistant_response" class="message assistant-message" :class="{ 'major-response': turn.is_major || (!turn.user_message && turn.assistant_response) }">
             <div class="message-meta">
               <span class="sender">Agent</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
@@ -514,13 +514,27 @@ function handleStreamEvent(msg) {
   }
 
   if (type === 'response') {
-    // Final response text — keep it visible until the turn poll picks it up
+    // Final response — promote to a synthetic turn immediately so it
+    // survives live state clears (turn_start, next response, etc.).
+    // The SQLite poll will eventually replace it with the real turn.
     if (msg.content) {
-      streamingText.value = msg.content
+      // Remove any existing live-source turn with the same content
+      const existIdx = turns.value.findIndex(t => t.source === 'live' && t.assistant_response === msg.content)
+      if (existIdx < 0) {
+        turns.value.push({
+          turn_index: null,
+          user_message: null,
+          assistant_response: msg.content,
+          timestamp: new Date().toISOString(),
+          source: 'live',
+          is_major: true,
+        })
+      }
+      streamingText.value = ''
     }
     activityText.value = ''
-    // Collapse all remaining live events
     liveEvents.value.forEach(e => { e.collapsed = true })
+    nextTick(() => scrollToBottom())
     return
   }
 
@@ -776,6 +790,12 @@ function formatTime(ts) {
   align-self: flex-start;
   background: var(--bg-card);
   border: 1px solid var(--border);
+}
+
+.assistant-message.major-response {
+  border-left: 3px solid #4ade80;
+  background: linear-gradient(90deg, rgba(74, 222, 128, 0.06) 0%, var(--bg-card) 40%);
+  box-shadow: -2px 0 8px rgba(74, 222, 128, 0.08);
 }
 
 .message-meta {
