@@ -1087,71 +1087,16 @@ class MessageRouter:
     async def _handle_agent_delta(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle a streaming text delta — update content, flush via timer."""
+        """Handle a streaming text delta — WebUI only (no Matrix streaming).
+
+        The final AGENT_RESPONSE will post the complete text to Matrix.
+        Streaming deltas are forwarded only to the control socket for the
+        WebUI's real-time display.
+        """
         content = msg.payload.get("content", "")
         if not content:
             return
         self._control.notify_delta(session.id, content)
-        reply_to = msg.payload.get("in_reply_to") or msg.reply_to
-
-        stream = self._streaming.get(session.id)
-        # If the stream belongs to a different user turn, finalize it and
-        # start a new message. This prevents a stale stream (e.g. a turn
-        # that ended without an AGENT_RESPONSE) from capturing deltas
-        # belonging to a subsequent reply.
-        if stream is not None and reply_to and stream.get("reply_to") and stream.get("reply_to") != reply_to:
-            await self._finalize_stale_stream(session)
-            stream = None
-        if stream is not None:
-            # Fast path (no lock): just update content if longer
-            if len(content) > len(stream.get("content", "")):
-                stream["content"] = content
-                self._schedule_stream_flush(session.id)
-            return
-
-        # Slow path: need to create the initial message (lock to prevent dupes)
-        async with self._get_stream_lock(session.id):
-            # Double-check after acquiring lock
-            stream = self._streaming.get(session.id)
-            if stream is not None and reply_to and stream.get("reply_to") and stream.get("reply_to") != reply_to:
-                await self._finalize_stale_stream(session)
-                stream = None
-            if stream is not None:
-                if len(content) > len(stream.get("content", "")):
-                    stream["content"] = content
-                    self._schedule_stream_flush(session.id)
-                return
-
-            # Finalize thinking stream now that response is starting
-            thinking_stream = self._thinking_stream.pop(session.id, None)
-            if thinking_stream and thinking_stream.get("event_id") and thinking_stream.get("content"):
-                preview = thinking_stream["content"].replace("\n", " ")
-                if len(preview) > 800:
-                    preview = preview[:800] + "…"
-                plain = f"🤔 {preview}"
-                html = f"🤔 <i>{_html_escape(preview)}</i>"
-                await self.matrix.edit_message(
-                    session.room_id, thinking_stream["event_id"],
-                    plain, html_body=html,
-                )
-            # Cancel any thinking flush timer
-            self._cancel_stream_flush(session.id, thinking=True)
-
-            thread_id = self._thread_events.get(session.id)
-            self._activity_msg.pop(session.id, None)
-            self._activity_lines.pop(session.id, None)
-            event_id = await self.matrix.send_message(
-                session.room_id,
-                content + " ▍",
-                thread_event_id=thread_id,
-            )
-            self._streaming[session.id] = {
-                "event_id": event_id,
-                "last_edit": time.monotonic(),
-                "content": content,
-                "reply_to": reply_to,
-            }
-            self._schedule_stream_flush(session.id)
 
     async def _finalize_stale_stream(self, session: Session) -> None:
         """Finalize a stream belonging to a previous turn: strip the cursor
@@ -1173,98 +1118,40 @@ class MessageRouter:
     async def _handle_agent_thinking(
         self, session: Session, msg: Message
     ) -> None:
-        """Handle an intent/thinking/reasoning update — show as status message."""
+        """Handle an intent/thinking/reasoning update — WebUI only.
+
+        All thinking/reasoning events go to the control socket (WebUI) but
+        are suppressed from Matrix to reduce notification volume.
+        """
         # Skip activity in sub-agent threads (high volume, rarely useful to user)
         if session.id in self._subagent_threads:
             return
-        thread_id = self._thread_events.get(session.id)
 
         # Short intent (e.g. "Exploring the codebase")
         intent = msg.payload.get("intent", "")
         if intent:
             log.debug("Agent %s intent: %s", session.id, intent)
             self._control.notify_activity(session.id, f"💭 {intent}")
-            plain = f"💭 {intent}"
-            html = f"💭 <i>{_html_escape(intent)}</i>"
-            await self._update_activity(session, plain, thread_id, html=html)
             return
 
-        # Accumulated thinking content (streaming edit-in-place)
+        # Accumulated thinking content (streaming)
         thinking = msg.payload.get("thinking_content", "")
         if thinking:
             self._control.notify_thinking(session.id, thinking, "delta")
-            stream = self._thinking_stream.get(session.id)
-            if stream is not None:
-                # Fast path: just update content if longer
-                if len(thinking) > len(stream.get("content", "")):
-                    stream["content"] = thinking
-                    self._schedule_stream_flush(session.id, thinking=True)
-                return
-
-            # Slow path: create initial thinking message (lock to prevent dupes)
-            async with self._get_stream_lock(session.id):
-                stream = self._thinking_stream.get(session.id)
-                if stream is not None:
-                    if len(thinking) > len(stream.get("content", "")):
-                        stream["content"] = thinking
-                        self._schedule_stream_flush(session.id, thinking=True)
-                    return
-
-                self._activity_msg.pop(session.id, None)
-                self._activity_lines.pop(session.id, None)
-                preview = thinking.replace("\n", " ")
-                if len(preview) > 800:
-                    preview = preview[:800] + "…"
-                plain = f"🤔 {preview} 🤔"
-                html = f"🤔 <i>{_html_escape(preview)}</i> 🤔"
-                event_id = await self.matrix.send_message(
-                    session.room_id, plain,
-                    html_body=html,
-                    thread_event_id=thread_id,
-                )
-                self._thinking_stream[session.id] = {
-                    "event_id": event_id,
-                    "last_edit": time.monotonic(),
-                    "content": thinking,
-                }
-                self._schedule_stream_flush(session.id, thinking=True)
             return
 
         # Full reasoning text (complete thinking block)
         reasoning = msg.payload.get("reasoning", "")
         if reasoning:
             self._control.notify_thinking(session.id, reasoning, "end")
-            # Cancel any pending thinking flush
-            self._cancel_stream_flush(session.id, thinking=True)
-            async with self._get_stream_lock(session.id):
-                preview = reasoning[:500].replace("\n", " ")
-                if len(reasoning) > 500:
-                    preview += "…"
-                log.debug("Agent %s reasoning: %s", session.id, preview[:80])
-                plain = f"🤔 {preview}"
-                html = f"🤔 <i>{_html_escape(preview)}</i>"
-                stream = self._thinking_stream.pop(session.id, None)
-                if stream and stream.get("event_id"):
-                    await self.matrix.edit_message(
-                        session.room_id, stream["event_id"],
-                        plain, html_body=html,
-                    )
-                else:
-                    await self.matrix.send_message(
-                        session.room_id, plain, thread_event_id=thread_id,
-                        html_body=html,
-                    )
             return
 
-        # Streaming reasoning delta — show via activity (transient)
+        # Streaming reasoning delta
         delta = msg.payload.get("reasoning_delta", "")
         if delta:
             preview = delta.strip()[:150].replace("\n", " ")
             if preview:
                 self._control.notify_thinking(session.id, preview, "delta")
-                plain = f"🤔 …{preview}"
-                html = f"🤔 <i>…{_html_escape(preview)}</i>"
-                await self._update_activity(session, plain, thread_id, html=html)
 
     # Friendly display names for common SDK tools
     _TOOL_LABELS: dict[str, str] = {
@@ -1344,8 +1231,8 @@ class MessageRouter:
             self._mimir_librarian.trigger(
                 f"mimir_record by {session.id}"
             )
-        # Keep typing indicator while more work may come
-        await self.matrix.set_typing(session.room_id, True)
+        # No Matrix activity messages anymore — typing indicator is managed
+        # only at turn_start (via refresh loop) and cleared on agent_response.
 
     # ── Typing indicator refresh ──
 
@@ -1529,27 +1416,16 @@ class MessageRouter:
         self, session: Session, text: str, thread_id: str | None,
         html: str | None = None,
     ) -> None:
-        """Buffer an activity line and schedule a throttled flush to Matrix.
+        """Buffer an activity line — WebUI-only (suppressed from Matrix).
 
-        Lines accumulate and are sent/edited as a batch no more often than
-        _ACTIVITY_THROTTLE seconds. This dramatically reduces Matrix event
-        volume while keeping the activity log readable.
+        Minor events (tool calls, thinking) are sent only to the control
+        socket (WebUI) to avoid flooding Matrix and draining phone battery.
+        The control socket notify_* calls happen at the call sites before
+        this function is invoked.
         """
-        lines = self._activity_lines.setdefault(session.id, [])
-        lines.append((text, html or text))
-        self._activity_thread_ids[session.id] = thread_id
-
-        now = time.monotonic()
-        last = self._activity_last_flush.get(session.id, 0.0)
-
-        if now - last >= _ACTIVITY_THROTTLE:
-            await self._flush_activity(session)
-        elif session.id not in self._activity_flush_tasks:
-            delay = _ACTIVITY_THROTTLE - (now - last)
-            task = asyncio.create_task(
-                self._delayed_activity_flush(session.id, delay)
-            )
-            self._activity_flush_tasks[session.id] = task
+        # Suppressed from Matrix — minor events go to WebUI only via
+        # control socket notify_* calls at the call sites.
+        return
 
     async def _delayed_activity_flush(
         self, session_id: str, delay: float
@@ -1612,12 +1488,12 @@ class MessageRouter:
     async def _handle_agent_response(
         self, session: Session, msg: Message
     ) -> None:
-        """Forward the final agent response to the Matrix room."""
+        """Forward the final agent response to the Matrix room (major event)."""
         content = msg.payload.get("content", "")
         if not content:
             return
 
-        # Notify control socket subscribers
+        # Notify control socket subscribers (WebUI)
         self._control.notify_response(session.id, content)
 
         thread_id = self._thread_events.get(session.id)
@@ -1626,41 +1502,16 @@ class MessageRouter:
             session.room_id, thread_id, content[:80],
         )
 
-        # Stop typing and flush any remaining buffered activity
+        # Stop typing
         self._stop_typing_refresh(session.id)
         await self.matrix.set_typing(session.room_id, False)
-        task = self._activity_flush_tasks.pop(session.id, None)
-        if task and not task.done():
-            task.cancel()
-        if self._activity_lines.get(session.id):
-            await self._flush_activity(session)
 
-        # Detach activity tracking (keep messages — volume purge handles cleanup)
-        self._activity_msg.pop(session.id, None)
-        self._activity_lines.pop(session.id, None)
-        self._activity_event_ids.pop(session.id, None)
-        self._activity_last_flush.pop(session.id, None)
-        self._activity_thread_ids.pop(session.id, None)
-
-        # If we have a streaming message, edit it with final content.
-        # Otherwise, send a new message.
-        # Cancel any pending flush timers first
-        self._cancel_stream_flush(session.id)
-        self._cancel_stream_flush(session.id, thinking=True)
-        self._thinking_stream.pop(session.id, None)
-        stream = self._streaming.pop(session.id, None)
-        if stream and stream.get("event_id"):
-            await self.matrix.edit_message(
-                session.room_id,
-                stream["event_id"],
-                content,
-            )
-        else:
-            await self.matrix.send_message(
-                session.room_id,
-                content,
-                thread_event_id=thread_id,
-            )
+        # Send to Matrix (this is the major event — the only message per response)
+        await self.matrix.send_message(
+            session.room_id,
+            content,
+            thread_event_id=thread_id,
+        )
 
         # Complete the emoji flow: remove 🤔, add ✅
         user_event_id = self._thread_events.pop(
@@ -1885,6 +1736,16 @@ class MessageRouter:
         event_id = await self.matrix.upload_file(
             session.room_id, host_path, body=body
         )
+
+        # Notify WebUI so images show in the web interface
+        if event_id:
+            import mimetypes
+            mimetype = mimetypes.guess_type(file_path)[0] or ""
+            filename = os.path.basename(file_path)
+            self._control.notify_file_send(
+                session.id, filename=filename, mimetype=mimetype,
+                event_id=event_id,
+            )
 
         return Message(
             type=MessageType.AGENT_RESPONSE,

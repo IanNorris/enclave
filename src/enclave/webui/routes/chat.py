@@ -55,6 +55,22 @@ def _workspace_base(request: Request) -> Path:
     return Path(request.app.state.config.container.workspace_base)
 
 
+def _persist_event(config: Any, session_id: str, event: dict) -> None:
+    """Persist a control socket event to the session's event store."""
+    from enclave.webui.event_store import get_event_store
+    event_type = event.get("type", "")
+    if not event_type:
+        return
+    try:
+        workspace_base = Path(config.container.workspace_base)
+        store = get_event_store(workspace_base, session_id)
+        # Store all event data except the "ok" and "type" fields (redundant)
+        data = {k: v for k, v in event.items() if k not in ("ok", "type")}
+        store.append(event_type, data)
+    except Exception:
+        pass  # Don't let persistence failures break streaming
+
+
 def _session_store_db(request: Request, session_id: str) -> Path:
     """Path to a session's Copilot state DB."""
     ws = _workspace_base(request) / session_id / ".copilot-state" / "session-store.db"
@@ -323,6 +339,39 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
     return {"turns": turns, "session_id": session_id}
 
 
+@router.get("/{session_id}/events")
+async def get_events(
+    request: Request,
+    session_id: str,
+    since_id: int | None = None,
+    since_timestamp: str | None = None,
+    types: str | None = None,
+    level: str = "full",
+    limit: int = 500,
+):
+    """Get persisted events for a session.
+
+    Query params:
+        since_id: return events after this id
+        since_timestamp: return events after this ISO timestamp
+        types: comma-separated event types to filter (e.g. "tool_start,response")
+        level: "full" (all events) or "major" (responses, files, asks, turns only)
+        limit: max events to return (default 500)
+    """
+    from enclave.webui.event_store import get_event_store
+    workspace_base = _workspace_base(request)
+    store = get_event_store(workspace_base, session_id)
+    type_list = types.split(",") if types else None
+    events = store.get_events(
+        since_id=since_id,
+        since_timestamp=since_timestamp,
+        types=type_list,
+        level=level,
+        limit=limit,
+    )
+    return {"events": events, "session_id": session_id}
+
+
 @router.post("/{session_id}/send")
 async def send_message(request: Request, session_id: str, body: SendMessage):
     """Send a message to a session's agent via control socket (preferred) or Matrix."""
@@ -541,6 +590,9 @@ async def stream_conversation(websocket: WebSocket, session_id: str, token: str 
                         continue
                     if event.get("type") in ("ping", "subscribed"):
                         continue
+
+                    # Persist event to the event store (all types)
+                    _persist_event(config, session_id, event)
 
                     # Cache response events for history supplement
                     if event.get("type") == "response" and event.get("content"):

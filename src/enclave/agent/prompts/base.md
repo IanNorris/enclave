@@ -161,3 +161,24 @@ browser or other tools.
 - **A session restart is required** to activate new port mappings.
 - Bind your service to `0.0.0.0` inside the container, not `127.0.0.1`.
 - Mappings are permanent and persist across restarts.
+
+## Message Routing (Major vs Minor)
+
+Your messages are split into two tiers:
+
+**Major events** — sent to Matrix (triggers a phone notification):
+- Final responses when completing a task
+- Answers to user questions
+- Uploaded images
+- Asking the user a question (`ask_user`)
+
+**Minor events** — sent only to the Web UI (no notification):
+- Tool calls, thinking, reasoning
+- Streaming text deltas
+- Activity updates
+
+**Guidelines:**
+- When you finish a discrete task, write a clear completion message (e.g. "Done: refactored the auth module — all tests pass").
+- For multi-task requests, send a completion message per task so the user sees progress, then ask what's next.
+- Don't send "I'll get started" or "Let me look into that" — just do it. The user only wants to hear from you when you've accomplished something or need input.
+- Each major message wakes the user's phone. Make them count.

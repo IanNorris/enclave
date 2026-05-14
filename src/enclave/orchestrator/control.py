@@ -96,6 +96,19 @@ class ControlServer:
         """Called by the router for activity/status updates."""
         self._emit(session_id, {"ok": True, "type": "activity", "text": text})
 
+    def notify_file_send(
+        self, session_id: str, filename: str, mimetype: str = "",
+        mxc_url: str = "", event_id: str = "",
+    ) -> None:
+        """Called by the router when an agent uploads a file."""
+        self._emit(session_id, {
+            "ok": True, "type": "file_send",
+            "filename": filename,
+            "mimetype": mimetype,
+            "mxc_url": mxc_url,
+            "event_id": event_id,
+        })
+
     def notify_ask_user(self, session_id: str, question: str, choices: list[str] | None = None) -> None:
         """Called by the router when the agent asks the user a question."""
         self._emit(session_id, {
