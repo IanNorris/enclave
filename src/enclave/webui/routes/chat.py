@@ -59,6 +59,7 @@ def _workspace_base(request: Request) -> Path:
 # Excludes streaming deltas, thinking tokens, activity, and turn markers.
 _PERSIST_TYPES = frozenset({
     "tool_start", "tool_complete", "response", "file_send", "ask_user",
+    "user_message",
 })
 
 
@@ -285,34 +286,71 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
     """Get conversation history for a session.
 
     Primary source: session-store.db (SDK turns).
-    Supplement: in-memory response cache for recent agent activity not yet in DB.
+    Supplement: event store (persisted response events) and in-memory cache.
     """
     db_path = _session_store_db(request, session_id)
     turns = _read_turns(db_path, limit=limit, offset=offset)
 
-    # Supplement turns that have NULL assistant_response with cached responses.
-    # Also append any truly new responses not yet in the DB.
-    if offset == 0 and session_id in _response_cache:
-        last_db_ts = ""
-        if turns:
-            last_db_ts = turns[-1].get("timestamp", "")
+    # Build a list of response content to fill NULL assistant_response fields.
+    # Sources: 1) event store (persisted), 2) in-memory response cache.
+    fill_responses: list[dict] = []  # [{content, timestamp}, ...]
 
-        # Collect assistant responses from DB turns for dedup
+    # 1) Event store responses
+    try:
+        from enclave.webui.event_store import get_event_store
+        workspace_base = _workspace_base(request)
+        store = get_event_store(workspace_base, session_id)
+        resp_events = store.get_events(types="response", limit=500)
+        for evt in resp_events:
+            data = evt.get("data", {})
+            if isinstance(data, str):
+                import json as _json
+                try:
+                    data = _json.loads(data)
+                except (ValueError, TypeError):
+                    data = {}
+            content = data.get("content", "")
+            if content:
+                fill_responses.append({
+                    "content": content,
+                    "timestamp": evt.get("timestamp", ""),
+                })
+    except Exception:
+        pass
+
+    # 2) In-memory response cache
+    if session_id in _response_cache:
+        for entry in _response_cache.get(session_id, []):
+            fill_responses.append({
+                "content": entry["content"],
+                "timestamp": entry["timestamp"],
+            })
+
+    # Dedup fill_responses
+    seen = set()
+    unique_fill: list[dict] = []
+    for fr in fill_responses:
+        if fr["content"] not in seen:
+            seen.add(fr["content"])
+            unique_fill.append(fr)
+
+    # Fill NULL assistant_response in turns
+    if unique_fill:
+        # Collect existing responses for dedup
         db_responses = set()
         for t in turns:
             resp = t.get("assistant_response")
             if resp:
                 db_responses.add(resp)
 
-        cached = _response_cache.get(session_id, [])
-        unmatched_cache = []
+        last_db_ts = turns[-1].get("timestamp", "") if turns else ""
+        unmatched = []
 
-        for entry in cached:
+        for entry in unique_fill:
             if entry["content"] in db_responses:
-                continue  # Already in DB, skip
+                continue
 
             # Try to match to a turn with NULL assistant_response
-            # Find the turn whose timestamp is closest-before this cache entry
             matched = False
             for t in reversed(turns):
                 if t.get("assistant_response") is not None:
@@ -320,14 +358,15 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
                 turn_ts = t.get("timestamp", "")
                 if turn_ts and turn_ts <= entry["timestamp"]:
                     t["assistant_response"] = entry["content"]
+                    db_responses.add(entry["content"])
                     matched = True
                     break
 
-            if not matched and entry["timestamp"] > last_db_ts:
-                unmatched_cache.append(entry)
+            if not matched and offset == 0 and entry["timestamp"] > last_db_ts:
+                unmatched.append(entry)
 
-        # Append any unmatched responses newer than the last DB turn
-        for entry in unmatched_cache:
+        # Append unmatched responses newer than the last DB turn
+        for entry in unmatched:
             turns.append({
                 "turn_index": None,
                 "user_message": None,
@@ -336,12 +375,14 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
                 "source": "live",
             })
 
-        # Prune cache entries whose content is already in the DB
-        if cached:
-            _response_cache[session_id] = [
-                e for e in cached if e["content"] not in db_responses
-            ]
-            _persist_response_cache()
+    # Prune in-memory cache entries whose content is now in the DB
+    if offset == 0 and session_id in _response_cache:
+        db_responses_final = {t.get("assistant_response") for t in turns if t.get("assistant_response")}
+        _response_cache[session_id] = [
+            e for e in _response_cache.get(session_id, [])
+            if e["content"] not in db_responses_final
+        ]
+        _persist_response_cache()
 
     return {"turns": turns, "session_id": session_id}
 
@@ -382,6 +423,12 @@ async def get_events(
 @router.post("/{session_id}/send")
 async def send_message(request: Request, session_id: str, body: SendMessage):
     """Send a message to a session's agent via control socket (preferred) or Matrix."""
+    # Persist user message in event store for history reconstruction
+    _persist_event(request.app.state.config, session_id, {
+        "type": "user_message",
+        "content": body.content,
+    })
+
     # Try control socket first — this properly wakes idle/stopped agents
     data_dir = Path(request.app.state.config.data_dir)
     sent = await _send_via_control_socket(data_dir, session_id, body.content)
