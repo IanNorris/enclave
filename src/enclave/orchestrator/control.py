@@ -117,6 +117,10 @@ class ControlServer:
             "choices": choices or [],
         })
 
+    def notify_structured_response(self, session_id: str, payload: dict) -> None:
+        """Called by the router for structured agent responses (rich cards)."""
+        self._emit(session_id, {"ok": True, "type": "structured_response", **payload})
+
     def notify_turn_start(self, session_id: str) -> None:
         """Called by the router when an agent turn begins."""
         self._emit(session_id, {"ok": True, "type": "turn_start"})

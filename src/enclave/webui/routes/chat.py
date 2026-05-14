@@ -59,7 +59,7 @@ def _workspace_base(request: Request) -> Path:
 # Excludes streaming deltas, thinking tokens, activity, and turn markers.
 _PERSIST_TYPES = frozenset({
     "tool_start", "tool_complete", "response", "file_send", "ask_user",
-    "user_message",
+    "user_message", "structured_response",
 })
 
 
@@ -557,6 +557,35 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
     return {"sent": True, "via": "matrix_only", "filename": filename}
 
 
+@router.get("/{session_id}/file/{file_path:path}")
+async def proxy_workspace_file(request: Request, session_id: str, file_path: str):
+    """Serve a file from the agent's workspace (for structured message images)."""
+    import mimetypes
+    from fastapi.responses import Response
+
+    config = request.app.state.config
+    workspace_base = Path(config.container.workspace_base)
+    # Resolve the workspace for this session
+    workspace = workspace_base / session_id
+    if not workspace.exists():
+        # Try finding workspace by prefix match
+        for d in workspace_base.iterdir():
+            if d.is_dir() and d.name.startswith(session_id.split("-")[0]):
+                workspace = d
+                break
+
+    # Resolve and sanitize — must stay within workspace
+    resolved = (workspace / file_path).resolve()
+    if not str(resolved).startswith(str(workspace.resolve())):
+        raise HTTPException(status_code=403, detail="Path traversal denied")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    content = resolved.read_bytes()
+    ct = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+    return Response(content=content, media_type=ct)
+
+
 @router.get("/media/{server_name}/{media_id}")
 async def proxy_matrix_media(request: Request, server_name: str, media_id: str):
     """Proxy Matrix media (mxc://) so the browser can display images."""
@@ -642,7 +671,14 @@ async def stream_conversation(websocket: WebSocket, session_id: str, token: str 
                     _persist_event(config, session_id, event)
 
                     # Cache response events for history supplement
-                    if event.get("type") == "response" and event.get("content"):
+                    etype = event.get("type")
+                    cache_content = None
+                    if etype == "response" and event.get("content"):
+                        cache_content = event["content"]
+                    elif etype == "structured_response" and event.get("summary"):
+                        # For history gap-fill, cache the summary as the turn's response
+                        cache_content = event.get("summary", "")
+                    if cache_content:
                         from datetime import datetime, timezone
                         ts = datetime.now(timezone.utc).strftime(
                             "%Y-%m-%dT%H:%M:%S.%f"
@@ -650,8 +686,9 @@ async def stream_conversation(websocket: WebSocket, session_id: str, token: str 
                         cache = _response_cache.setdefault(session_id, [])
                         cache.append({
                             "role": "assistant",
-                            "content": event["content"],
+                            "content": cache_content,
                             "timestamp": ts,
+                            "structured": event if etype == "structured_response" else None,
                         })
                         # Keep cache bounded
                         if len(cache) > 200:

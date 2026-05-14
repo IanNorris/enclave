@@ -82,7 +82,38 @@
             </div>
           </template>
 
-          <div v-if="turn.assistant_response" class="message assistant-message" :class="{ 'major-response': turn.is_major || (!turn.user_message && turn.assistant_response) }">
+          <!-- Structured response card -->
+          <div v-if="turn.structured" class="message assistant-message structured-card major-response">
+            <div class="structured-title" v-if="turn.structured.title">{{ turn.structured.title }}</div>
+            <div class="structured-summary" v-html="renderMarkdown(turn.structured.summary)"></div>
+            <div v-if="turn.structured.images?.length" class="structured-images">
+              <img v-for="(img, ii) in turn.structured.images" :key="ii"
+                   :src="`/api/chat/${selectedSession}/file/${encodeURIComponent(img)}`"
+                   class="structured-img" @click="lightboxImage = img" />
+            </div>
+            <details v-if="turn.structured.details" class="structured-details">
+              <summary>Details</summary>
+              <div class="structured-details-body" v-html="renderMarkdown(turn.structured.details)"></div>
+              <div class="structured-details-actions">
+                <button class="btn-sm" @click="downloadMarkdown(turn.structured)">📥 Download as Markdown</button>
+              </div>
+            </details>
+            <div v-if="turn.structured.actions?.length" class="structured-actions">
+              <div v-for="(action, ai) in turn.structured.actions" :key="ai" class="structured-action">
+                <img v-if="action.image"
+                     :src="`/api/chat/${selectedSession}/file/${encodeURIComponent(action.image)}`"
+                     class="action-img" />
+                <button class="action-btn" @click="sendActionReply(action.label)">{{ action.label }}</button>
+              </div>
+            </div>
+            <div class="message-meta">
+              <span class="sender">Agent</span>
+              <span class="time">{{ formatTime(turn.timestamp) }}</span>
+            </div>
+          </div>
+
+          <!-- Regular response (non-structured) -->
+          <div v-else-if="turn.assistant_response" class="message assistant-message" :class="{ 'major-response': turn.is_major || (!turn.user_message && turn.assistant_response) }">
             <div class="message-meta">
               <span class="sender">Agent</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
@@ -332,7 +363,7 @@ async function loadEvents() {
     // This preserves the chronological interleaving of tool calls and responses.
     const grouped = {}
     for (const evt of events) {
-      if (!['tool_start', 'tool_complete', 'file_send', 'response'].includes(evt.type)) continue
+      if (!['tool_start', 'tool_complete', 'file_send', 'response', 'structured_response'].includes(evt.type)) continue
       // Find the best matching turn
       let bestTurn = null
       for (const t of turns.value) {
@@ -345,7 +376,14 @@ async function loadEvents() {
       if (!grouped[bestTurn]) grouped[bestTurn] = [{ tools: [], response: null }]
 
       const segments = grouped[bestTurn]
-      if (evt.type === 'response') {
+      if (evt.type === 'structured_response') {
+        // Apply structured data to the matching turn
+        const matchTurn = turns.value.find(t => t.turn_index === bestTurn)
+        if (matchTurn) {
+          matchTurn.structured = evt.data || {}
+          matchTurn.is_major = true
+        }
+      } else if (evt.type === 'response') {
         // A response closes the current segment and starts a new one
         const content = evt.data?.content || ''
         if (content) {
@@ -472,15 +510,15 @@ function handleStreamEvent(msg) {
             msg.user_message.includes(t.user_message)
           )
         )
-        if (qIdx >= 0) turns.value.splice(qIdx, 1)
-      }
-      // If no exact match found, remove the most recent queued message
-      // (the agent can only respond to the latest queued message)
-      if (msg.user_message) {
-        for (let i = turns.value.length - 1; i >= 0; i--) {
-          if (turns.value[i].source === 'queued') {
-            turns.value.splice(i, 1)
-            break
+        if (qIdx >= 0) {
+          turns.value.splice(qIdx, 1)
+        } else {
+          // Fallback: remove the most recent queued message
+          for (let i = turns.value.length - 1; i >= 0; i--) {
+            if (turns.value[i].source === 'queued') {
+              turns.value.splice(i, 1)
+              break
+            }
           }
         }
       }
@@ -488,8 +526,9 @@ function handleStreamEvent(msg) {
       if (msg.assistant_response) {
         const lIdx = turns.value.findIndex(t => t.source === 'live' && t.assistant_response === msg.assistant_response)
         if (lIdx >= 0) {
-          // Preserve is_major from the live turn
+          // Preserve is_major and structured data from the live turn
           if (turns.value[lIdx].is_major) msg.is_major = true
+          if (turns.value[lIdx].structured) msg.structured = turns.value[lIdx].structured
           turns.value.splice(lIdx, 1)
         }
       }
@@ -612,6 +651,33 @@ function handleStreamEvent(msg) {
           is_major: true,
         })
       }
+      streamingText.value = ''
+    }
+    activityText.value = ''
+    liveEvents.value.forEach(e => { e.collapsed = true })
+    nextTick(() => scrollToBottom())
+    return
+  }
+
+  if (type === 'structured_response') {
+    setAgentState('responding')
+    const summary = msg.summary || ''
+    if (summary) {
+      turns.value.push({
+        turn_index: null,
+        user_message: null,
+        assistant_response: summary,
+        timestamp: new Date().toISOString(),
+        source: 'live',
+        is_major: true,
+        structured: {
+          title: msg.title || '',
+          summary: msg.summary || '',
+          details: msg.details || '',
+          actions: msg.actions || [],
+          images: msg.images || [],
+        },
+      })
       streamingText.value = ''
     }
     activityText.value = ''
@@ -790,6 +856,32 @@ function renderMarkdown(text) {
   return md.render(display)
 }
 
+function downloadMarkdown(structured) {
+  const parts = []
+  if (structured.title) parts.push(`# ${structured.title}\n`)
+  if (structured.summary) parts.push(structured.summary + '\n')
+  if (structured.details) parts.push('---\n\n' + structured.details + '\n')
+  if (structured.actions?.length) {
+    parts.push('## Options\n')
+    structured.actions.forEach((a, i) => parts.push(`${i + 1}. ${a.label}\n`))
+  }
+  const blob = new Blob([parts.join('\n')], { type: 'text/markdown' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = (structured.title || 'response').replace(/[^a-zA-Z0-9_-]/g, '_') + '.md'
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function sendActionReply(label) {
+  if (!selectedSession.value) return
+  userMessage.value = label
+  sendMessage()
+}
+
+const lightboxImage = ref(null)
+
 function formatTime(ts) {
   if (!ts) return ''
   const d = new Date(ts)
@@ -937,6 +1029,137 @@ function formatTime(ts) {
   border-left: 3px solid #4ade80;
   background: linear-gradient(90deg, rgba(74, 222, 128, 0.06) 0%, var(--bg-card) 40%);
   box-shadow: -2px 0 8px rgba(74, 222, 128, 0.08);
+}
+
+/* Structured message cards */
+.structured-card {
+  padding: 1rem;
+}
+
+.structured-card .message-meta {
+  margin-top: 0.75rem;
+  margin-bottom: 0;
+}
+
+.structured-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  color: #e2e8f0;
+}
+
+.structured-summary {
+  margin-bottom: 0.5rem;
+}
+
+.structured-summary :deep(p) {
+  margin: 0.25rem 0;
+}
+
+.structured-images {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.5rem 0;
+}
+
+.structured-img {
+  max-width: 200px;
+  max-height: 150px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.1);
+  transition: transform 0.15s;
+}
+
+.structured-img:hover {
+  transform: scale(1.05);
+}
+
+.structured-details {
+  margin: 0.5rem 0;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.structured-details > summary {
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: #94a3b8;
+  background: rgba(255,255,255,0.03);
+  user-select: none;
+}
+
+.structured-details > summary:hover {
+  color: #e2e8f0;
+  background: rgba(255,255,255,0.06);
+}
+
+.structured-details-body {
+  padding: 0.75rem;
+  font-size: 0.9rem;
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
+
+.structured-details-actions {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
+
+.btn-sm {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 4px;
+  background: rgba(255,255,255,0.05);
+  color: #94a3b8;
+  cursor: pointer;
+}
+
+.btn-sm:hover {
+  background: rgba(255,255,255,0.1);
+  color: #e2e8f0;
+}
+
+.structured-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.5rem 0;
+}
+
+.structured-action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.action-img {
+  max-width: 120px;
+  max-height: 90px;
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+
+.action-btn {
+  padding: 0.4rem 1rem;
+  border: 1px solid #4ade80;
+  border-radius: 6px;
+  background: rgba(74, 222, 128, 0.1);
+  color: #4ade80;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.15s;
+}
+
+.action-btn:hover {
+  background: rgba(74, 222, 128, 0.2);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.2);
 }
 
 .segment-response {

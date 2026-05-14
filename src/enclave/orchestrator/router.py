@@ -958,6 +958,8 @@ class MessageRouter:
                     session.room_id,
                     f"✅ {summary}",
                 )
+        elif msg.type == MessageType.STRUCTURED_RESPONSE:
+            await self._handle_structured_response(session, msg)
         elif msg.type == MessageType.ASK_USER:
             question = msg.payload.get("question", "")
             choices = msg.payload.get("choices") or []
@@ -1585,6 +1587,50 @@ class MessageRouter:
             await self.matrix.send_reaction(
                 user_room_id, user_event_id, "✅"
             )
+
+    async def _handle_structured_response(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle a structured response — rich card to WebUI, summary to Matrix."""
+        payload = msg.payload
+        summary = payload.get("summary", "")
+        title = payload.get("title", "")
+        if not summary:
+            return
+
+        log.info(
+            "Structured response from %s: %s — %s",
+            session.id, title or "(no title)", summary[:80],
+        )
+
+        # Notify control socket (WebUI gets full structured payload)
+        if self._control:
+            self._control.notify_structured_response(session.id, payload)
+
+        # Build plain-text for Matrix: **title**\n\nsummary\n\nactions
+        parts: list[str] = []
+        if title:
+            parts.append(f"**{title}**")
+        parts.append(summary)
+        actions = payload.get("actions") or []
+        if actions:
+            action_lines = []
+            for i, a in enumerate(actions, 1):
+                label = a.get("label", f"Option {i}")
+                action_lines.append(f"{i}️⃣ {label}")
+            parts.append("\n".join(action_lines))
+        matrix_text = "\n\n".join(parts)
+
+        # Buffer for Matrix like regular responses (debounce)
+        thread_id = self._thread_events.get(session.id)
+        self._response_buffer[session.id] = matrix_text
+        self._response_buffer_thread[session.id] = thread_id
+        old_task = self._response_flush_tasks.pop(session.id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        self._response_flush_tasks[session.id] = asyncio.create_task(
+            self._delayed_response_flush(session.id, 5.0)
+        )
 
     async def _handle_agent_status(
         self, session: Session, msg: Message

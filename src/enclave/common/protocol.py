@@ -65,6 +65,7 @@ class MessageType(str, Enum):
     # Agent lifecycle signals
     TASK_DONE = "task_done"
     ASK_USER = "ask_user"
+    STRUCTURED_RESPONSE = "structured_response"
 
 
 @dataclass

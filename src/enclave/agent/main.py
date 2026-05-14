@@ -2928,6 +2928,87 @@ async def try_init_copilot(
         )
         custom_tools.append(ask_user_tool)
 
+        # Custom tool: structured_response — send a rich structured update to the user
+        async def _structured_response_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            summary = args.get("summary", "").strip()
+            if not summary:
+                return ToolResult(
+                    text_result_for_llm="Error: 'summary' parameter is required.",
+                    result_type="error",
+                )
+            payload: dict[str, Any] = {"summary": summary}
+            for key in ("title", "details", "images"):
+                val = args.get(key)
+                if val:
+                    payload[key] = val
+            actions = args.get("actions")
+            if actions:
+                payload["actions"] = actions
+            if ipc and ipc.is_connected:
+                await ipc.send(Message(
+                    type=MessageType.STRUCTURED_RESPONSE,
+                    payload=payload,
+                ))
+                return ToolResult(
+                    text_result_for_llm="Structured update sent to the user.",
+                )
+            return ToolResult(
+                text_result_for_llm="Error: not connected to orchestrator",
+                result_type="error",
+            )
+
+        structured_response_tool = Tool(
+            name="structured_response",
+            description=(
+                "Send a structured update to the user with a scannable card format. "
+                "Use this for major updates: task completions, status reports, or when "
+                "presenting choices with visual context. The summary appears in "
+                "notifications; details are shown in a collapsible panel."
+            ),
+            handler=_structured_response_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Bold heading for the card (e.g. 'Auth module refactored').",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Short summary always shown — what changed and current status.",
+                    },
+                    "details": {
+                        "type": "string",
+                        "description": (
+                            "Markdown body with implementation details, reasoning, "
+                            "code snippets, etc. Collapsed by default in the UI."
+                        ),
+                    },
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Button label or choice text."},
+                                "image": {"type": "string", "description": "Optional workspace path to an image for this choice."},
+                            },
+                            "required": ["label"],
+                        },
+                        "description": "Call-to-action choices for the user. Each becomes a clickable button.",
+                    },
+                    "images": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Workspace file paths for images to embed in the card.",
+                    },
+                },
+                "required": ["summary"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(structured_response_tool)
+
         # Custom tool: enter_nix_shell — restart under a nix-shell environment
         async def _enter_nix_shell_handler(invocation: object) -> ToolResult:
             args = getattr(invocation, "arguments", {}) or {}
