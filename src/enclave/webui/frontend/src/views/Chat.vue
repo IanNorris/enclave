@@ -23,7 +23,7 @@
       </div>
 
       <!-- Messages -->
-      <div class="messages" ref="messagesEl">
+      <div class="messages" ref="messagesEl" @scroll="onMessagesScroll">
         <!-- Load earlier button -->
         <div v-if="hasMore" class="load-earlier">
           <button class="secondary" @click="loadEarlier" :disabled="loadingMore">
@@ -128,8 +128,43 @@
 
         <!-- Live streaming section -->
         <div v-if="liveEvents.length || streamingText" class="turn live-turn">
-          <!-- Accumulated events (thinking blocks, tool calls) -->
-          <div v-for="(evt, i) in liveEvents" :key="i" class="live-event" :class="evt.type">
+          <!-- Collapsed tool summary when many events -->
+          <div v-if="collapsedLiveCount > 0" class="live-events-collapsed">
+            <span class="collapsed-summary" @click="liveEventsExpanded = !liveEventsExpanded">
+              {{ liveEventsExpanded ? '▼' : '▶' }} {{ collapsedLiveCount }} earlier tool calls
+            </span>
+            <template v-if="liveEventsExpanded">
+              <div v-for="(evt, i) in collapsedLiveEvents" :key="'c-'+i" class="live-event" :class="evt.type">
+                <div v-if="evt.type === 'thinking'" class="thinking-block collapsed">
+                  <div class="event-header" @click="evt.collapsed = !evt.collapsed">
+                    <span class="event-icon">🤔</span>
+                    <span class="event-label">Thinking</span>
+                    <span class="expand-toggle">{{ evt.collapsed ? '▶' : '▼' }}</span>
+                  </div>
+                  <div v-if="!evt.collapsed" class="event-content thinking-content">{{ evt.content }}</div>
+                </div>
+                <div v-if="evt.type === 'tool'" class="tool-block collapsed">
+                  <div class="event-header" @click="evt.collapsed = !evt.collapsed">
+                    <span class="event-icon">{{ evt.icon }}</span>
+                    <span class="event-label">{{ evt.detail || evt.name }}</span>
+                    <span v-if="evt.done" class="tool-status" :class="evt.success ? 'success' : 'fail'">
+                      {{ evt.success ? '✅' : '❌' }}
+                    </span>
+                    <span v-else class="tool-spinner">⏳</span>
+                  </div>
+                </div>
+                <div v-if="evt.type === 'file_send'" class="tool-block">
+                  <div class="event-header">
+                    <span class="event-icon">📎</span>
+                    <span class="event-label">{{ evt.filename }}</span>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <!-- Visible (recent) events -->
+          <div v-for="(evt, i) in visibleLiveEvents" :key="'v-'+i" class="live-event" :class="evt.type">
             <!-- Thinking block -->
             <div v-if="evt.type === 'thinking'" class="thinking-block" :class="{ collapsed: evt.collapsed }">
               <div class="event-header" @click="evt.collapsed = !evt.collapsed">
@@ -212,6 +247,13 @@
         </div>
       </div>
 
+      <!-- Jump to latest button -->
+      <transition name="fade">
+        <button v-if="hasNewContent && !isScrollPinned" class="jump-to-latest" @click="jumpToLatest">
+          ↓ Jump to latest
+        </button>
+      </transition>
+
       <!-- Pending files -->
       <div v-if="pendingFiles.length" class="pending-files">
         <div v-for="(f, i) in pendingFiles" :key="i" class="file-chip">
@@ -282,6 +324,15 @@ const activityText = ref('')
 const askUserPrompt = ref(null)
 const askUserAnswer = ref('')
 let currentThinkingIdx = -1
+const liveEventsExpanded = ref(false)
+const LIVE_EVENTS_VISIBLE = 5
+
+const collapsedLiveCount = computed(() => Math.max(0, liveEvents.value.length - LIVE_EVENTS_VISIBLE))
+const collapsedLiveEvents = computed(() => liveEvents.value.slice(0, collapsedLiveCount.value))
+const visibleLiveEvents = computed(() => {
+  if (liveEvents.value.length <= LIVE_EVENTS_VISIBLE) return liveEvents.value
+  return liveEvents.value.slice(-LIVE_EVENTS_VISIBLE)
+})
 
 // Agent state tracking
 const agentState = ref('unknown') // 'idle' | 'thinking' | 'tool' | 'responding' | 'waiting_user' | 'unknown'
@@ -361,7 +412,7 @@ async function loadHistory() {
     // Load persisted events (tool calls, thinking, etc.)
     await loadEvents()
     await nextTick()
-    scrollToBottom()
+    scrollToBottom(true)
     connectWebSocket()
     loadModels()
   } catch (e) {
@@ -793,7 +844,7 @@ async function answerAskUser(answer) {
     source: 'queued',
   })
   await nextTick()
-  scrollToBottom()
+  scrollToBottom(true)
   try {
     await api.sendChatMessage(selectedSession.value, text)
   } catch (e) {
@@ -870,7 +921,31 @@ function formatSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function scrollToBottom() {
+// Auto-scroll pinning: only scroll down if user is already at the bottom
+const isScrollPinned = ref(true)
+const hasNewContent = ref(false)
+
+function onMessagesScroll() {
+  if (!messagesEl.value) return
+  const el = messagesEl.value
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60
+  isScrollPinned.value = atBottom
+  if (atBottom) hasNewContent.value = false
+}
+
+function scrollToBottom(force = false) {
+  if (!messagesEl.value) return
+  if (force || isScrollPinned.value) {
+    messagesEl.value.scrollTop = messagesEl.value.scrollHeight
+    hasNewContent.value = false
+  } else {
+    hasNewContent.value = true
+  }
+}
+
+function jumpToLatest() {
+  isScrollPinned.value = true
+  hasNewContent.value = false
   if (messagesEl.value) {
     messagesEl.value.scrollTop = messagesEl.value.scrollHeight
   }
@@ -952,7 +1027,8 @@ function formatTime(ts) {
 .chat-view {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 4rem);
+  height: calc(100dvh - 4rem);
+  overflow-x: hidden;
 }
 
 .chat-header {
@@ -1282,8 +1358,11 @@ function formatTime(ts) {
   display: flex;
   gap: 0.75rem;
   padding: 1rem 0 0;
+  padding-bottom: env(safe-area-inset-bottom, 0);
   border-top: 1px solid var(--border);
   align-items: flex-end;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .input-bar .attach-btn {
@@ -1377,6 +1456,7 @@ function formatTime(ts) {
   flex-direction: column;
   min-height: 0;
   position: relative;
+  overflow: hidden;
 }
 
 .empty-state {
@@ -1571,7 +1651,7 @@ function formatTime(ts) {
 }
 
 @media (max-width: 768px) {
-  .chat-view { height: calc(100vh - 3.5rem); }
+  .chat-view { height: calc(100dvh - 3.5rem); }
   .chat-header { flex-direction: column; align-items: stretch; gap: 0.5rem; }
   .chat-header select { max-width: 100%; }
   .message { max-width: 95%; }
@@ -1602,4 +1682,45 @@ function formatTime(ts) {
 .events-summary {
   font-style: italic;
 }
+
+/* Jump to latest button */
+.jump-to-latest {
+  position: absolute;
+  bottom: 5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent, #63b3ed);
+  color: #fff;
+  border: none;
+  border-radius: 20px;
+  padding: 0.5rem 1.2rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  z-index: 10;
+  transition: opacity 0.2s, transform 0.2s;
+}
+.jump-to-latest:hover {
+  transform: translateX(-50%) scale(1.05);
+}
+.fade-enter-active, .fade-leave-active { transition: opacity 0.2s; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* Collapsed live events summary */
+.live-events-collapsed {
+  margin-bottom: 0.5rem;
+}
+.collapsed-summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--text-muted, #888);
+  user-select: none;
+  padding: 0.2rem 0;
+}
+.collapsed-summary:hover {
+  color: var(--text-primary, #ccc);
+}
+
+/* Chat container needs relative positioning for jump button */
 </style>
