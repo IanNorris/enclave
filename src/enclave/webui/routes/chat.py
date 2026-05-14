@@ -300,7 +300,7 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
         from enclave.webui.event_store import get_event_store
         workspace_base = _workspace_base(request)
         store = get_event_store(workspace_base, session_id)
-        resp_events = store.get_events(types="response", limit=500)
+        resp_events = store.get_events(types=["response"], limit=500)
         for evt in resp_events:
             data = evt.get("data", {})
             if isinstance(data, str):
