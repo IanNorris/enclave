@@ -36,3 +36,4 @@ result
 *.pem
 *.key
 enclave.yaml
+node_modules/

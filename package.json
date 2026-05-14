@@ -1,0 +1,27 @@
+{
+  "name": "enclave",
+  "version": "1.0.0",
+  "description": "<p align=\"center\">   <img src=\"assets/logo.png\" alt=\"Enclave\" width=\"200\"> </p>",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IanNorris/enclave.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/IanNorris/enclave/issues"
+  },
+  "homepage": "https://github.com/IanNorris/enclave#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
+  }
+}

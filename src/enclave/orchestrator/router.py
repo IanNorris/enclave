@@ -895,6 +895,10 @@ class MessageRouter:
             self._control.cancel_turn_end(session.id)
             self._control.notify_turn_start(session.id)
             self._start_typing_refresh(session)
+            # Cancel pending Matrix flush — agent is continuing investigation
+            old_task = self._response_flush_tasks.pop(session.id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
         elif msg.type == MessageType.TURN_END:
             elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
             log.info("Agent %s turn ended (%.1fs)", session.id, elapsed)
@@ -904,6 +908,15 @@ class MessageRouter:
             asyncio.create_task(
                 asyncio.to_thread(self.sessions.backup_sdk_state, session)
             )
+            # Start a longer debounce for Matrix flush — if a new turn
+            # starts soon (multi-turn investigation), it will be cancelled.
+            if session.id in self._response_buffer:
+                old_task = self._response_flush_tasks.pop(session.id, None)
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                self._response_flush_tasks[session.id] = asyncio.create_task(
+                    self._delayed_response_flush(session.id, 30.0)
+                )
         elif msg.type == MessageType.STATUS_UPDATE:
             await self._handle_agent_status(session, msg)
         elif msg.type == MessageType.PERMISSION_REQUEST:
@@ -953,6 +966,13 @@ class MessageRouter:
         elif msg.type == MessageType.TASK_DONE:
             summary = msg.payload.get("summary", "")
             log.info("Agent %s marked task done: %s", session.id, summary[:80])
+            # Discard buffered intermediate response — the task_done summary
+            # is the authoritative completion message for Matrix.
+            self._response_buffer.pop(session.id, None)
+            self._response_buffer_thread.pop(session.id, None)
+            old_task = self._response_flush_tasks.pop(session.id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
             if summary:
                 await self.matrix.send_message(
                     session.room_id,
@@ -964,6 +984,13 @@ class MessageRouter:
             question = msg.payload.get("question", "")
             choices = msg.payload.get("choices") or []
             log.info("Agent %s asking user: %s", session.id, question[:80])
+
+            # Discard buffered response — ask_user is the important event
+            self._response_buffer.pop(session.id, None)
+            self._response_buffer_thread.pop(session.id, None)
+            old_task = self._response_flush_tasks.pop(session.id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
 
             # Notify control socket subscribers (web UI)
             if self._control:
@@ -1522,15 +1549,15 @@ class MessageRouter:
         self._response_buffer[session.id] = content
         self._response_buffer_thread[session.id] = thread_id
 
-        # Cancel any existing flush timer and start a new one.
-        # Debounce: wait 5s before sending to Matrix. If another response
-        # arrives (multi-turn investigation), it replaces the buffer and
-        # resets the timer, so only the last response gets sent.
+        # Cancel any existing flush timer and start a long fallback.
+        # The actual flush is managed by TURN_END (30s debounce) and
+        # TASK_DONE (immediate).  This is a safety net in case those
+        # events never arrive.
         old_task = self._response_flush_tasks.pop(session.id, None)
         if old_task and not old_task.done():
             old_task.cancel()
         self._response_flush_tasks[session.id] = asyncio.create_task(
-            self._delayed_response_flush(session.id, 5.0)
+            self._delayed_response_flush(session.id, 120.0)
         )
 
     async def _delayed_response_flush(self, session_id: str, delay: float) -> None:
@@ -1631,7 +1658,7 @@ class MessageRouter:
         if old_task and not old_task.done():
             old_task.cancel()
         self._response_flush_tasks[session.id] = asyncio.create_task(
-            self._delayed_response_flush(session.id, 5.0)
+            self._delayed_response_flush(session.id, 120.0)
         )
 
     async def _handle_ask_deferred(

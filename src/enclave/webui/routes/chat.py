@@ -441,6 +441,65 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
         ]
         _persist_response_cache()
 
+    # Append synthetic turns from the event store for events newer than the
+    # last SDK turn.  The SDK DB lags behind because it only writes turns at
+    # idle or checkpoint boundaries, so recent interactions may be missing.
+    if turns and offset == 0:
+        last_ts = turns[-1].get("timestamp", "")
+        if last_ts:
+            try:
+                from enclave.webui.event_store import get_event_store
+                workspace_base = _workspace_base(request)
+                store = get_event_store(workspace_base, session_id)
+                recent_events = store.get_events(
+                    since_timestamp=last_ts,
+                    types=["user_message", "response", "ask_user", "structured_response"],
+                    limit=2000,
+                )
+                if recent_events:
+                    next_index = (turns[-1].get("turn_index", 0) or 0) + 1
+                    current_user: str | None = None
+                    current_ts_r = ""
+                    responses_r: list[str] = []
+                    for evt in recent_events:
+                        data = evt.get("data", {})
+                        if isinstance(data, str):
+                            try:
+                                data = json.loads(data)
+                            except (json.JSONDecodeError, TypeError):
+                                data = {}
+                        etype = evt.get("type", "")
+                        if etype == "user_message":
+                            if current_user is not None:
+                                turns.append({
+                                    "turn_index": next_index,
+                                    "user_message": current_user,
+                                    "assistant_response": "\n\n".join(responses_r) if responses_r else None,
+                                    "timestamp": current_ts_r,
+                                })
+                                next_index += 1
+                                responses_r = []
+                            current_user = data.get("content", "")
+                            current_ts_r = evt.get("timestamp", "")
+                        elif etype == "response":
+                            content = data.get("content", "")
+                            if content:
+                                responses_r.append(content)
+                        elif etype == "ask_user":
+                            q = data.get("question", "")
+                            if q:
+                                responses_r.append(f"**Question:** {q}")
+                    # Close last turn
+                    if current_user is not None:
+                        turns.append({
+                            "turn_index": next_index,
+                            "user_message": current_user,
+                            "assistant_response": "\n\n".join(responses_r) if responses_r else None,
+                            "timestamp": current_ts_r,
+                        })
+            except Exception:
+                pass
+
     return {"turns": turns, "session_id": session_id}
 
 
