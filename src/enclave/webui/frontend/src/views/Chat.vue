@@ -487,7 +487,11 @@ function handleStreamEvent(msg) {
       // Remove any live-cache entry that matches this turn's assistant_response
       if (msg.assistant_response) {
         const lIdx = turns.value.findIndex(t => t.source === 'live' && t.assistant_response === msg.assistant_response)
-        if (lIdx >= 0) turns.value.splice(lIdx, 1)
+        if (lIdx >= 0) {
+          // Preserve is_major from the live turn
+          if (turns.value[lIdx].is_major) msg.is_major = true
+          turns.value.splice(lIdx, 1)
+        }
       }
       turns.value.push(msg)
     }
