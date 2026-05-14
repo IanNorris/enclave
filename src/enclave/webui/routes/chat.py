@@ -346,53 +346,27 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
         # Sort fill responses chronologically
         unique_fill.sort(key=lambda e: e["timestamp"])
 
-        # Match each response to the closest preceding turn with NULL response
+        # For each NULL turn, find ALL responses in its time window and use
+        # the LAST one (intermediate responses are shown inline in event segments).
         null_turns = [(i, t) for i, t in enumerate(turns) if t.get("assistant_response") is None]
-        fill_idx = 0
         for turn_pos, (turn_i, turn) in enumerate(null_turns):
-            if fill_idx >= len(unique_fill):
-                break
             turn_ts = turn.get("timestamp", "")
-            # Find the best response: timestamp >= turn_ts but < next turn's ts
             next_turn_ts = null_turns[turn_pos + 1][1].get("timestamp", "") if turn_pos + 1 < len(null_turns) else "9999"
-            while fill_idx < len(unique_fill):
-                entry = unique_fill[fill_idx]
-                if entry["content"] in db_responses:
-                    fill_idx += 1
-                    continue
-                if turn_ts and entry["timestamp"] < turn_ts:
-                    fill_idx += 1
-                    continue
-                if entry["timestamp"] < next_turn_ts:
-                    turn["assistant_response"] = entry["content"]
-                    db_responses.add(entry["content"])
-                    fill_idx += 1
-                    break
-                else:
-                    break  # This response belongs to a later turn
+            # Collect all responses in this turn's window
+            candidates = [
+                e for e in unique_fill
+                if e["content"] not in db_responses
+                and (not turn_ts or e["timestamp"] >= turn_ts)
+                and e["timestamp"] < next_turn_ts
+            ]
+            if candidates:
+                # Use the last response as the turn's assistant_response
+                best = candidates[-1]
+                turn["assistant_response"] = best["content"]
+                db_responses.add(best["content"])
 
-        # Any remaining unmatched responses: insert chronologically
-        last_db_ts = turns[-1].get("timestamp", "") if turns else ""
-        for entry in unique_fill[fill_idx:]:
-            if entry["content"] in db_responses:
-                continue
-            if offset != 0:
-                continue  # Only add new entries on first page
-            new_turn = {
-                "turn_index": None,
-                "user_message": None,
-                "assistant_response": entry["content"],
-                "timestamp": entry["timestamp"],
-                "source": "live",
-            }
-            # Find insertion point by timestamp
-            insert_at = len(turns)
-            for i, t in enumerate(turns):
-                t_ts = t.get("timestamp", "")
-                if t_ts and t_ts > entry["timestamp"]:
-                    insert_at = i
-                    break
-            turns.insert(insert_at, new_turn)
+        # Any remaining unmatched responses beyond the last turn: skip them
+        # (they'll appear as event-store segment responses instead)
 
     # Prune in-memory cache entries whose content is now in the DB
     if offset == 0 and session_id in _response_cache:

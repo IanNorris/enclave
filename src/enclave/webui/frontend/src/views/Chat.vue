@@ -38,31 +38,42 @@
             <div class="message-body" v-html="renderMarkdown(turn.user_message)"></div>
           </div>
 
-          <!-- Persisted events for this turn (tool calls, thinking) -->
+          <!-- Persisted event segments for this turn (tool calls interleaved with responses) -->
           <template v-if="turnEvents[turn.turn_index]?.length">
             <div class="turn-events" :class="{ collapsed: !expandedTurns[turn.turn_index] }">
               <div class="events-toggle" @click="expandedTurns[turn.turn_index] = !expandedTurns[turn.turn_index]">
                 <span class="expand-toggle">{{ expandedTurns[turn.turn_index] ? '▼' : '▶' }}</span>
-                <span class="events-summary">{{ turnEvents[turn.turn_index].length }} events</span>
+                <span class="events-summary">{{ countSegmentEvents(turnEvents[turn.turn_index]) }} events</span>
               </div>
               <template v-if="expandedTurns[turn.turn_index]">
-                <div v-for="(evt, ei) in turnEvents[turn.turn_index]" :key="ei" class="live-event" :class="evt.type">
-                  <div v-if="evt.type === 'tool_start' || evt.type === 'tool_complete'" class="tool-block collapsed">
-                    <div class="event-header">
-                      <span class="event-icon">{{ TOOL_ICONS_MAP[evt.data?.name] || '🔧' }}</span>
-                      <span class="event-label">{{ evt.data?.detail || evt.data?.name || 'tool' }}</span>
-                      <span v-if="evt.type === 'tool_complete'" class="tool-status" :class="evt.data?.success !== false ? 'success' : 'fail'">
-                        {{ evt.data?.success !== false ? '✅' : '❌' }}
-                      </span>
+                <template v-for="(seg, si) in turnEvents[turn.turn_index]" :key="si">
+                  <!-- Tool calls in this segment -->
+                  <div v-for="(evt, ei) in seg.tools" :key="`${si}-${ei}`" class="live-event" :class="evt.type">
+                    <div v-if="evt.type === 'tool_start' || evt.type === 'tool_complete'" class="tool-block collapsed">
+                      <div class="event-header">
+                        <span class="event-icon">{{ TOOL_ICONS_MAP[evt.data?.name] || '🔧' }}</span>
+                        <span class="event-label">{{ evt.data?.detail || evt.data?.name || 'tool' }}</span>
+                        <span v-if="evt.type === 'tool_complete'" class="tool-status" :class="evt.data?.success !== false ? 'success' : 'fail'">
+                          {{ evt.data?.success !== false ? '✅' : '❌' }}
+                        </span>
+                      </div>
+                    </div>
+                    <div v-else-if="evt.type === 'file_send'" class="tool-block collapsed">
+                      <div class="event-header">
+                        <span class="event-icon">📎</span>
+                        <span class="event-label">{{ evt.data?.filename || 'file' }}</span>
+                      </div>
                     </div>
                   </div>
-                  <div v-else-if="evt.type === 'file_send'" class="tool-block collapsed">
-                    <div class="event-header">
-                      <span class="event-icon">📎</span>
-                      <span class="event-label">{{ evt.data?.filename || 'file' }}</span>
+                  <!-- Intermediate response after this batch of tool calls -->
+                  <div v-if="seg.response" class="message assistant-message segment-response">
+                    <div class="message-meta">
+                      <span class="sender">Agent</span>
+                      <span v-if="seg.responseTimestamp" class="time">{{ formatTime(seg.responseTimestamp) }}</span>
                     </div>
+                    <div class="message-body" v-html="renderMarkdown(seg.response)"></div>
                   </div>
-                </div>
+                </template>
               </template>
             </div>
           </template>
@@ -226,6 +237,11 @@ const turnEvents = ref({})
 const expandedTurns = ref({})
 const TOOL_ICONS_MAP = TOOL_ICONS
 
+function countSegmentEvents(segments) {
+  if (!segments) return 0
+  return segments.reduce((sum, seg) => sum + seg.tools.length + (seg.response ? 1 : 0), 0)
+}
+
 let ws = null
 let dragCounter = 0
 
@@ -280,12 +296,12 @@ async function loadEvents() {
   try {
     const data = await api.getChatEvents(selectedSession.value, { limit: 2000 })
     const events = data.events || []
-    // Group events by turn: assign each event to the turn whose timestamp
-    // is closest-before the event timestamp
+    // Group events by turn, then split into segments separated by responses.
+    // Each segment: { tools: [...], response: null | string }
+    // This preserves the chronological interleaving of tool calls and responses.
     const grouped = {}
     for (const evt of events) {
-      // Skip non-visual event types
-      if (!['tool_start', 'tool_complete', 'file_send'].includes(evt.type)) continue
+      if (!['tool_start', 'tool_complete', 'file_send', 'response'].includes(evt.type)) continue
       // Find the best matching turn
       let bestTurn = null
       for (const t of turns.value) {
@@ -294,9 +310,33 @@ async function loadEvents() {
           bestTurn = t.turn_index
         }
       }
-      if (bestTurn != null) {
-        if (!grouped[bestTurn]) grouped[bestTurn] = []
-        grouped[bestTurn].push(evt)
+      if (bestTurn == null) continue
+      if (!grouped[bestTurn]) grouped[bestTurn] = [{ tools: [], response: null }]
+
+      const segments = grouped[bestTurn]
+      if (evt.type === 'response') {
+        // A response closes the current segment and starts a new one
+        const content = evt.data?.content || ''
+        if (content) {
+          segments[segments.length - 1].response = content
+          // Update the response timestamp to the latest event in this segment
+          const lastTool = segments[segments.length - 1].tools
+          if (lastTool.length > 0) {
+            segments[segments.length - 1].responseTimestamp = lastTool[lastTool.length - 1].timestamp
+          } else {
+            segments[segments.length - 1].responseTimestamp = evt.timestamp
+          }
+          segments.push({ tools: [], response: null })
+        }
+      } else {
+        segments[segments.length - 1].tools.push(evt)
+      }
+    }
+    // Clean up trailing empty segments
+    for (const key of Object.keys(grouped)) {
+      const segs = grouped[key]
+      if (segs.length > 0 && segs[segs.length - 1].tools.length === 0 && !segs[segs.length - 1].response) {
+        segs.pop()
       }
     }
     turnEvents.value = grouped
@@ -796,6 +836,14 @@ function formatTime(ts) {
   border-left: 3px solid #4ade80;
   background: linear-gradient(90deg, rgba(74, 222, 128, 0.06) 0%, var(--bg-card) 40%);
   box-shadow: -2px 0 8px rgba(74, 222, 128, 0.08);
+}
+
+.segment-response {
+  margin: 0.4rem 0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.9rem;
+  opacity: 0.85;
+  max-width: 100%;
 }
 
 .message-meta {
