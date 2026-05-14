@@ -409,9 +409,9 @@ class ControlServer:
         subs.add(q)
 
         try:
-            # Tag the message so the agent knows it's from the orchestrator
-            tagged = f"[{sender}] {content}" if content else f"[{sender}] [Sent a file]"
-            ok = await self._router.inject_message(session_id, tagged, attachments=attachments)
+            # Send the message content directly (no sender tag prefix)
+            msg_content = content if content else "[Sent a file]"
+            ok = await self._router.inject_message(session_id, msg_content, attachments=attachments)
             if not ok:
                 await self._write(writer, {"ok": False, "error": "Failed to send to agent"})
                 return
