@@ -1290,11 +1290,10 @@ function formatTime(ts) {
 }
 
 .structured-img {
-  max-width: 200px;
-  max-height: 150px;
+  max-width: 300px;
+  max-height: 225px;
   border-radius: 6px;
-  cursor: pointer;
-  border: 1px solid rgba(255,255,255,0.1);
+  cursor: zoom-in;
   transition: transform 0.15s;
 }
 
@@ -1366,10 +1365,10 @@ function formatTime(ts) {
 }
 
 .action-img {
-  max-width: 120px;
-  max-height: 90px;
+  max-width: 180px;
+  max-height: 135px;
   border-radius: 4px;
-  border: 1px solid rgba(255,255,255,0.1);
+  cursor: zoom-in;
 }
 
 .action-btn {
@@ -1629,46 +1628,49 @@ function formatTime(ts) {
 /* Live streaming styles */
 .live-turn {
   border-left: 2px solid var(--accent);
-  padding-left: 0.75rem;
+  padding-left: 0.5rem;
   margin-left: 0.25rem;
 }
 
 .live-event {
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.15rem;
 }
 
-.thinking-block,
-.tool-block {
+.thinking-block {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   overflow: hidden;
 }
 
+.tool-block {
+  overflow: hidden;
+}
+
 .file-send-preview {
-  padding: 0.4rem 0.6rem;
+  padding: 0.25rem 0;
 }
 
 .file-send-img {
-  max-width: 300px;
-  max-height: 200px;
+  max-width: 450px;
+  max-height: 300px;
   border-radius: var(--radius-sm);
-  cursor: pointer;
+  cursor: zoom-in;
 }
 
 .event-header {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
-  padding: 0.4rem 0.6rem;
+  gap: 0.3rem;
+  padding: 0.15rem 0.4rem;
   cursor: pointer;
-  font-size: 0.8rem;
-  color: var(--text-secondary);
+  font-size: 0.72rem;
+  color: var(--text-muted);
   user-select: none;
 }
 
 .event-header:hover {
-  background: var(--bg-main);
+  color: var(--text-secondary);
 }
 
 .event-icon {
@@ -1684,7 +1686,7 @@ function formatTime(ts) {
 
 .expand-toggle {
   flex-shrink: 0;
-  font-size: 0.65rem;
+  font-size: 0.6rem;
   color: var(--text-muted);
 }
 
