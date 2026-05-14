@@ -728,7 +728,7 @@ def setup_session_listener(
                                 content = data.get("content", "")
                                 if content:
                                     print(f"[agent] Inbox notification: {content[:80]}", file=sys.stderr)
-                                    await sdk_session.send(f"[Service Notification] {content}")
+                                    _fire_and_forget(sdk_session.send(f"[Service Notification] {content}"))
                             except Exception as e:
                                 print(f"[agent] Inbox file error {inbox_file.name}: {e}", file=sys.stderr)
                             finally:
