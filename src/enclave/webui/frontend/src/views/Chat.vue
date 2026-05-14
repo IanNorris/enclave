@@ -2,6 +2,10 @@
   <div class="chat-view" @dragover.prevent="onDragOver" @dragleave="onDragLeave" @drop.prevent="onDrop">
     <div class="chat-header">
       <h2>Chat</h2>
+      <div v-if="selectedSession && agentState !== 'unknown'" class="agent-status" :class="agentStateClass">
+        <span class="status-indicator"></span>
+        <span class="status-label">{{ agentStateLabel }}</span>
+      </div>
       <div class="model-picker" v-if="selectedSession">
         <select v-if="models.available.length" v-model="currentModel" @change="changeModel" class="model-select">
           <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
@@ -231,6 +235,33 @@ const activityText = ref('')
 const askUserPrompt = ref(null)
 const askUserAnswer = ref('')
 let currentThinkingIdx = -1
+
+// Agent state tracking
+const agentState = ref('unknown') // 'idle' | 'thinking' | 'tool' | 'responding' | 'waiting_user' | 'unknown'
+const agentToolName = ref('')
+const agentLastUpdate = ref(null)
+let stateIdleTimer = null
+
+function setAgentState(state, toolName = '') {
+  agentState.value = state
+  agentToolName.value = toolName
+  agentLastUpdate.value = new Date()
+  // Clear any pending idle timer
+  if (stateIdleTimer) { clearTimeout(stateIdleTimer); stateIdleTimer = null }
+}
+
+const agentStateLabel = computed(() => {
+  switch (agentState.value) {
+    case 'thinking': return '🤔 Thinking…'
+    case 'tool': return `⚙️ Running ${agentToolName.value || 'tool'}…`
+    case 'responding': return '💬 Responding…'
+    case 'waiting_user': return '❓ Waiting for input'
+    case 'idle': return '😴 Idle'
+    default: return ''
+  }
+})
+
+const agentStateClass = computed(() => agentState.value)
 
 // Persisted events per turn (turn_index → events array)
 const turnEvents = ref({})
@@ -473,6 +504,7 @@ function handleStreamEvent(msg) {
     streamingText.value = ''
     activityText.value = ''
     currentThinkingIdx = -1
+    setAgentState('thinking')
     return
   }
 
@@ -480,11 +512,13 @@ function handleStreamEvent(msg) {
     streamingText.value = msg.content || ''
     activityText.value = ''
     sending.value = false
+    setAgentState('responding')
     return
   }
 
   if (type === 'thinking') {
     const phase = msg.phase || 'delta'
+    setAgentState('thinking')
     if (phase === 'end') {
       // Finalize thinking block — auto-collapse
       if (currentThinkingIdx >= 0 && currentThinkingIdx < liveEvents.value.length) {
@@ -512,6 +546,7 @@ function handleStreamEvent(msg) {
   if (type === 'tool_start') {
     currentThinkingIdx = -1  // End any open thinking block
     const icon = TOOL_ICONS[msg.name] || '🔧'
+    setAgentState('tool', msg.detail || msg.name || 'tool')
     liveEvents.value.push(reactive({
       type: 'tool',
       name: msg.name || 'unknown',
@@ -526,6 +561,7 @@ function handleStreamEvent(msg) {
   }
 
   if (type === 'tool_complete') {
+    setAgentState('thinking') // Back to thinking after tool completes
     // Find the last tool event with this name that isn't done
     for (let i = liveEvents.value.length - 1; i >= 0; i--) {
       const evt = liveEvents.value[i]
@@ -545,6 +581,7 @@ function handleStreamEvent(msg) {
   }
 
   if (type === 'ask_user') {
+    setAgentState('waiting_user')
     askUserPrompt.value = {
       question: msg.question || '',
       choices: msg.choices || [],
@@ -554,6 +591,7 @@ function handleStreamEvent(msg) {
   }
 
   if (type === 'response') {
+    setAgentState('responding')
     // Final response — promote to a synthetic turn immediately so it
     // survives live state clears (turn_start, next response, etc.).
     // The SQLite poll will eventually replace it with the real turn.
@@ -581,6 +619,9 @@ function handleStreamEvent(msg) {
   if (type === 'turn_end') {
     sending.value = false
     activityText.value = ''
+    // Set idle after a short delay (agent may start a new turn immediately)
+    if (stateIdleTimer) clearTimeout(stateIdleTimer)
+    stateIdleTimer = setTimeout(() => setAgentState('idle'), 3000)
     return
   }
 }
@@ -767,6 +808,62 @@ function formatTime(ts) {
 }
 
 .chat-header h2 { margin: 0; }
+
+/* Agent status indicator */
+.agent-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: #999;
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  background: rgba(255,255,255,0.05);
+}
+
+.agent-status .status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #666;
+}
+
+.agent-status.thinking .status-indicator {
+  background: #f59e0b;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.agent-status.tool .status-indicator {
+  background: #3b82f6;
+  animation: spin-dot 1s linear infinite;
+  border-radius: 2px;
+  width: 8px;
+  height: 8px;
+}
+
+.agent-status.responding .status-indicator {
+  background: #4ade80;
+  animation: pulse 0.8s ease-in-out infinite;
+}
+
+.agent-status.waiting_user .status-indicator {
+  background: #f97316;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.agent-status.idle .status-indicator {
+  background: #666;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+
+@keyframes spin-dot {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
 
 .model-picker {
   display: flex;
