@@ -47,13 +47,7 @@
               </div>
               <template v-if="expandedTurns[turn.turn_index]">
                 <div v-for="(evt, ei) in turnEvents[turn.turn_index]" :key="ei" class="live-event" :class="evt.type">
-                  <div v-if="evt.type === 'thinking'" class="thinking-block collapsed">
-                    <div class="event-header">
-                      <span class="event-icon">🤔</span>
-                      <span class="event-label">{{ (evt.data?.content || 'Thinking').substring(0, 120) }}</span>
-                    </div>
-                  </div>
-                  <div v-else-if="evt.type === 'tool_start' || evt.type === 'tool_complete'" class="tool-block collapsed">
+                  <div v-if="evt.type === 'tool_start' || evt.type === 'tool_complete'" class="tool-block collapsed">
                     <div class="event-header">
                       <span class="event-icon">{{ TOOL_ICONS_MAP[evt.data?.name] || '🔧' }}</span>
                       <span class="event-label">{{ evt.data?.detail || evt.data?.name || 'tool' }}</span>
@@ -291,7 +285,7 @@ async function loadEvents() {
     const grouped = {}
     for (const evt of events) {
       // Skip non-visual event types
-      if (!['tool_start', 'tool_complete', 'thinking', 'file_send'].includes(evt.type)) continue
+      if (!['tool_start', 'tool_complete', 'file_send'].includes(evt.type)) continue
       // Find the best matching turn
       let bestTurn = null
       for (const t of turns.value) {

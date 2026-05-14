@@ -55,11 +55,18 @@ def _workspace_base(request: Request) -> Path:
     return Path(request.app.state.config.container.workspace_base)
 
 
+# Event types worth persisting (major + tool lifecycle).
+# Excludes streaming deltas, thinking tokens, activity, and turn markers.
+_PERSIST_TYPES = frozenset({
+    "tool_start", "tool_complete", "response", "file_send", "ask_user",
+})
+
+
 def _persist_event(config: Any, session_id: str, event: dict) -> None:
     """Persist a control socket event to the session's event store."""
     from enclave.webui.event_store import get_event_store
     event_type = event.get("type", "")
-    if not event_type:
+    if event_type not in _PERSIST_TYPES:
         return
     try:
         workspace_base = Path(config.container.workspace_base)
