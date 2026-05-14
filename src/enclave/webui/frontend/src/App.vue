@@ -59,6 +59,11 @@
             <span v-if="pendingAsks > 0" class="nav-badge">{{ pendingAsks }}</span>
           </router-link>
         </li>
+        <li>
+          <router-link to="/timeline" active-class="active" @click="sidebarOpen = false">
+            <span class="icon">📅</span> Timeline
+          </router-link>
+        </li>
       </ul>
     </nav>
     <main class="content">

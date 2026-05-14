@@ -536,6 +536,153 @@ async def get_events(
     return {"events": events, "session_id": session_id}
 
 
+@router.get("/{session_id}/timeline")
+async def get_timeline(request: Request, session_id: str, date: str | None = None):
+    """Get a timeline view of session activity.
+
+    Three levels of detail:
+    1. No date param → day-level summary (list of active dates with stats)
+    2. date=YYYY-MM-DD → hour-level breakdown for that date
+    3. date=YYYY-MM-DDThh → minute-level events for that hour
+    """
+    from enclave.webui.event_store import get_event_store
+    from collections import defaultdict
+
+    workspace_base = _workspace_base(request)
+    store = get_event_store(workspace_base, session_id)
+
+    if date and "T" in date:
+        # Level 3: events for a specific hour
+        hour_prefix = date[:13]  # YYYY-MM-DDThh
+        # Get events for this hour window
+        start = f"{hour_prefix}:00:00"
+        end_hour = int(hour_prefix[-2:]) + 1
+        if end_hour >= 24:
+            # Roll to next day
+            from datetime import datetime as dt, timedelta
+            d = dt.fromisoformat(f"{hour_prefix[:10]}T00:00:00")
+            d += timedelta(days=1)
+            end = f"{d.strftime('%Y-%m-%d')}T00:00:00"
+        else:
+            end = f"{hour_prefix[:11]}{end_hour:02d}:00:00"
+
+        events = store.get_events(since_timestamp=start, limit=5000)
+        # Filter to events before end
+        events = [e for e in events if e["timestamp"] < end]
+
+        return {"level": "events", "date": hour_prefix, "events": events, "session_id": session_id}
+
+    conn = store._conn()
+
+    if date:
+        # Level 2: hourly breakdown for a date
+        day = date[:10]
+        rows = conn.execute(
+            """
+            SELECT substr(timestamp, 12, 2) AS hour,
+                   type,
+                   COUNT(*) AS cnt
+            FROM events
+            WHERE timestamp LIKE ? || '%'
+            GROUP BY hour, type
+            ORDER BY hour, type
+            """,
+            (day,),
+        ).fetchall()
+
+        hours: dict[str, dict] = {}
+        for r in rows:
+            h = r["hour"]
+            if h not in hours:
+                hours[h] = {"hour": h, "event_counts": {}, "total": 0, "highlights": []}
+            hours[h]["event_counts"][r["type"]] = r["cnt"]
+            hours[h]["total"] += r["cnt"]
+
+        # Fetch highlight events (responses, user messages, task completions)
+        highlight_rows = conn.execute(
+            """
+            SELECT substr(timestamp, 12, 2) AS hour,
+                   type,
+                   timestamp,
+                   data
+            FROM events
+            WHERE timestamp LIKE ? || '%'
+              AND type IN ('response', 'user_message', 'ask_user', 'structured_response', 'file_send')
+            ORDER BY timestamp
+            """,
+            (day,),
+        ).fetchall()
+
+        for r in highlight_rows:
+            h = r["hour"]
+            if h in hours:
+                try:
+                    data = json.loads(r["data"]) if isinstance(r["data"], str) else r["data"]
+                except (json.JSONDecodeError, TypeError):
+                    data = {}
+                content = data.get("content", data.get("question", data.get("summary", "")))
+                if content:
+                    hours[h]["highlights"].append({
+                        "type": r["type"],
+                        "timestamp": r["timestamp"],
+                        "preview": content[:200],
+                    })
+
+        hour_list = sorted(hours.values(), key=lambda x: x["hour"])
+        return {
+            "level": "hours",
+            "date": day,
+            "hours": hour_list,
+            "session_id": session_id,
+        }
+
+    # Level 1: day-level summary
+    rows = conn.execute(
+        """
+        SELECT substr(timestamp, 1, 10) AS day,
+               type,
+               COUNT(*) AS cnt
+        FROM events
+        GROUP BY day, type
+        ORDER BY day DESC, type
+        """
+    ).fetchall()
+
+    days: dict[str, dict] = {}
+    for r in rows:
+        d = r["day"]
+        if d not in days:
+            days[d] = {"date": d, "event_counts": {}, "total": 0}
+        days[d]["event_counts"][r["type"]] = r["cnt"]
+        days[d]["total"] += r["cnt"]
+
+    # Get first and last user message per day for context
+    msg_rows = conn.execute(
+        """
+        SELECT substr(timestamp, 1, 10) AS day,
+               MIN(timestamp) AS first_ts,
+               MAX(timestamp) AS last_ts
+        FROM events
+        WHERE type IN ('user_message', 'response')
+        GROUP BY day
+        ORDER BY day DESC
+        """
+    ).fetchall()
+
+    for r in msg_rows:
+        d = r["day"]
+        if d in days:
+            days[d]["first_activity"] = r["first_ts"]
+            days[d]["last_activity"] = r["last_ts"]
+
+    day_list = sorted(days.values(), key=lambda x: x["date"], reverse=True)
+    return {
+        "level": "days",
+        "days": day_list,
+        "session_id": session_id,
+    }
+
+
 @router.post("/{session_id}/send")
 async def send_message(request: Request, session_id: str, body: SendMessage):
     """Send a message to a session's agent via control socket (preferred) or Matrix."""

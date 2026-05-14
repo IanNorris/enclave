@@ -114,4 +114,12 @@ export const api = {
     body: JSON.stringify({ answer }),
   }),
   dismissAsk: (askId) => request(`/asks/${askId}/dismiss`, { method: 'POST' }),
+
+  // Timeline
+  getTimeline: (session, date) => {
+    const params = new URLSearchParams()
+    if (date) params.set('date', date)
+    const qs = params.toString()
+    return request(`/chat/${session}/timeline${qs ? '?' + qs : ''}`)
+  },
 }
