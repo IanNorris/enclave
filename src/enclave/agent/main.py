@@ -4256,7 +4256,14 @@ async def main() -> None:
     print("[agent] Connected to orchestrator", file=sys.stderr)
 
     # Create inbox directory for in-container service notifications
-    Path("/workspace/.enclave/inbox").mkdir(parents=True, exist_ok=True)
+    # Clear stale files from previous runs to avoid re-delivering old notifications
+    inbox_dir = Path("/workspace/.enclave/inbox")
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    for stale in inbox_dir.glob("*.json"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
     # Try to init Copilot SDK
     state = AgentState()

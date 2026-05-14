@@ -37,6 +37,42 @@
             </div>
             <div class="message-body" v-html="renderMarkdown(turn.user_message)"></div>
           </div>
+
+          <!-- Persisted events for this turn (tool calls, thinking) -->
+          <template v-if="turnEvents[turn.turn_index]?.length">
+            <div class="turn-events" :class="{ collapsed: !expandedTurns[turn.turn_index] }">
+              <div class="events-toggle" @click="expandedTurns[turn.turn_index] = !expandedTurns[turn.turn_index]">
+                <span class="expand-toggle">{{ expandedTurns[turn.turn_index] ? '▼' : '▶' }}</span>
+                <span class="events-summary">{{ turnEvents[turn.turn_index].length }} events</span>
+              </div>
+              <template v-if="expandedTurns[turn.turn_index]">
+                <div v-for="(evt, ei) in turnEvents[turn.turn_index]" :key="ei" class="live-event" :class="evt.type">
+                  <div v-if="evt.type === 'thinking'" class="thinking-block collapsed">
+                    <div class="event-header">
+                      <span class="event-icon">🤔</span>
+                      <span class="event-label">{{ (evt.data?.content || 'Thinking').substring(0, 120) }}</span>
+                    </div>
+                  </div>
+                  <div v-else-if="evt.type === 'tool_start' || evt.type === 'tool_complete'" class="tool-block collapsed">
+                    <div class="event-header">
+                      <span class="event-icon">{{ TOOL_ICONS_MAP[evt.data?.name] || '🔧' }}</span>
+                      <span class="event-label">{{ evt.data?.detail || evt.data?.name || 'tool' }}</span>
+                      <span v-if="evt.type === 'tool_complete'" class="tool-status" :class="evt.data?.success !== false ? 'success' : 'fail'">
+                        {{ evt.data?.success !== false ? '✅' : '❌' }}
+                      </span>
+                    </div>
+                  </div>
+                  <div v-else-if="evt.type === 'file_send'" class="tool-block collapsed">
+                    <div class="event-header">
+                      <span class="event-icon">📎</span>
+                      <span class="event-label">{{ evt.data?.filename || 'file' }}</span>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+
           <div v-if="turn.assistant_response" class="message assistant-message">
             <div class="message-meta">
               <span class="sender">Agent</span>
@@ -191,6 +227,11 @@ const askUserPrompt = ref(null)
 const askUserAnswer = ref('')
 let currentThinkingIdx = -1
 
+// Persisted events per turn (turn_index → events array)
+const turnEvents = ref({})
+const expandedTurns = ref({})
+const TOOL_ICONS_MAP = TOOL_ICONS
+
 let ws = null
 let dragCounter = 0
 
@@ -218,6 +259,8 @@ function clearLiveState() {
   askUserPrompt.value = null
   askUserAnswer.value = ''
   currentThinkingIdx = -1
+  turnEvents.value = {}
+  expandedTurns.value = {}
 }
 
 async function loadHistory() {
@@ -227,12 +270,44 @@ async function loadHistory() {
     turns.value = data.turns || []
     // If we got exactly INITIAL_LIMIT turns, there may be more
     hasMore.value = turns.value.length >= INITIAL_LIMIT
+    // Load persisted events (tool calls, thinking, etc.)
+    await loadEvents()
     await nextTick()
     scrollToBottom()
     connectWebSocket()
     loadModels()
   } catch (e) {
     console.error('Failed to load history:', e)
+  }
+}
+
+async function loadEvents() {
+  if (!selectedSession.value) return
+  try {
+    const data = await api.getChatEvents(selectedSession.value, { limit: 2000 })
+    const events = data.events || []
+    // Group events by turn: assign each event to the turn whose timestamp
+    // is closest-before the event timestamp
+    const grouped = {}
+    for (const evt of events) {
+      // Skip non-visual event types
+      if (!['tool_start', 'tool_complete', 'thinking', 'file_send'].includes(evt.type)) continue
+      // Find the best matching turn
+      let bestTurn = null
+      for (const t of turns.value) {
+        if (t.turn_index == null) continue
+        if (t.timestamp && t.timestamp <= evt.timestamp) {
+          bestTurn = t.turn_index
+        }
+      }
+      if (bestTurn != null) {
+        if (!grouped[bestTurn]) grouped[bestTurn] = []
+        grouped[bestTurn].push(evt)
+      }
+    }
+    turnEvents.value = grouped
+  } catch (e) {
+    console.error('Failed to load events:', e)
   }
 }
 
@@ -1030,5 +1105,28 @@ function formatTime(ts) {
   .input-bar { gap: 0.4rem; }
   .input-bar button { padding: 0.5rem 1rem; }
   .file-chip .file-name { max-width: 80px; }
+}
+
+/* Persisted turn events */
+.turn-events {
+  margin: 0.25rem 0;
+  padding-left: 0.5rem;
+  border-left: 2px solid var(--border-color, #333);
+}
+.events-toggle {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #888);
+  user-select: none;
+}
+.events-toggle:hover {
+  color: var(--text-primary, #ccc);
+}
+.events-summary {
+  font-style: italic;
 }
 </style>

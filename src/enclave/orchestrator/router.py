@@ -149,6 +149,13 @@ class MessageRouter:
         # Sessions needing a continuation nudge after nix-shell restart
         self._nix_shell_nudge: set[str] = set()
 
+        # Buffered agent responses waiting for turn_end before posting to Matrix.
+        # This prevents flooding Matrix when the agent does multi-turn investigation
+        # (each turn produces a response, but only the last one matters).
+        self._response_buffer: dict[str, str] = {}  # session_id → content
+        self._response_buffer_thread: dict[str, str | None] = {}  # session_id → thread_id
+        self._response_flush_tasks: dict[str, asyncio.Task] = {}  # session_id → fallback timer
+
         # File watchers for workspace change notifications
         self._watchers: dict[str, WorkspaceWatcher] = {}  # session_id → watcher
 
@@ -1488,25 +1495,75 @@ class MessageRouter:
     async def _handle_agent_response(
         self, session: Session, msg: Message
     ) -> None:
-        """Forward the final agent response to the Matrix room (major event)."""
+        """Buffer the agent response — flush to Matrix on turn_end.
+
+        The WebUI gets the response immediately via control socket.
+        Matrix delivery is deferred so that multi-turn investigation
+        only sends the last response, not every intermediate thought.
+        """
         content = msg.payload.get("content", "")
         if not content:
             return
 
-        # Notify control socket subscribers (WebUI)
+        # Notify control socket subscribers (WebUI) immediately
         self._control.notify_response(session.id, content)
 
         thread_id = self._thread_events.get(session.id)
+        log.info(
+            "Buffered agent response for %s (thread=%s): %s",
+            session.room_id, thread_id, content[:80],
+        )
+
+        # Buffer for Matrix — replaced if another response arrives before turn_end
+        self._response_buffer[session.id] = content
+        self._response_buffer_thread[session.id] = thread_id
+
+        # Cancel any existing flush timer and start a new one.
+        # Debounce: wait 5s before sending to Matrix. If another response
+        # arrives (multi-turn investigation), it replaces the buffer and
+        # resets the timer, so only the last response gets sent.
+        old_task = self._response_flush_tasks.pop(session.id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        self._response_flush_tasks[session.id] = asyncio.create_task(
+            self._delayed_response_flush(session.id, 5.0)
+        )
+
+    async def _delayed_response_flush(self, session_id: str, delay: float) -> None:
+        """Fallback: flush buffered response to Matrix if turn_end doesn't arrive."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        self._response_flush_tasks.pop(session_id, None)
+        await self._flush_response_to_matrix(session_id)
+
+    async def _flush_response_to_matrix(self, session_id: str) -> None:
+        """Send the buffered response to Matrix and do emoji cleanup."""
+        content = self._response_buffer.pop(session_id, None)
+        thread_id = self._response_buffer_thread.pop(session_id, None)
+        if not content:
+            return
+
+        # Cancel fallback timer if we're being called from turn_end
+        old_task = self._response_flush_tasks.pop(session_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+        session = self.sessions.get_session(session_id)
+        if not session:
+            return
+
         log.info(
             "Forwarding agent response to %s (thread=%s): %s",
             session.room_id, thread_id, content[:80],
         )
 
         # Stop typing
-        self._stop_typing_refresh(session.id)
+        self._stop_typing_refresh(session_id)
         await self.matrix.set_typing(session.room_id, False)
 
-        # Send to Matrix (this is the major event — the only message per response)
+        # Send to Matrix
         await self.matrix.send_message(
             session.room_id,
             content,
@@ -1515,10 +1572,10 @@ class MessageRouter:
 
         # Complete the emoji flow: remove 🤔, add ✅
         user_event_id = self._thread_events.pop(
-            f"{session.id}:event_id", None
+            f"{session_id}:event_id", None
         )
         user_room_id = self._thread_events.pop(
-            f"{session.id}:room_id", None
+            f"{session_id}:room_id", None
         )
         if user_event_id and user_room_id:
             thinking_key = f"{user_room_id}:{user_event_id}"

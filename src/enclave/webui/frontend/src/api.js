@@ -76,6 +76,15 @@ export const api = {
   // Chat
   getChatHistory: (session, limit = 100, offset = 0) =>
     request(`/chat/${session}/history?limit=${limit}&offset=${offset}`),
+  getChatEvents: (session, { sinceId, level, types, limit } = {}) => {
+    const params = new URLSearchParams()
+    if (sinceId != null) params.set('since_id', sinceId)
+    if (level) params.set('level', level)
+    if (types) params.set('types', types)
+    if (limit) params.set('limit', limit)
+    const qs = params.toString()
+    return request(`/chat/${session}/events${qs ? '?' + qs : ''}`)
+  },
   sendChatMessage: (session, content) => request(`/chat/${session}/send`, {
     method: 'POST',
     body: JSON.stringify({ content }),
