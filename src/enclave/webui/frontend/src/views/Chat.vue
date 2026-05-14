@@ -44,6 +44,22 @@
 
           <!-- Persisted event segments for this turn (tool calls interleaved with responses) -->
           <template v-if="turnEvents[turn.turn_index]?.length">
+            <!-- File attachments always visible (not collapsed with tool calls) -->
+            <template v-for="(seg, si) in turnEvents[turn.turn_index]" :key="'fs-'+si">
+              <template v-for="(evt, ei) in seg.tools" :key="'fs-'+si+'-'+ei">
+                <div v-if="evt.type === 'file_send'" class="file-send-block">
+                  <div class="file-send-label">
+                    <span class="event-icon">📎</span>
+                    <span>{{ evt.data?.filename || 'file' }}</span>
+                  </div>
+                  <div v-if="evt.data?.mimetype?.startsWith('image/')" class="file-send-preview">
+                    <img v-if="evt.data?.file_path" :src="workspaceFileUrl(evt.data.file_path)" class="file-send-img clickable-img" @click="openLightbox(workspaceFileUrl(evt.data.file_path))" />
+                    <img v-else-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img clickable-img" @click="openLightbox(mediaUrl(evt.data.mxc_url))" />
+                  </div>
+                </div>
+              </template>
+            </template>
+
             <div class="turn-events" :class="{ collapsed: !expandedTurns[turn.turn_index] }">
               <div class="events-toggle" @click="expandedTurns[turn.turn_index] = !expandedTurns[turn.turn_index]">
                 <span class="expand-toggle">{{ expandedTurns[turn.turn_index] ? '▼' : '▶' }}</span>
@@ -60,16 +76,6 @@
                         <span v-if="evt.type === 'tool_complete'" class="tool-status" :class="evt.data?.success !== false ? 'success' : 'fail'">
                           {{ evt.data?.success !== false ? '✅' : '❌' }}
                         </span>
-                      </div>
-                    </div>
-                    <div v-else-if="evt.type === 'file_send'" class="tool-block">
-                      <div class="event-header">
-                        <span class="event-icon">📎</span>
-                        <span class="event-label">{{ evt.data?.filename || 'file' }}</span>
-                      </div>
-                      <div v-if="evt.data?.mimetype?.startsWith('image/')" class="file-send-preview">
-                        <img v-if="evt.data?.file_path" :src="workspaceFileUrl(evt.data.file_path)" class="file-send-img clickable-img" @click="openLightbox(workspaceFileUrl(evt.data.file_path))" />
-                        <img v-else-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img clickable-img" @click="openLightbox(mediaUrl(evt.data.mxc_url))" />
                       </div>
                     </div>
                   </div>
@@ -1649,6 +1655,19 @@ function formatTime(ts) {
 
 .file-send-preview {
   padding: 0.25rem 0;
+}
+
+.file-send-block {
+  margin: 0.25rem 0;
+}
+
+.file-send-label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.2rem;
 }
 
 .file-send-img {
