@@ -53,6 +53,12 @@
             <span class="icon">📎</span> Artifacts
           </router-link>
         </li>
+        <li>
+          <router-link to="/asks" active-class="active" @click="sidebarOpen = false">
+            <span class="icon">❓</span> Asks
+            <span v-if="pendingAsks > 0" class="nav-badge">{{ pendingAsks }}</span>
+          </router-link>
+        </li>
       </ul>
     </nav>
     <main class="content">
@@ -62,9 +68,10 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useSessionStore } from './stores/session.js'
+import { api } from './api.js'
 
 const route = useRoute()
 const sidebarOpen = ref(false)
@@ -72,15 +79,34 @@ const { sessions, selectedSessionId, loadSessions } = useSessionStore()
 const activeSessions = computed(() => sessions.value.filter(s => !s.archived))
 const isLoginPage = computed(() => route.name === 'login')
 const hasToken = ref(!!localStorage.getItem('enclave_token'))
+const pendingAsks = ref(0)
+
+async function pollAskCount() {
+  if (!hasToken.value) return
+  try {
+    const data = await api.getAskCount()
+    pendingAsks.value = data.count || 0
+  } catch { /* ignore */ }
+}
+
+let askPollTimer = null
 
 // Only load sessions when authenticated and not on login page
 onMounted(() => {
-  if (!isLoginPage.value && hasToken.value) loadSessions()
+  if (!isLoginPage.value && hasToken.value) {
+    loadSessions()
+    pollAskCount()
+    askPollTimer = setInterval(pollAskCount, 30000)
+  }
 })
+onUnmounted(() => { if (askPollTimer) clearInterval(askPollTimer) })
 watch(isLoginPage, (isLogin) => {
   if (!isLogin) {
     hasToken.value = !!localStorage.getItem('enclave_token')
-    if (hasToken.value) loadSessions()
+    if (hasToken.value) {
+      loadSessions()
+      pollAskCount()
+    }
   }
 })
 </script>
@@ -166,6 +192,18 @@ watch(isLoginPage, (isLogin) => {
 
 .icon {
   font-size: 1.1rem;
+}
+
+.nav-badge {
+  margin-left: auto;
+  background: #ef4444;
+  color: white;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 10px;
+  min-width: 1.2rem;
+  text-align: center;
 }
 
 .content {

@@ -1007,6 +1007,8 @@ class MessageRouter:
                     html_body=html,
                     thread_event_id=thread_id,
                 )
+        elif msg.type == MessageType.ASK_DEFERRED:
+            await self._handle_ask_deferred(session, msg)
         else:
             log.debug(
                 "Unhandled IPC message type from %s: %s",
@@ -1631,6 +1633,34 @@ class MessageRouter:
         self._response_flush_tasks[session.id] = asyncio.create_task(
             self._delayed_response_flush(session.id, 5.0)
         )
+
+    async def _handle_ask_deferred(
+        self, session: Session, msg: Message
+    ) -> None:
+        """Handle a non-blocking question from the agent."""
+        from enclave.webui.deferred_asks import get_deferred_asks_store
+
+        payload = msg.payload
+        question = payload.get("question", "")
+        if not question:
+            return
+
+        log.info("Agent %s deferred ask: %s", session.id, question[:80])
+
+        workspace_base = Path(self.config.container.workspace_base)
+        store = get_deferred_asks_store(workspace_base)
+        ask = store.add(
+            session_id=session.id,
+            question=question,
+            choices=payload.get("choices"),
+            context=payload.get("context"),
+            priority=payload.get("priority", "normal"),
+            tags=payload.get("tags"),
+        )
+
+        # Notify control socket so WebUI can update badge count
+        if self._control:
+            self._control.notify_deferred_ask(session.id, ask)
 
     async def _handle_agent_status(
         self, session: Session, msg: Message

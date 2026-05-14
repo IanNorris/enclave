@@ -121,6 +121,14 @@ class ControlServer:
         """Called by the router for structured agent responses (rich cards)."""
         self._emit(session_id, {"ok": True, "type": "structured_response", **payload})
 
+    def notify_deferred_ask(self, session_id: str, ask: dict) -> None:
+        """Called by the router when an agent posts a non-blocking question."""
+        self._emit(session_id, {"ok": True, "type": "deferred_ask", **ask})
+        # Also broadcast to all sessions so the global badge updates
+        for sid in list(self._subscribers.keys()):
+            if sid != session_id:
+                self._emit(sid, {"ok": True, "type": "deferred_ask_badge", "session_id": session_id})
+
     def notify_turn_start(self, session_id: str) -> None:
         """Called by the router when an agent turn begins."""
         self._emit(session_id, {"ok": True, "type": "turn_start"})

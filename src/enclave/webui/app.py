@@ -65,7 +65,7 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     app.include_router(auth_router)
 
     # Protected API routers — require valid JWT
-    from enclave.webui.routes import bugs, chat, memories, sessions
+    from enclave.webui.routes import asks, bugs, chat, memories, sessions
 
     app.include_router(
         sessions.router,
@@ -108,6 +108,11 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
         chat.ws_router,
         prefix="/api/chat",
         tags=["chat"],
+    )
+    app.include_router(
+        asks.router,
+        prefix="/api",
+        dependencies=[Depends(get_current_user)],
     )
 
     # Health check (unprotected)

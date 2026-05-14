@@ -88,7 +88,7 @@
             <div class="structured-summary" v-html="renderMarkdown(turn.structured.summary)"></div>
             <div v-if="turn.structured.images?.length" class="structured-images">
               <img v-for="(img, ii) in turn.structured.images" :key="ii"
-                   :src="`/api/chat/${selectedSession}/file/${encodeURIComponent(img)}`"
+                   :src="workspaceFileUrl(img)"
                    class="structured-img" @click="lightboxImage = img" />
             </div>
             <details v-if="turn.structured.details" class="structured-details">
@@ -101,7 +101,7 @@
             <div v-if="turn.structured.actions?.length" class="structured-actions">
               <div v-for="(action, ai) in turn.structured.actions" :key="ai" class="structured-action">
                 <img v-if="action.image"
-                     :src="`/api/chat/${selectedSession}/file/${encodeURIComponent(action.image)}`"
+                     :src="workspaceFileUrl(action.image)"
                      class="action-img" />
                 <button class="action-btn" @click="sendActionReply(action.label)">{{ action.label }}</button>
               </div>
@@ -852,6 +852,11 @@ function renderMarkdown(text) {
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim()
   // Convert mxc:// URLs to proxied URLs for images
   cleaned = cleaned.replace(/mxc:\/\/([^/\s]+)\/([^)\s]+)/g, '/api/chat/media/$1/$2')
+  // Rewrite /workspace/ paths to proxy URLs so embedded images work
+  if (selectedSession.value) {
+    cleaned = cleaned.replace(/\/workspace\/([^)\s"']+)/g, (_, p) =>
+      `/api/chat/${selectedSession.value}/file/${p.split('/').map(encodeURIComponent).join('/')}`)
+  }
   const display = cleaned.length > 10000 ? cleaned.slice(0, 10000) + '\n\n…(truncated)' : cleaned
   return md.render(display)
 }
@@ -876,8 +881,18 @@ function downloadMarkdown(structured) {
 
 function sendActionReply(label) {
   if (!selectedSession.value) return
-  userMessage.value = label
+  draft.value = label
   sendMessage()
+}
+
+function workspaceFileUrl(filePath) {
+  // Strip leading /workspace/ prefix if present, then build the proxy URL
+  // Each path segment is individually encoded to preserve slashes
+  let rel = filePath
+  if (rel.startsWith('/workspace/')) rel = rel.slice('/workspace/'.length)
+  else if (rel.startsWith('/')) rel = rel.slice(1)
+  const encoded = rel.split('/').map(encodeURIComponent).join('/')
+  return `/api/chat/${selectedSession.value}/file/${encoded}`
 }
 
 const lightboxImage = ref(null)

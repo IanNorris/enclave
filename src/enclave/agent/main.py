@@ -3009,6 +3009,92 @@ async def try_init_copilot(
         )
         custom_tools.append(structured_response_tool)
 
+        # Custom tool: ask_deferred — non-blocking question to the user
+        async def _ask_deferred_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            question = args.get("question", "").strip()
+            if not question:
+                return ToolResult(
+                    text_result_for_llm="Error: 'question' parameter is required.",
+                    result_type="error",
+                )
+            payload: dict[str, Any] = {"question": question}
+            context = args.get("context", "").strip()
+            if context:
+                payload["context"] = context
+            choices = args.get("choices")
+            if choices:
+                payload["choices"] = choices
+            priority = args.get("priority", "normal")
+            if priority in ("low", "normal", "high"):
+                payload["priority"] = priority
+            tags = args.get("tags")
+            if tags:
+                payload["tags"] = tags
+            if ipc and ipc.is_connected:
+                await ipc.send(Message(
+                    type=MessageType.ASK_DEFERRED,
+                    payload=payload,
+                ))
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Question queued for the user. They will answer when "
+                        "available — continue with other work. The answer will "
+                        "arrive as a message with the original context."
+                    ),
+                )
+            return ToolResult(
+                text_result_for_llm="Error: not connected to orchestrator",
+                result_type="error",
+            )
+
+        ask_deferred_tool = Tool(
+            name="ask_deferred",
+            description=(
+                "Ask the user a non-blocking question. Unlike ask_user (which pauses "
+                "your work until they reply), this queues the question and lets you "
+                "continue working. The user sees it in their 'Agent Asks' tab and can "
+                "answer at their leisure. Provide enough context so you can resume "
+                "the relevant task when the answer eventually arrives."
+            ),
+            handler=_ask_deferred_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "Context for resuming work when the answer arrives. "
+                            "Explain what you're working on and how the answer "
+                            "affects your next steps."
+                        ),
+                    },
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional choice buttons for the user.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "normal", "high"],
+                        "description": "How urgent the question is. Default: normal.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags for categorization (e.g. 'design', 'architecture').",
+                    },
+                },
+                "required": ["question", "context"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(ask_deferred_tool)
+
         # Custom tool: enter_nix_shell — restart under a nix-shell environment
         async def _enter_nix_shell_handler(invocation: object) -> ToolResult:
             args = getattr(invocation, "arguments", {}) or {}

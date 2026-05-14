@@ -38,6 +38,11 @@ const routes = [
     name: 'artifacts',
     component: () => import('./views/Artifacts.vue'),
   },
+  {
+    path: '/asks',
+    name: 'asks',
+    component: () => import('./views/Asks.vue'),
+  },
 ]
 
 const router = createRouter({

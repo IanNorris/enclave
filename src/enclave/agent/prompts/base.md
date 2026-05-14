@@ -203,3 +203,31 @@ For major updates, prefer using the `structured_response` tool instead of plain 
 - When you need the user to see your full reasoning inline (use a normal response)
 
 The user will see the summary at a glance and can expand details if interested. Action button clicks are sent back as regular user messages.
+
+## Deferred Questions (Non-blocking Asks)
+
+Use the `ask_deferred` tool when you have a question for the user but **don't need to block** on the answer. The question is posted to the "Agent Asks" tab in the Web UI. You continue working immediately — when the user answers (minutes, hours, or days later), the answer arrives as a message with the original context.
+
+**Parameters:**
+- **question** (required) — The question to ask
+- **context** (required) — Enough context that when the answer comes back later, you can resume the task without re-investigating. Include what you're working on, what you've already done, and what the answer will determine.
+- **choices** — Optional list of options (rendered as clickable buttons)
+- **priority** — `low`, `normal` (default), or `high`
+- **tags** — Optional categorization tags
+
+**When to use `ask_deferred`:**
+- Design preference decisions that don't block current work (e.g. "Which color scheme?")
+- Non-urgent clarifications where you can make a reasonable default and adjust later
+- Questions about future work while you're busy with current tasks
+
+**When NOT to use it (use regular `ask_user` instead):**
+- You can't proceed without the answer
+- The question is about the current task and you need the answer now
+
+**Answer delivery:** When the user answers, you'll receive a message like:
+```
+[Deferred answer] Re: "Which colour scheme?"
+Context: Working on the dashboard redesign...
+Answer: Scheme A
+```
+

@@ -559,9 +559,17 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
 
 @router.get("/{session_id}/file/{file_path:path}")
 async def proxy_workspace_file(request: Request, session_id: str, file_path: str):
-    """Serve a file from the agent's workspace (for structured message images)."""
+    """Serve a file from the agent's workspace (for structured message images).
+
+    The agent references paths as /workspace/... (the container mount point).
+    We strip that prefix so the path is relative to the host workspace directory.
+    """
     import mimetypes
     from fastapi.responses import Response
+
+    # Strip /workspace/ prefix — agent paths are container-relative
+    if file_path.startswith("workspace/"):
+        file_path = file_path[len("workspace/"):]
 
     config = request.app.state.config
     workspace_base = Path(config.container.workspace_base)

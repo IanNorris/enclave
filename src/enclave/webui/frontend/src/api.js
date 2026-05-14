@@ -101,4 +101,17 @@ export const api = {
   getArtifactDiff: (id, filename, v1, v2) => request(`/sessions/${id}/artifacts/${filename}/diff?v1=${v1}&v2=${v2}`),
   getArtifactVersions: (id, filename) => request(`/sessions/${id}/artifacts/${filename}/versions`),
   artifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}`,
+
+  // Deferred Asks
+  getAsks: (sessionId, status = 'pending') => {
+    const params = new URLSearchParams({ status })
+    if (sessionId) params.set('session_id', sessionId)
+    return request(`/asks?${params}`)
+  },
+  getAskCount: () => request('/asks/count'),
+  answerAsk: (askId, answer) => request(`/asks/${askId}/answer`, {
+    method: 'POST',
+    body: JSON.stringify({ answer }),
+  }),
+  dismissAsk: (askId) => request(`/asks/${askId}/dismiss`, { method: 'POST' }),
 }
