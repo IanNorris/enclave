@@ -23,7 +23,7 @@
       </div>
 
       <!-- Messages -->
-      <div class="messages" ref="messagesEl" @scroll="onMessagesScroll">
+      <div class="messages" ref="messagesEl" @scroll="onMessagesScroll" @click="onMessagesClick">
         <!-- Load earlier button -->
         <div v-if="hasMore" class="load-earlier">
           <button class="secondary" @click="loadEarlier" :disabled="loadingMore">
@@ -68,8 +68,8 @@
                         <span class="event-label">{{ evt.data?.filename || 'file' }}</span>
                       </div>
                       <div v-if="evt.data?.mimetype?.startsWith('image/')" class="file-send-preview">
-                        <img v-if="evt.data?.file_path" :src="workspaceFileUrl(evt.data.file_path)" class="file-send-img" />
-                        <img v-else-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img" />
+                        <img v-if="evt.data?.file_path" :src="workspaceFileUrl(evt.data.file_path)" class="file-send-img clickable-img" @click="openLightbox(workspaceFileUrl(evt.data.file_path))" />
+                        <img v-else-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img clickable-img" @click="openLightbox(mediaUrl(evt.data.mxc_url))" />
                       </div>
                     </div>
                   </div>
@@ -93,7 +93,7 @@
             <div v-if="turn.structured.images?.length" class="structured-images">
               <img v-for="(img, ii) in turn.structured.images" :key="ii"
                    :src="workspaceFileUrl(img)"
-                   class="structured-img" @click="lightboxImage = img" />
+                   class="structured-img clickable-img" @click="openLightbox(workspaceFileUrl(img))" />
             </div>
             <details v-if="turn.structured.details" class="structured-details">
               <summary>Details</summary>
@@ -106,7 +106,7 @@
               <div v-for="(action, ai) in turn.structured.actions" :key="ai" class="structured-action">
                 <img v-if="action.image"
                      :src="workspaceFileUrl(action.image)"
-                     class="action-img" />
+                     class="action-img clickable-img" @click="openLightbox(workspaceFileUrl(action.image))" />
                 <button class="action-btn" @click="sendActionReply(action.label)">{{ action.label }}</button>
               </div>
             </div>
@@ -195,8 +195,8 @@
                 <span class="event-label">{{ evt.filename }}</span>
               </div>
               <div v-if="evt.mimetype?.startsWith('image/')" class="file-send-preview">
-                <img v-if="evt.filePath" :src="workspaceFileUrl(evt.filePath)" class="file-send-img" />
-                <img v-else-if="evt.mxcUrl" :src="mediaUrl(evt.mxcUrl)" class="file-send-img" />
+                <img v-if="evt.filePath" :src="workspaceFileUrl(evt.filePath)" class="file-send-img clickable-img" @click="openLightbox(workspaceFileUrl(evt.filePath))" />
+                <img v-else-if="evt.mxcUrl" :src="mediaUrl(evt.mxcUrl)" class="file-send-img clickable-img" @click="openLightbox(mediaUrl(evt.mxcUrl))" />
               </div>
             </div>
           </div>
@@ -283,6 +283,21 @@
     <div v-else class="empty-state">
       <p class="muted">Select a session to start chatting.</p>
     </div>
+
+    <!-- Lightbox gallery overlay -->
+    <teleport to="body">
+      <transition name="lightbox-fade">
+        <div v-if="lightboxImage" class="lightbox-overlay" @click.self="lightboxImage = null">
+          <button class="lightbox-close" @click="lightboxImage = null" title="Close">✕</button>
+          <button v-if="lightboxIndex > 0" class="lightbox-nav lightbox-prev" @click="lightboxPrev" title="Previous">‹</button>
+          <img :src="lightboxImageUrl" class="lightbox-img" @click.stop />
+          <button v-if="lightboxIndex < galleryImages.length - 1" class="lightbox-nav lightbox-next" @click="lightboxNext" title="Next">›</button>
+          <div class="lightbox-counter" v-if="galleryImages.length > 1">
+            {{ lightboxIndex + 1 }} / {{ galleryImages.length }}
+          </div>
+        </div>
+      </transition>
+    </teleport>
   </div>
 </template>
 
@@ -378,11 +393,13 @@ onMounted(async () => {
   if (selectedSession.value) {
     loadHistory()
   }
+  window.addEventListener('keydown', onLightboxKey)
 })
 
 onUnmounted(() => {
   if (ws) ws.close()
   pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
+  window.removeEventListener('keydown', onLightboxKey)
 })
 
 watch(selectedSession, (newVal) => {
@@ -915,6 +932,15 @@ function onDrop(event) {
   if (files?.length) addFiles(files)
 }
 
+function onMessagesClick(event) {
+  // Delegate click on any <img> inside rendered markdown to open lightbox
+  const img = event.target.closest('.message-body img')
+  if (img && img.src) {
+    event.preventDefault()
+    openLightbox(img.src)
+  }
+}
+
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -1014,7 +1040,72 @@ function mediaUrl(mxcUrl) {
   return `/api/chat/media/${parts[0]}/${parts[1]}?token=${encodeURIComponent(token)}`
 }
 
-const lightboxImage = ref(null)
+// Gallery / lightbox
+const lightboxImage = ref(null) // stores the URL of the currently viewed image
+
+const galleryImages = computed(() => {
+  const imgs = []
+  // Collect from turns
+  for (const turn of turns.value) {
+    if (turn.structured?.images?.length) {
+      for (const img of turn.structured.images) imgs.push(workspaceFileUrl(img))
+    }
+    if (turn.structured?.actions?.length) {
+      for (const a of turn.structured.actions) {
+        if (a.image) imgs.push(workspaceFileUrl(a.image))
+      }
+    }
+    // Persisted events
+    const evts = turnEvents.value[turn.turn_index]
+    if (evts) {
+      for (const seg of evts) {
+        for (const evt of (seg.events || [])) {
+          if (evt.type === 'file_send' && evt.data?.mimetype?.startsWith('image/')) {
+            if (evt.data.file_path) imgs.push(workspaceFileUrl(evt.data.file_path))
+            else if (evt.data.mxc_url) imgs.push(mediaUrl(evt.data.mxc_url))
+          }
+        }
+      }
+    }
+  }
+  // Collect from live events
+  for (const evt of liveEvents.value) {
+    if (evt.type === 'file_send' && evt.mimetype?.startsWith('image/')) {
+      if (evt.filePath) imgs.push(workspaceFileUrl(evt.filePath))
+      else if (evt.mxcUrl) imgs.push(mediaUrl(evt.mxcUrl))
+    }
+  }
+  return imgs
+})
+
+const lightboxIndex = computed(() => {
+  if (!lightboxImage.value) return -1
+  const idx = galleryImages.value.indexOf(lightboxImage.value)
+  return idx >= 0 ? idx : 0
+})
+
+const lightboxImageUrl = computed(() => lightboxImage.value || '')
+
+function openLightbox(url) {
+  lightboxImage.value = url
+}
+
+function lightboxPrev() {
+  const idx = lightboxIndex.value
+  if (idx > 0) lightboxImage.value = galleryImages.value[idx - 1]
+}
+
+function lightboxNext() {
+  const idx = lightboxIndex.value
+  if (idx < galleryImages.value.length - 1) lightboxImage.value = galleryImages.value[idx + 1]
+}
+
+function onLightboxKey(e) {
+  if (!lightboxImage.value) return
+  if (e.key === 'Escape') lightboxImage.value = null
+  else if (e.key === 'ArrowLeft') lightboxPrev()
+  else if (e.key === 'ArrowRight') lightboxNext()
+}
 
 function formatTime(ts) {
   if (!ts) return ''
@@ -1723,4 +1814,99 @@ function formatTime(ts) {
 }
 
 /* Chat container needs relative positioning for jump button */
+
+/* Clickable images */
+.clickable-img {
+  cursor: zoom-in;
+}
+.message-body :deep(img) {
+  cursor: zoom-in;
+  max-width: 100%;
+  border-radius: var(--radius-sm, 4px);
+}
+
+/* Lightbox gallery overlay (not scoped — teleported to body) */
+</style>
+
+<style>
+.lightbox-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(4px);
+}
+
+.lightbox-img {
+  max-width: 90vw;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+  user-select: none;
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  background: rgba(255, 255, 255, 0.15);
+  border: none;
+  color: #fff;
+  font-size: 1.5rem;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+.lightbox-close:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  background: rgba(255, 255, 255, 0.12);
+  border: none;
+  color: #fff;
+  font-size: 2.5rem;
+  width: 50px;
+  height: 70px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+  user-select: none;
+}
+.lightbox-nav:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+.lightbox-prev { left: 1rem; }
+.lightbox-next { right: 1rem; }
+
+.lightbox-counter {
+  position: absolute;
+  bottom: 1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.85rem;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 0.25rem 0.75rem;
+  border-radius: 12px;
+}
+
+.lightbox-fade-enter-active { transition: opacity 0.2s ease; }
+.lightbox-fade-leave-active { transition: opacity 0.15s ease; }
+.lightbox-fade-enter-from, .lightbox-fade-leave-to { opacity: 0; }
 </style>
