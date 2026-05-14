@@ -67,8 +67,9 @@
                         <span class="event-icon">📎</span>
                         <span class="event-label">{{ evt.data?.filename || 'file' }}</span>
                       </div>
-                      <div v-if="evt.data?.mimetype?.startsWith('image/') || evt.data?.mxc_url" class="file-send-preview">
-                        <img v-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img" />
+                      <div v-if="evt.data?.mimetype?.startsWith('image/')" class="file-send-preview">
+                        <img v-if="evt.data?.file_path" :src="workspaceFileUrl(evt.data.file_path)" class="file-send-img" />
+                        <img v-else-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img" />
                       </div>
                     </div>
                   </div>
@@ -159,8 +160,8 @@
                 <span class="event-label">{{ evt.filename }}</span>
               </div>
               <div v-if="evt.mimetype?.startsWith('image/')" class="file-send-preview">
-                <img v-if="evt.mxcUrl" :src="mediaUrl(evt.mxcUrl)" class="file-send-img" />
-                <img v-else-if="evt.filename" :src="workspaceFileUrl(evt.filename)" class="file-send-img" />
+                <img v-if="evt.filePath" :src="workspaceFileUrl(evt.filePath)" class="file-send-img" />
+                <img v-else-if="evt.mxcUrl" :src="mediaUrl(evt.mxcUrl)" class="file-send-img" />
               </div>
             </div>
           </div>
@@ -655,6 +656,7 @@ function handleStreamEvent(msg) {
     liveEvents.value.push(reactive({
       type: 'file_send',
       filename,
+      filePath: msg.file_path || '',
       mxcUrl,
       mimetype: msg.mimetype || '',
       collapsed: false,

@@ -98,7 +98,7 @@ class ControlServer:
 
     def notify_file_send(
         self, session_id: str, filename: str, mimetype: str = "",
-        mxc_url: str = "", event_id: str = "",
+        mxc_url: str = "", event_id: str = "", file_path: str = "",
     ) -> None:
         """Called by the router when an agent uploads a file."""
         self._emit(session_id, {
@@ -107,6 +107,7 @@ class ControlServer:
             "mimetype": mimetype,
             "mxc_url": mxc_url,
             "event_id": event_id,
+            "file_path": file_path,
         })
 
     def notify_ask_user(self, session_id: str, question: str, choices: list[str] | None = None) -> None:

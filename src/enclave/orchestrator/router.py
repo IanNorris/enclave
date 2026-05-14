@@ -1877,7 +1877,7 @@ class MessageRouter:
             filename = os.path.basename(file_path)
             self._control.notify_file_send(
                 session.id, filename=filename, mimetype=mimetype,
-                event_id=event_id,
+                event_id=event_id, file_path=file_path,
             )
 
         return Message(
