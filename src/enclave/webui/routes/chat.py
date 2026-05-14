@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 router = APIRouter()
 ws_router = APIRouter()  # Separate router for WebSocket (no OAuth2 dependency)
+public_router = APIRouter()  # Routes that accept ?token= query param auth (for <img> etc.)
 
 # In-memory cache of recent agent responses not yet in session-store.db.
 # Keyed by session_id → list of {role, content, timestamp}.
@@ -575,12 +576,8 @@ async def set_model(request: Request, session_id: str, body: SendMessage):
 async def upload_file(request: Request, session_id: str, file: UploadFile = File(...), message: str = ""):
     """Upload a file and send it to the agent via control socket (with attachment metadata).
 
-    Also uploads to Matrix for the conversation record.
+    Also uploads to Matrix for the conversation record (best-effort).
     """
-    room_id = _get_room_id(request, session_id)
-    if not room_id:
-        raise HTTPException(status_code=404, detail="Session room not found")
-
     config = request.app.state.config
     content = await file.read()
     content_type = file.content_type or "application/octet-stream"
@@ -605,28 +602,52 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
         data_dir, session_id, text_content, attachments=[attachment_meta]
     )
 
-    # Also upload to Matrix for the conversation record
-    try:
-        mat_config = _matrix_config(request)
-        mxc_uri = await _upload_matrix_file(mat_config, filename, content, content_type)
-        await _send_matrix_file(mat_config, room_id, mxc_uri, filename, len(content), content_type)
-    except Exception:
-        pass  # Matrix upload is best-effort for the record
+    # Also upload to Matrix for the conversation record (best-effort)
+    room_id = _get_room_id(request, session_id)
+    if room_id:
+        try:
+            mat_config = _matrix_config(request)
+            mxc_uri = await _upload_matrix_file(mat_config, filename, content, content_type)
+            await _send_matrix_file(mat_config, room_id, mxc_uri, filename, len(content), content_type)
+        except Exception:
+            pass  # Matrix upload is best-effort for the record
 
     if sent_to_agent:
         return {"sent": True, "via": "control_socket", "filename": filename}
 
-    # Fallback: if control socket failed, at least it's in Matrix
-    return {"sent": True, "via": "matrix_only", "filename": filename}
+    return {"sent": True, "via": "workspace_only", "filename": filename}
 
 
-@router.get("/{session_id}/file/{file_path:path}")
-async def proxy_workspace_file(request: Request, session_id: str, file_path: str):
+def _validate_file_auth(request: Request, token_param: str | None):
+    """Validate auth via ?token= query param or Authorization header.
+
+    Used for endpoints that serve files to <img>/<a> tags which can't send headers.
+    """
+    from fastapi import Query
+    from enclave.webui.auth import validate_token
+
+    if token_param:
+        validate_token(token_param)
+    else:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            validate_token(auth_header[7:])
+        else:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+@public_router.get("/{session_id}/file/{file_path:path}")
+async def proxy_workspace_file(
+    request: Request, session_id: str, file_path: str, token: str | None = None
+):
     """Serve a file from the agent's workspace (for structured message images).
 
     The agent references paths as /workspace/... (the container mount point).
     We strip that prefix so the path is relative to the host workspace directory.
+    Auth via ?token= query param so <img src="...?token=X"> works.
     """
+    _validate_file_auth(request, token)
+
     import mimetypes
     from fastapi.responses import Response
 
@@ -657,16 +678,20 @@ async def proxy_workspace_file(request: Request, session_id: str, file_path: str
     return Response(content=content, media_type=ct)
 
 
-@router.get("/media/{server_name}/{media_id}")
-async def proxy_matrix_media(request: Request, server_name: str, media_id: str):
+@public_router.get("/media/{server_name}/{media_id}")
+async def proxy_matrix_media(
+    request: Request, server_name: str, media_id: str, token: str | None = None
+):
     """Proxy Matrix media (mxc://) so the browser can display images."""
+    _validate_file_auth(request, token)
+
     config = _matrix_config(request)
-    token = await _get_matrix_token(config)
+    mat_token = await _get_matrix_token(config)
 
     # Use the authenticated media download endpoint
     url = f"{config.homeserver}/_matrix/client/v1/media/download/{server_name}/{media_id}"
     async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {"Authorization": f"Bearer {mat_token}"}
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
                 raise HTTPException(status_code=resp.status, detail="Media not found")

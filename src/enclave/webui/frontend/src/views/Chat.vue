@@ -62,10 +62,13 @@
                         </span>
                       </div>
                     </div>
-                    <div v-else-if="evt.type === 'file_send'" class="tool-block collapsed">
+                    <div v-else-if="evt.type === 'file_send'" class="tool-block">
                       <div class="event-header">
                         <span class="event-icon">📎</span>
                         <span class="event-label">{{ evt.data?.filename || 'file' }}</span>
+                      </div>
+                      <div v-if="evt.data?.mimetype?.startsWith('image/') || evt.data?.mxc_url" class="file-send-preview">
+                        <img v-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img" />
                       </div>
                     </div>
                   </div>
@@ -146,6 +149,18 @@
                 </span>
                 <span v-else class="tool-spinner">⏳</span>
                 <span class="expand-toggle">{{ evt.collapsed ? '▶' : '▼' }}</span>
+              </div>
+            </div>
+
+            <!-- File sent by agent -->
+            <div v-if="evt.type === 'file_send'" class="tool-block">
+              <div class="event-header">
+                <span class="event-icon">📎</span>
+                <span class="event-label">{{ evt.filename }}</span>
+              </div>
+              <div v-if="evt.mimetype?.startsWith('image/')" class="file-send-preview">
+                <img v-if="evt.mxcUrl" :src="mediaUrl(evt.mxcUrl)" class="file-send-img" />
+                <img v-else-if="evt.filename" :src="workspaceFileUrl(evt.filename)" class="file-send-img" />
               </div>
             </div>
           </div>
@@ -633,6 +648,21 @@ function handleStreamEvent(msg) {
     return
   }
 
+  if (type === 'file_send') {
+    // Agent sent a file — show it as a live event
+    const filename = msg.filename || 'file'
+    const mxcUrl = msg.mxc_url || ''
+    liveEvents.value.push(reactive({
+      type: 'file_send',
+      filename,
+      mxcUrl,
+      mimetype: msg.mimetype || '',
+      collapsed: false,
+    }))
+    nextTick(() => scrollToBottom())
+    return
+  }
+
   if (type === 'response') {
     setAgentState('responding')
     // Final response — promote to a synthetic turn immediately so it
@@ -850,12 +880,14 @@ function renderMarkdown(text) {
   let cleaned = text.replace(/<current_datetime>[^<]*<\/current_datetime>/g, '')
   // Trim excessive whitespace left behind
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim()
-  // Convert mxc:// URLs to proxied URLs for images
-  cleaned = cleaned.replace(/mxc:\/\/([^/\s]+)\/([^)\s]+)/g, '/api/chat/media/$1/$2')
+  // Convert mxc:// URLs to proxied URLs for images (with auth token)
+  const authToken = encodeURIComponent(localStorage.getItem('enclave_token') || '')
+  cleaned = cleaned.replace(/mxc:\/\/([^/\s]+)\/([^)\s]+)/g,
+    (_, server, id) => `/api/chat/media/${server}/${id}?token=${authToken}`)
   // Rewrite /workspace/ paths to proxy URLs so embedded images work
   if (selectedSession.value) {
     cleaned = cleaned.replace(/\/workspace\/([^)\s"']+)/g, (_, p) =>
-      `/api/chat/${selectedSession.value}/file/${p.split('/').map(encodeURIComponent).join('/')}`)
+      `/api/chat/${selectedSession.value}/file/${p.split('/').map(encodeURIComponent).join('/')}?token=${authToken}`)
   }
   const display = cleaned.length > 10000 ? cleaned.slice(0, 10000) + '\n\n…(truncated)' : cleaned
   return md.render(display)
@@ -882,7 +914,7 @@ function downloadMarkdown(structured) {
 function sendActionReply(label) {
   if (!selectedSession.value) return
   draft.value = label
-  sendMessage()
+  send()
 }
 
 function workspaceFileUrl(filePath) {
@@ -892,7 +924,17 @@ function workspaceFileUrl(filePath) {
   if (rel.startsWith('/workspace/')) rel = rel.slice('/workspace/'.length)
   else if (rel.startsWith('/')) rel = rel.slice(1)
   const encoded = rel.split('/').map(encodeURIComponent).join('/')
-  return `/api/chat/${selectedSession.value}/file/${encoded}`
+  const token = localStorage.getItem('enclave_token') || ''
+  return `/api/chat/${selectedSession.value}/file/${encoded}?token=${encodeURIComponent(token)}`
+}
+
+function mediaUrl(mxcUrl) {
+  // Convert mxc://server/mediaId to proxied URL with auth
+  if (!mxcUrl || !mxcUrl.startsWith('mxc://')) return ''
+  const parts = mxcUrl.slice('mxc://'.length).split('/')
+  if (parts.length < 2) return ''
+  const token = localStorage.getItem('enclave_token') || ''
+  return `/api/chat/media/${parts[0]}/${parts[1]}?token=${encodeURIComponent(token)}`
 }
 
 const lightboxImage = ref(null)
@@ -1428,6 +1470,17 @@ function formatTime(ts) {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   overflow: hidden;
+}
+
+.file-send-preview {
+  padding: 0.4rem 0.6rem;
+}
+
+.file-send-img {
+  max-width: 300px;
+  max-height: 200px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
 }
 
 .event-header {

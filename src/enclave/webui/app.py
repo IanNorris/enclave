@@ -109,6 +109,12 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
         prefix="/api/chat",
         tags=["chat"],
     )
+    # File/media proxy routes accept ?token= query param (browser <img> can't send headers)
+    app.include_router(
+        chat.public_router,
+        prefix="/api/chat",
+        tags=["chat"],
+    )
     app.include_router(
         asks.router,
         prefix="/api",
