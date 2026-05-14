@@ -1647,7 +1647,8 @@ class MessageRouter:
 
         log.info("Agent %s deferred ask: %s", session.id, question[:80])
 
-        workspace_base = Path(self.config.container.workspace_base)
+        # Derive workspace_base from session's workspace_path (its parent)
+        workspace_base = Path(session.workspace_path).parent
         store = get_deferred_asks_store(workspace_base)
         ask = store.add(
             session_id=session.id,
