@@ -60,6 +60,16 @@ def _discover_sessions(request: Request) -> list[dict[str, Any]]:
     if not ws_base.exists():
         return sessions
 
+    # Load orchestrator sessions.json for extra metadata (ACP fields etc.)
+    orch_sessions: dict[str, dict] = {}
+    orch_file = _session_base(request) / "sessions.json"
+    if orch_file.exists():
+        try:
+            for s in json.loads(orch_file.read_text()):
+                orch_sessions[s["id"]] = s
+        except Exception:
+            pass
+
     for entry in sorted(ws_base.iterdir()):
         if not entry.is_dir():
             continue
@@ -80,13 +90,25 @@ def _discover_sessions(request: Request) -> list[dict[str, Any]]:
             except Exception:
                 pass
 
-        sessions.append({
+        orch = orch_sessions.get(session_id, {})
+        if orch.get("name"):
+            name = orch["name"]
+
+        info: dict[str, Any] = {
             "id": session_id,
             "name": name,
             "status": "running" if is_running else "stopped",
             "archived": archived,
             "workspace": str(entry),
-        })
+        }
+
+        # Include ACP remote info if present
+        if orch.get("acp_host"):
+            info["acp_host"] = orch["acp_host"]
+            info["acp_port"] = orch.get("acp_port", 0)
+            info["acp_remote"] = True
+
+        sessions.append(info)
 
     return sessions
 

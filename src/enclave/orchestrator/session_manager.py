@@ -56,6 +56,11 @@ class Session:
     nix_shell_path: str = ""  # path to shell.nix/flake.nix for nix-shell wrapping
     extra_mounts: list[dict[str, str]] = field(default_factory=list)  # [{source, mount_name}]
     port_mappings: list[dict[str, Any]] = field(default_factory=list)  # [{container_port, host_port, protocol}]
+    # ACP remote agent fields
+    acp_host: str = ""  # Remote ACP server hostname/IP
+    acp_port: int = 0  # Remote ACP server port
+    acp_session_id: str = ""  # The ACP session ID on the remote CLI
+    acp_remote_cwd: str = ""  # Working directory on the remote machine
 
 
 def _slugify(name: str) -> str:
@@ -139,6 +144,10 @@ class SessionManager:
                     nix_shell_path=s.get("nix_shell_path", ""),
                     extra_mounts=s.get("extra_mounts", []),
                     port_mappings=s.get("port_mappings", []),
+                    acp_host=s.get("acp_host", ""),
+                    acp_port=s.get("acp_port", 0),
+                    acp_session_id=s.get("acp_session_id", ""),
+                    acp_remote_cwd=s.get("acp_remote_cwd", ""),
                 )
                 self._sessions[session.id] = session
             log.info("Loaded %d persisted sessions", len(self._sessions))
@@ -166,6 +175,10 @@ class SessionManager:
                 "nix_shell_path": s.nix_shell_path,
                 "extra_mounts": s.extra_mounts,
                 "port_mappings": s.port_mappings,
+                "acp_host": s.acp_host,
+                "acp_port": s.acp_port,
+                "acp_session_id": s.acp_session_id,
+                "acp_remote_cwd": s.acp_remote_cwd,
             })
         try:
             self._sessions_file.write_text(json.dumps(data, indent=2))

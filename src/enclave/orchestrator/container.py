@@ -35,6 +35,7 @@ class ContainerManager:
     def __init__(self, config: ContainerConfig, *, mimir: MimirConfig | None = None):
         self.config = config
         self.mimir = mimir
+        self._acp_bridges: dict[str, "ACPBridge"] = {}
 
     async def start_session(self, session: Session) -> tuple[bool, str]:
         """Start the runtime for a session (container or host process).
@@ -45,6 +46,10 @@ class ContainerManager:
         socket_dir = str(Path(session.socket_path).parent)
 
         profile = self.config.get_profile(session.profile)
+
+        # ACP remote mode: connect to remote Copilot CLI via ACP protocol
+        if session.acp_host and session.acp_port:
+            return await self._start_acp_session(session)
 
         # Host mode: spawn subprocess instead of container
         if profile.image == "":
@@ -401,6 +406,46 @@ class ContainerManager:
             log.error("[start:%s] Failed to start host agent: %s", session.id, e)
             return False, f"Host mode start failed: {e}"
 
+    async def _start_acp_session(self, session: Session) -> tuple[bool, str]:
+        """Start an ACP remote session by connecting to a remote Copilot CLI.
+
+        Instead of spawning a process, creates an ACPBridge that connects
+        to the IPC socket (as a virtual agent) and to the remote ACP server.
+        """
+        from enclave.orchestrator.acp_bridge import ACPBridge
+
+        log.info(
+            "[start:%s] Starting ACP remote session to %s:%d",
+            session.id, session.acp_host, session.acp_port,
+        )
+
+        bridge = ACPBridge(
+            session_id=session.id,
+            socket_path=session.socket_path,
+            acp_host=session.acp_host,
+            acp_port=session.acp_port,
+            remote_cwd=session.acp_remote_cwd or ".",
+            acp_session_id=session.acp_session_id or None,
+        )
+
+        try:
+            await bridge.start()
+            # Store the ACP session ID back (may have been newly created)
+            if bridge.acp_session_id and not session.acp_session_id:
+                session.acp_session_id = bridge.acp_session_id
+
+            self._acp_bridges[session.id] = bridge
+            session.status = "running"
+            log.info(
+                "[start:%s] ACP bridge connected (acp_session=%s)",
+                session.id, bridge.acp_session_id,
+            )
+            return True, ""
+        except Exception as e:
+            session.status = "stopped"
+            log.error("[start:%s] Failed to start ACP session: %s", session.id, e)
+            return False, f"ACP start failed: {e}"
+
     async def _monitor_host_process(
         self, session: Session, proc: asyncio.subprocess.Process
     ) -> None:
@@ -434,6 +479,15 @@ class ContainerManager:
 
         Does NOT update session status — that is SessionManager's job.
         """
+        # ACP remote bridge
+        bridge = self._acp_bridges.pop(session.id, None)
+        if bridge is not None:
+            try:
+                await bridge.stop()
+            except Exception as e:
+                log.warning("Error stopping ACP bridge %s: %s", session.id, e)
+            return
+
         if session.host_pid:
             try:
                 os.kill(session.host_pid, signal.SIGTERM)
@@ -458,6 +512,11 @@ class ContainerManager:
 
     async def is_alive(self, session: Session) -> bool:
         """Check whether a session's runtime is still running."""
+        # ACP remote bridge
+        bridge = self._acp_bridges.get(session.id)
+        if bridge is not None:
+            return bridge._acp.connected
+
         if session.host_pid:
             try:
                 os.kill(session.host_pid, 0)
