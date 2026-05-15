@@ -4362,6 +4362,12 @@ async def try_init_copilot(
             last_id = await client.get_last_session_id()
             if last_id:
                 print(f"[agent] Resuming session {last_id}", file=sys.stderr)
+                # Tell the orchestrator we're resuming (this can take minutes)
+                if ipc:
+                    await ipc.send(Message(
+                        type=MessageType.STATUS_UPDATE,
+                        payload={"status": "resuming", "sdk_session_id": last_id},
+                    ))
                 session = await client.resume_session(
                     last_id,
                     on_permission_request=perm_handler,

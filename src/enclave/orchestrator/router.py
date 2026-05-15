@@ -146,9 +146,6 @@ class MessageRouter:
         # Sessions currently being restored (prevent double-restore)
         self._restoring: set[str] = set()
 
-        # Sessions needing a continuation nudge after nix-shell restart
-        self._nix_shell_nudge: set[str] = set()
-
         # Buffered agent responses waiting for turn_end before posting to Matrix.
         # This prevents flooding Matrix when the agent does multi-turn investigation
         # (each turn produces a response, but only the last one matters).
@@ -1717,6 +1714,15 @@ class MessageRouter:
                 log.warning("Failed to post doom-loop notice to Matrix: %s", e)
             return
 
+        if status == "resuming":
+            sdk_id = msg.payload.get("sdk_session_id", "")
+            log.info("Agent %s resuming SDK session %s", session.id, sdk_id)
+            if self._control:
+                self._control.notify_activity(
+                    session.id, "⏳ Resuming session…"
+                )
+            return
+
         if status == "ready":
             mode = "🤖 Copilot" if copilot else "📝 Echo"
             ready_msg = f"✅ Agent ready ({mode} mode). Start chatting!"
@@ -1735,8 +1741,9 @@ class MessageRouter:
             )
 
             # Send continuation nudge after nix-shell restart
-            if session.id in self._nix_shell_nudge:
-                self._nix_shell_nudge.discard(session.id)
+            if session.pending_nix_nudge:
+                session.pending_nix_nudge = False
+                self.sessions.save_sessions()
                 nix_path = session.nix_shell_path or "unknown"
                 nudge = Message(
                     type=MessageType.USER_MESSAGE,
@@ -2083,7 +2090,8 @@ class MessageRouter:
             )
         else:
             # Mark for continuation nudge when the agent reports ready
-            self._nix_shell_nudge.add(session.id)
+            session.pending_nix_nudge = True
+            self.sessions.save_sessions()
 
     async def _handle_port_request(
         self, session: Session, msg: Message,
