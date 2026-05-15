@@ -75,6 +75,8 @@ class ACPBridge:
         self._tool_states: dict[str, dict] = {}
         self._pending_permissions: dict[str, int | str] = {}
         self._replay_mode = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnecting = False
 
     @property
     def acp_session_id(self) -> str | None:
@@ -123,11 +125,22 @@ class ACPBridge:
         # Start reading from IPC (orchestrator → bridge)
         self._ipc_read_task = asyncio.create_task(self._ipc_read_loop())
 
+        # Start reconnection monitor
+        self._reconnect_task = asyncio.create_task(self._reconnection_monitor())
+
         log.info("[%s] ACP bridge started (acp_session=%s)", self.session_id, self._acp_session_id)
 
     async def stop(self) -> None:
         """Cleanly shut down the bridge."""
         self._running = False
+
+        # Cancel reconnection monitor
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Cancel any active prompt
         if self._prompt_task and not self._prompt_task.done():
@@ -410,6 +423,94 @@ class ACPBridge:
                 "command": params.get("command", ""),
             },
         ))
+
+    # -- Reconnection --
+
+    async def _reconnection_monitor(self) -> None:
+        """Monitor the ACP connection and attempt reconnection on drop."""
+        try:
+            while self._running:
+                await asyncio.sleep(5)
+
+                if not self._running:
+                    break
+
+                if self._acp.connected or self._reconnecting:
+                    continue
+
+                # Connection lost — attempt reconnect
+                log.warning("[%s] ACP connection lost, attempting reconnect...", self.session_id)
+                await self._ipc_send(Message(
+                    type=MessageType.STATUS_UPDATE,
+                    payload={"status": "⚠️ Remote agent disconnected, reconnecting..."},
+                ))
+
+                await self._attempt_reconnect()
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.error("[%s] Reconnection monitor error: %s", self.session_id, e)
+
+    async def _attempt_reconnect(self) -> None:
+        """Try to reconnect to the ACP server with exponential backoff."""
+        self._reconnecting = True
+        backoff = 2.0
+        max_backoff = 60.0
+        max_attempts = 30
+
+        for attempt in range(1, max_attempts + 1):
+            if not self._running:
+                break
+
+            try:
+                log.info("[%s] Reconnect attempt %d/%d...", self.session_id, attempt, max_attempts)
+
+                # Disconnect cleanly first
+                await self._acp.disconnect()
+
+                # Reconnect
+                await self._acp.connect()
+                await self._acp.initialize()
+
+                # Resume the session
+                if self._acp_session_id:
+                    caps = self._acp.agent_capabilities
+                    resume_supported = bool(
+                        caps.get("sessionCapabilities", {}).get("resume")
+                    )
+                    if resume_supported:
+                        try:
+                            await self._acp.resume_session(self._acp_session_id, self.remote_cwd)
+                        except ACPError:
+                            self._replay_mode = True
+                            await self._acp.load_session(self._acp_session_id, self.remote_cwd)
+                            self._replay_mode = False
+                    else:
+                        self._replay_mode = True
+                        await self._acp.load_session(self._acp_session_id, self.remote_cwd)
+                        self._replay_mode = False
+
+                log.info("[%s] Reconnected to ACP server", self.session_id)
+                await self._ipc_send(Message(
+                    type=MessageType.STATUS_UPDATE,
+                    payload={"status": "✅ Remote agent reconnected"},
+                ))
+                self._reconnecting = False
+                return
+
+            except Exception as e:
+                log.warning("[%s] Reconnect attempt %d failed: %s", self.session_id, attempt, e)
+                await asyncio.sleep(min(backoff, max_backoff))
+                backoff *= 1.5
+
+        # All attempts exhausted
+        log.error("[%s] Failed to reconnect after %d attempts", self.session_id, max_attempts)
+        await self._ipc_send(Message(
+            type=MessageType.STATUS_UPDATE,
+            payload={"status": "❌ Remote agent unreachable — reconnect failed"},
+        ))
+        self._reconnecting = False
 
     # -- IPC helpers --
 
