@@ -266,6 +266,23 @@ def main():
         help="Port to listen on (default: 8430)",
     )
     parser.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default="/data/Enclave/tls/server.crt",
+        help="Path to TLS certificate (default: /data/Enclave/tls/server.crt)",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default="/data/Enclave/tls/server.key",
+        help="Path to TLS private key (default: /data/Enclave/tls/server.key)",
+    )
+    parser.add_argument(
+        "--no-tls",
+        action="store_true",
+        help="Disable TLS (serve over plain HTTP)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         help="Enable auto-reload for development",
@@ -297,7 +314,23 @@ def main():
     config = load_config(args.config)
     app = create_app(config)
 
-    print(f"[webui] Starting Enclave Web UI on http://{args.host}:{args.port}", file=sys.stderr)
+    # TLS configuration
+    ssl_kwargs = {}
+    if not args.no_tls:
+        certfile = Path(args.ssl_certfile)
+        keyfile = Path(args.ssl_keyfile)
+        if certfile.exists() and keyfile.exists():
+            ssl_kwargs["ssl_certfile"] = str(certfile)
+            ssl_kwargs["ssl_keyfile"] = str(keyfile)
+            scheme = "https"
+        else:
+            print(f"[webui] WARNING: TLS cert/key not found at {certfile} / {keyfile} — falling back to HTTP",
+                  file=sys.stderr)
+            scheme = "http"
+    else:
+        scheme = "http"
+
+    print(f"[webui] Starting Enclave Web UI on {scheme}://{args.host}:{args.port}", file=sys.stderr)
     if user_count() == 0:
         print("[webui] WARNING: No users configured — run with --create-user to add one",
               file=sys.stderr)
@@ -307,6 +340,7 @@ def main():
         host=args.host,
         port=args.port,
         log_level="info",
+        **ssl_kwargs,
     )
 
 
