@@ -72,6 +72,13 @@ class ACPClient:
         self._connected = False
         self._closing = False
 
+        # session/update notifications are dispatched through this bounded queue
+        # by a dedicated consumer task, so a slow/back-pressured update handler
+        # (e.g. IPC drain()) can never stall the ACP read loop while it holds
+        # the prompt lock (security review M3).
+        self._update_queue: asyncio.Queue[dict] | None = None
+        self._update_task: asyncio.Task | None = None
+
         # Negotiated state
         self.agent_capabilities: dict = {}
         self.agent_info: dict = {}
@@ -96,6 +103,10 @@ class ACPClient:
         )
         self._connected = True
         self._closing = False
+        if self._update_queue is None:
+            self._update_queue = asyncio.Queue(maxsize=1024)
+        if self._update_task is None or self._update_task.done():
+            self._update_task = asyncio.create_task(self._update_consumer())
         self._read_task = asyncio.create_task(self._read_loop())
         log.info("Connected to ACP server at %s:%d", self.host, self.port)
 
@@ -123,6 +134,14 @@ class ACPClient:
             except (asyncio.CancelledError, Exception):
                 pass
 
+        if self._update_task and not self._update_task.done():
+            self._update_task.cancel()
+            try:
+                await self._update_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._update_task = None
+        self._update_queue = None
         if self._writer:
             self._writer.close()
             try:
@@ -312,6 +331,24 @@ class ACPClient:
                         pass
                 log.warning("ACP connection lost to %s:%d", self.host, self.port)
 
+    async def _update_consumer(self) -> None:
+        """Drain queued session/update notifications, one at a time, in order.
+
+        Runs independently of the read loop so a slow update handler applies
+        back-pressure here (a bounded queue) instead of blocking ACP reads.
+        """
+        assert self._update_queue is not None
+        try:
+            while True:
+                params = await self._update_queue.get()
+                if self._on_update:
+                    try:
+                        await self._on_update(params)
+                    except Exception as e:
+                        log.error("Error in ACP update handler: %s", e)
+        except asyncio.CancelledError:
+            pass
+
     async def _handle_message(self, msg: dict) -> None:
         """Route an incoming JSON-RPC message."""
         if "id" in msg and "result" in msg:
@@ -360,10 +397,25 @@ class ACPClient:
             params = msg.get("params", {})
 
             if method == "session/update" and self._on_update:
-                try:
-                    await self._on_update(params)
-                except Exception as e:
-                    log.error("Error in ACP update handler: %s", e)
+                # Hand off to the consumer task instead of awaiting inline, so a
+                # back-pressured handler cannot stall the read loop (M3). The
+                # queue is bounded; drop oldest under sustained overflow rather
+                # than block or grow without bound.
+                if self._update_queue is not None:
+                    try:
+                        self._update_queue.put_nowait(params)
+                    except asyncio.QueueFull:
+                        try:
+                            self._update_queue.get_nowait()
+                            self._update_queue.put_nowait(params)
+                        except (asyncio.QueueEmpty, asyncio.QueueFull):
+                            pass
+                        log.warning("ACP update queue full — dropped an update")
+                else:
+                    try:
+                        await self._on_update(params)
+                    except Exception as e:
+                        log.error("Error in ACP update handler: %s", e)
             else:
                 log.debug("Unhandled ACP notification: %s", method)
             return

@@ -216,6 +216,14 @@ async def create_bug(request: Request, session_id: str, project_path: str, body:
     if project_path == "_root":
         project_path = "."
     project_dir = ws_base / session_id / project_path
+    # Containment: project_path is attacker-controlled ('..' would escape the
+    # session workspace and write bug markdown anywhere on disk). Enforce that
+    # the resolved directory stays under the session workspace (security M2).
+    session_root = (ws_base / session_id).resolve()
+    try:
+        project_dir.resolve().relative_to(session_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid project path")
     if not project_dir.exists():
         raise HTTPException(status_code=404, detail="Project directory not found")
 

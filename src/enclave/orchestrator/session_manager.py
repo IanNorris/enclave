@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -65,14 +66,21 @@ class Session:
 
 
 def _slugify(name: str) -> str:
-    """Convert a name to a filesystem/container-safe slug."""
-    return (
-        name.lower()
-        .replace(" ", "-")
-        .replace("_", "-")
-        .replace(".", "-")
-        .strip("-")[:32]
-    )
+    """Convert a name to a filesystem/container-safe slug.
+
+    Collapses any run of characters outside ``[a-z0-9]`` (including ``/``,
+    ``.`` and whitespace) to a single ``-`` so the result can never contain a
+    path separator or ``..`` traversal component (security review M1).
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower())
+    return slug.strip("-")[:32].strip("-")
+
+
+def _assert_within(base: Path, path: Path) -> Path:
+    """Return ``path`` if it resolves inside ``base``; raise ValueError otherwise."""
+    resolved = path.resolve()
+    resolved.relative_to(base.resolve())
+    return resolved
 
 
 # ── Session Manager ──────────────────────────────────────────────────
@@ -250,9 +258,11 @@ class SessionManager:
         profile_obj = self.config.get_profile(resolved_profile)
 
         workspace = Path(self.config.workspace_base) / session_id
+        _assert_within(Path(self.config.workspace_base), workspace)
         workspace.mkdir(parents=True, exist_ok=True)
 
         state_dir = Path(self.config.session_base) / session_id
+        _assert_within(Path(self.config.session_base), state_dir)
         state_dir.mkdir(parents=True, exist_ok=True)
 
         session = Session(
@@ -348,15 +358,25 @@ class SessionManager:
         # Clean up workspace directory
         if session.workspace_path:
             ws = Path(session.workspace_path)
-            if ws.exists():
-                shutil.rmtree(ws, ignore_errors=True)
-                log.info("Removed workspace: %s", ws)
+            try:
+                _assert_within(Path(self.config.workspace_base), ws)
+            except ValueError:
+                log.error("Refusing to remove out-of-base workspace: %s", ws)
+            else:
+                if ws.exists():
+                    shutil.rmtree(ws, ignore_errors=True)
+                    log.info("Removed workspace: %s", ws)
 
         # Clean up session state directory
         session_dir = Path(self.config.session_base) / session_id
-        if session_dir.exists():
-            shutil.rmtree(session_dir, ignore_errors=True)
-            log.info("Removed session dir: %s", session_dir)
+        try:
+            _assert_within(Path(self.config.session_base), session_dir)
+        except ValueError:
+            log.error("Refusing to remove out-of-base session dir: %s", session_dir)
+        else:
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+                log.info("Removed session dir: %s", session_dir)
 
         # Remove IPC socket
         if self.ipc:
