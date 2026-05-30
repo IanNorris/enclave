@@ -1659,15 +1659,20 @@ class MessageRouter:
             parts.append("\n".join(action_lines))
         matrix_text = "\n\n".join(parts)
 
-        # Buffer for Matrix like regular responses (debounce)
+        # Major updates (structured responses) are deliberate, authoritative
+        # status reports / task completions.  Deliver them to Matrix
+        # immediately so they cannot be clobbered by trailing intermediate
+        # responses (which share the single _response_buffer) or discarded by a
+        # later task_done/ask_user.  Discard any buffered intermediate response:
+        # this major update supersedes the chatter that preceded it.
         thread_id = self._thread_events.get(session.id)
-        self._response_buffer[session.id] = matrix_text
-        self._response_buffer_thread[session.id] = thread_id
+        self._response_buffer.pop(session.id, None)
+        self._response_buffer_thread.pop(session.id, None)
         old_task = self._response_flush_tasks.pop(session.id, None)
         if old_task and not old_task.done():
             old_task.cancel()
-        self._response_flush_tasks[session.id] = asyncio.create_task(
-            self._delayed_response_flush(session.id, 120.0)
+        await self.matrix.send_message(
+            session.room_id, matrix_text, thread_event_id=thread_id,
         )
 
     async def _handle_ask_deferred(
