@@ -20,6 +20,11 @@ log = get_logger("acp-client")
 # ACP protocol version we support
 ACP_PROTOCOL_VERSION = 1
 
+# Max length of a single NDJSON line. asyncio's StreamReader defaults to 64 KiB,
+# which a single large tool-result update easily exceeds → LimitOverrunError,
+# mis-read as a dropped connection (security review H4). 16 MiB headroom.
+ACP_STREAM_LIMIT = 16 * 1024 * 1024
+
 # Callbacks
 UpdateCallback = Callable[[dict], Awaitable[None]]
 RequestCallback = Callable[[int | str, str, dict], Awaitable[dict]]
@@ -87,7 +92,7 @@ class ACPClient:
 
         log.info("Connecting to ACP server at %s:%d (tls=%s)", self.host, self.port, self._use_tls)
         self._reader, self._writer = await asyncio.open_connection(
-            self.host, self.port, ssl=ssl_ctx,
+            self.host, self.port, ssl=ssl_ctx, limit=ACP_STREAM_LIMIT,
         )
         self._connected = True
         self._closing = False
@@ -96,7 +101,11 @@ class ACPClient:
 
     async def disconnect(self) -> None:
         """Cleanly close the TCP connection."""
-        if not self._connected:
+        # Guard on the writer, not on _connected: the read loop sets
+        # _connected=False on a dropped connection while leaving the socket
+        # open, so an early-return on `not self._connected` would orphan the
+        # fd across reconnects (security review H3).
+        if self._closing and self._writer is None:
             return
         self._closing = True
         self._connected = False
@@ -294,6 +303,13 @@ class ACPClient:
                     if not fut.done():
                         fut.set_exception(ConnectionError("ACP connection lost"))
                 self._pending.clear()
+                # Close the writer so the socket fd is released rather than
+                # leaked until the next disconnect() (security review H3).
+                if self._writer is not None:
+                    try:
+                        self._writer.close()
+                    except Exception:
+                        pass
                 log.warning("ACP connection lost to %s:%d", self.host, self.port)
 
     async def _handle_message(self, msg: dict) -> None:

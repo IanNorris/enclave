@@ -14,6 +14,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from enclave.common.config import ContainerConfig, MimirConfig
 from enclave.common.logging import get_logger
@@ -36,6 +37,16 @@ class ContainerManager:
         self.config = config
         self.mimir = mimir
         self._acp_bridges: dict[str, "ACPBridge"] = {}
+        # Optional hook that re-validates a session's extra_mounts against the
+        # live permission grants at each start. Set by the router (which owns
+        # the permission DB). Returns the subset of mount entries that are still
+        # authorized; may mutate/persist session.extra_mounts (e.g. to drop
+        # consumed ONCE grants or revoked mounts).
+        self._mount_validator: "Callable[[Session], list[dict]] | None" = None
+
+    def set_mount_validator(self, validator: "Callable[[Session], list[dict]]") -> None:
+        """Register a callback that filters extra_mounts against live grants."""
+        self._mount_validator = validator
 
     async def start_session(self, session: Session) -> tuple[bool, str]:
         """Start the runtime for a session (container or host process).
@@ -159,8 +170,14 @@ class ContainerManager:
         else:
             cmd.extend(["-e", "ENCLAVE_MIMIR_ENABLED=0"])
 
-        # Extra mounts requested by the agent (approved by user)
-        for mount in getattr(session, "extra_mounts", []):
+        # Extra mounts requested by the agent (approved by user). Re-validate
+        # against live grants at each start so revoked/expired/consumed mounts
+        # are not silently re-bound (see security review H1).
+        if self._mount_validator is not None:
+            extra_mounts = self._mount_validator(session)
+        else:
+            extra_mounts = getattr(session, "extra_mounts", [])
+        for mount in extra_mounts:
             source = mount.get("source", "")
             mount_name = mount.get("mount_name", "")
             if source and mount_name and Path(source).exists():

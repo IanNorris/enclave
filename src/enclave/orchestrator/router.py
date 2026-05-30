@@ -196,6 +196,13 @@ class MessageRouter:
             timeout=approval_timeout,
         )
 
+        # Re-validate agent-requested mounts against live grants at each
+        # container start (security review H1). runtime is the ContainerManager.
+        try:
+            self.sessions.runtime.set_mount_validator(self._validate_session_mounts)
+        except AttributeError:
+            pass
+
         # Scheduler for cron jobs and timers
         scheduler_dir = os.path.join(
             data_dir or os.path.expanduser("~/.local/share/enclave"),
@@ -2427,9 +2434,56 @@ class MessageRouter:
                 f"❌ Failed to restart container: {error}",
             )
 
-    # ------------------------------------------------------------------
-    # Matrix poll/reaction → approval flow
-    # ------------------------------------------------------------------
+    def _validate_session_mounts(self, session: "Session") -> list[dict]:
+        """Filter a session's extra_mounts against live permission grants.
+
+        Called by the ContainerManager at each container start. Mounts whose
+        grant has been revoked, has expired, or is a consumed ONCE grant are
+        dropped (and persisted out of extra_mounts) so they are never silently
+        re-bound. ONCE mounts are applied for this start only, then consumed and
+        removed. SESSION/PROJECT/PATTERN mounts remain until revoked/expired.
+        """
+        mounts = list(getattr(session, "extra_mounts", []))
+        if not mounts:
+            return []
+
+        apply_now: list[dict] = []
+        keep: list[dict] = []
+        changed = False
+
+        for entry in mounts:
+            source = entry.get("source", "")
+            if not source:
+                changed = True
+                continue
+            grant = self._perm_db.check_permission(
+                session.id,
+                session.name,
+                PermissionType.FILESYSTEM,
+                f"mount:{source}",
+            )
+            if grant is None:
+                log.info(
+                    "[mounts:%s] Dropping unauthorized mount (no active grant): %s",
+                    session.id, source,
+                )
+                changed = True
+                continue
+
+            apply_now.append(entry)
+            if grant.scope == PermissionScope.ONCE:
+                # Apply for this start only, then consume the grant and drop it.
+                self._perm_db.use_grant(grant.id)
+                changed = True
+            else:
+                keep.append(entry)
+
+        if changed:
+            session.extra_mounts = keep
+            self.sessions.save_sessions()
+
+        return apply_now
+
 
     async def _on_poll_response(
         self, room_id: str, sender: str, poll_event_id: str, answer_ids: list[str]

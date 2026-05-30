@@ -22,7 +22,7 @@ from typing import Any
 
 from enclave.common.logging import get_logger
 from enclave.common.protocol import Message, MessageType
-from enclave.orchestrator.acp_client import ACPClient, ACPError
+from enclave.orchestrator.acp_client import ACPClient, ACPError, ACP_STREAM_LIMIT
 
 log = get_logger("acp-bridge")
 
@@ -88,7 +88,7 @@ class ACPBridge:
 
         # Connect to the IPC socket (as the agent)
         self._ipc_reader, self._ipc_writer = await asyncio.open_unix_connection(
-            self.socket_path
+            self.socket_path, limit=ACP_STREAM_LIMIT,
         )
         log.info("[%s] Connected to IPC socket", self.session_id)
 
@@ -198,13 +198,21 @@ class ACPBridge:
         except Exception as e:
             log.error("[%s] IPC read loop error: %s", self.session_id, e)
 
+    def _on_prompt_task_done(self, task: asyncio.Task) -> None:
+        """Clear the stored prompt task reference once it completes."""
+        if self._prompt_task is task:
+            self._prompt_task = None
+
     async def _handle_ipc_message(self, msg: Message) -> None:
         """Handle a message from the orchestrator."""
         if msg.type == MessageType.USER_MESSAGE:
             text = msg.payload.get("content", "")
             if text:
-                # Queue the prompt (serialize — only one active at a time)
-                asyncio.create_task(self._send_prompt(text))
+                # Queue the prompt (serialize — only one active at a time).
+                # Store the task so stop() can cancel it and so it isn't
+                # garbage-collected mid-flight (security review H2).
+                self._prompt_task = asyncio.create_task(self._send_prompt(text))
+                self._prompt_task.add_done_callback(self._on_prompt_task_done)
 
         elif msg.type == MessageType.PERMISSION_RESPONSE:
             await self._handle_permission_response(msg)
