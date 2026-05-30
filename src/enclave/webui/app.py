@@ -223,12 +223,25 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
 
         app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
 
+        dist_root = frontend_dist.resolve()
+
         @app.get("/{full_path:path}")
         async def spa_fallback(full_path: str):
             """Serve index.html for all non-API routes (SPA client-side routing)."""
-            file_path = frontend_dist / full_path
-            if file_path.is_file():
-                return FileResponse(file_path)
+            # Containment guard: resolve the requested path and confirm it stays
+            # within the dist root before serving. Without this, '..' / '%2e%2e'
+            # segments (which Starlette/uvicorn do NOT normalize) would let an
+            # unauthenticated caller read arbitrary files (TLS key, JWT signing
+            # key, bcrypt hashes). On any escape or non-file, fall through to
+            # index.html so client-side routing still works.
+            candidate = (frontend_dist / full_path).resolve()
+            try:
+                candidate.relative_to(dist_root)
+                is_contained = True
+            except ValueError:
+                is_contained = False
+            if is_contained and candidate.is_file():
+                return FileResponse(candidate)
             # Serve index.html with no-cache so browsers always get the
             # latest JS bundle references (asset files use content hashes).
             html = (frontend_dist / "index.html").read_text()

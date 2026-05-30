@@ -785,13 +785,21 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
     config = request.app.state.config
     content = await file.read()
     content_type = file.content_type or "application/octet-stream"
-    filename = file.filename or "attachment"
+    # Sanitize: strip any directory components from the client-supplied filename
+    # (multipart filenames are NOT path-normalized, so '../' would otherwise
+    # escape the attachments dir and allow arbitrary host file writes).
+    filename = Path(file.filename or "attachment").name or "attachment"
 
     # Save to workspace attachments dir so agent can read it directly
     ws_base = Path(config.container.workspace_base) / session_id
     attach_dir = ws_base / ".attachments"
     attach_dir.mkdir(parents=True, exist_ok=True)
-    local_path = attach_dir / filename
+    local_path = (attach_dir / filename).resolve()
+    # Defence in depth: confirm the resolved path stays within attach_dir.
+    try:
+        local_path.relative_to(attach_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
     local_path.write_bytes(content)
 
     # Send to agent via control socket with attachment metadata

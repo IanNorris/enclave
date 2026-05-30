@@ -106,6 +106,7 @@ class ApprovalManager:
         reason: str = "",
         room_id: str | None = None,
         suggested_pattern: str | None = None,
+        allow_pattern: bool = True,
     ) -> tuple[RequestStatus, PermissionScope | None, str | None]:
         """Post a permission request poll and wait for user response.
 
@@ -154,11 +155,23 @@ class ApprovalManager:
         answers = [
             (ANSWER_APPROVE_ONCE, "✅ Approve once"),
             (ANSWER_APPROVE_PROJECT, "✅ Approve for project"),
-            (ANSWER_APPROVE_PATTERN, f"✅ Approve pattern: {pattern}"),
-            (ANSWER_CUSTOM_PATTERN, "✏️ Approve with custom pattern"),
+        ]
+        # Pattern grants apply a regex to FUTURE targets, so they must never be
+        # offered for host-command / GUI launches: such a target's leading token
+        # is a constant category prefix (e.g. "GUI:") which would yield a pattern
+        # that auto-approves *every* future command → host RCE. Callers pass
+        # allow_pattern=False to suppress both pattern options for those cases.
+        if allow_pattern:
+            answers.append(
+                (ANSWER_APPROVE_PATTERN, f"✅ Approve pattern: {pattern}")
+            )
+            answers.append(
+                (ANSWER_CUSTOM_PATTERN, "✏️ Approve with custom pattern")
+            )
+        answers.extend([
             (ANSWER_DENY_ONCE, "❌ Deny once"),
             (ANSWER_DENY_PROJECT, "❌ Deny for project"),
-        ]
+        ])
 
         poll_event_id = await self.send_poll(room_id, question, answers)
 

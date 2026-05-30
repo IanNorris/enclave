@@ -3074,6 +3074,7 @@ class MessageRouter:
             target=f"GUI: {command}",
             reason=reason or f"Launch GUI application: {command}",
             room_id=session.room_id,
+            allow_pattern=False,
         )
 
         if status != RequestStatus.APPROVED:

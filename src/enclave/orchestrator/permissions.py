@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Any
 
 
+# Target prefixes that identify host-command / GUI launch approvals. These run
+# arbitrary commands on the host and must NEVER be auto-approved by a regex
+# pattern grant — only by an exact-target (once/session/project) grant. Keep in
+# sync with the target strings built in router.py (_handle_gui_launch).
+_NO_PATTERN_TARGET_PREFIXES = ("GUI: ",)
+
+
 class PermissionScope(str, Enum):
     """How broadly a permission grant applies."""
 
@@ -264,6 +271,15 @@ class PermissionDB:
 
         if rows:
             return self._row_to_grant(rows[0])
+
+        # Host-exec / GUI launches run an arbitrary command on the HOST. They
+        # must only ever be auto-approved by an exact-target grant (once /
+        # session / project), never by a regex pattern grant — otherwise a
+        # single broad/stale pattern (e.g. a legacy "^GUI:\s+") would
+        # auto-approve every future command → host RCE. Bail before the pattern
+        # loop for these targets.
+        if any(target.startswith(p) for p in _NO_PATTERN_TARGET_PREFIXES):
+            return None
 
         # Check pattern grants
         import re
