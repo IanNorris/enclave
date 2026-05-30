@@ -188,9 +188,23 @@ class ContainerManager:
         # Bind-mount host paths read-only at /host/<path> (only for profiles that use host mounts)
         if profile.host_mounts:
             for host_path in self.config.host_mounts:
-                if Path(host_path).exists():
-                    container_path = f"/host{host_path}"
-                    cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
+                if not Path(host_path).exists():
+                    continue
+                # On NixOS, /usr/bin is served by an on-demand envfs: Path.exists()
+                # returns True but the kernel can't statfs the mount, so `podman run
+                # -v /usr/bin:...` aborts with "statfs /usr/bin: no such file or
+                # directory" and fails the ENTIRE container start. Skip any host path
+                # we can't statfs so one unmountable entry doesn't sink the session.
+                try:
+                    os.statvfs(host_path)
+                except OSError as e:
+                    log.warning(
+                        "[start:%s] Skipping host mount %s — not statfs-able (%s)",
+                        session.id, host_path, e.strerror,
+                    )
+                    continue
+                container_path = f"/host{host_path}"
+                cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
 
         # FUSE: user-space mounts (e.g. mounting disk images without root).
         # Needs /dev/fuse device + SYS_ADMIN cap inside the userns. The cap
