@@ -129,20 +129,12 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     async def health():
         return {"status": "ok", "auth_required": user_count() > 0}
 
-    # Background task: durably persist agent events for all sessions so chat
-    # history survives reloads even when no browser is connected.
-    @app.on_event("startup")
-    async def _start_event_persister():
-        import asyncio
-        from enclave.webui.event_persister import EventPersister
-
-        data_dir = Path(config.data_dir)
-        sock_path = data_dir / "control.sock"
-        workspace_base = Path(config.container.workspace_base)
-
-        persister = EventPersister(sock_path, workspace_base)
-        app.state.event_persister = persister
-        asyncio.create_task(persister.run())
+    # Durable event persistence now happens at the SOURCE, inside the
+    # orchestrator's control socket (_emit), so it is exactly-once and does
+    # not depend on this process being subscribed. The old webui-side
+    # EventPersister was lossy (any event emitted during a subscribe/reconnect
+    # gap was dropped) and is intentionally no longer started here. The webui
+    # only READS events.db for history.
 
     # Serve Vue SPA static files (built output) — must be last
     frontend_dist = Path(__file__).parent / "frontend" / "dist"

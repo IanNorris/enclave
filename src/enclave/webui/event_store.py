@@ -11,11 +11,14 @@ Each session gets its own SQLite database at:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("enclave.event_store")
 
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS events (
@@ -144,19 +147,39 @@ PERSIST_TYPES = frozenset({
 })
 
 
-def persist_event(workspace_base: Path, session_id: str, event: dict[str, Any]) -> None:
+def persist_event(
+    workspace_base: Path,
+    session_id: str,
+    event: dict[str, Any],
+    *,
+    swallow: bool = True,
+) -> bool:
     """Persist a control-socket event to the session's event store.
 
     Only event types in PERSIST_TYPES are stored. The ``ok`` and ``type``
     keys are dropped from the stored payload (``type`` is a column).
-    Failures are swallowed so persistence never disrupts the caller.
+
+    Returns ``True`` if the event was written, ``False`` if it was skipped
+    (not a persistable type) or failed while ``swallow`` is set.
+
+    By default failures are swallowed so persistence never disrupts the
+    caller, but they are always logged — a silent drop here means permanent
+    data loss with no trace, which previously made this bug class very hard
+    to debug. Pass ``swallow=False`` to propagate the exception.
     """
     event_type = event.get("type", "")
     if event_type not in PERSIST_TYPES:
-        return
+        return False
     try:
         store = get_event_store(workspace_base, session_id)
         data = {k: v for k, v in event.items() if k not in ("ok", "type")}
         store.append(event_type, data)
+        return True
     except Exception:
-        pass
+        log.exception(
+            "Failed to persist %s event for session %s (DATA LOSS)",
+            event_type, session_id,
+        )
+        if not swallow:
+            raise
+        return False

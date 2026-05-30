@@ -34,6 +34,8 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from enclave.webui.event_store import PERSIST_TYPES, persist_event
+
 if TYPE_CHECKING:
     from .router import MessageRouter
 
@@ -145,8 +147,36 @@ class ControlServer:
         """Called by the router when an agent turn begins."""
         self._emit(session_id, {"ok": True, "type": "turn_start"})
 
+    def _workspace_base_for(self, session_id: str) -> Path | None:
+        """Resolve the workspace_base for a session's event store, or None.
+
+        events.db lives at ``{workspace_base}/{session_id}/.enclave/events.db``
+        and ``session.workspace_path`` is ``{workspace_base}/{session_id}``,
+        so the base is its parent.
+        """
+        try:
+            sess = self._router.sessions.get_session(session_id)
+        except Exception:
+            return None
+        if not sess or not sess.workspace_path:
+            return None
+        return Path(sess.workspace_path).parent
+
     def _emit(self, session_id: str, event: dict) -> None:
-        """Push an event to all subscribers of a session."""
+        """Push an event to all subscribers of a session.
+
+        Durable persistence happens HERE, at the source, before fan-out: this
+        is the single chokepoint every agent event funnels through, so capture
+        is exactly-once and independent of whether any subscriber (browser or
+        the webui persister) happens to be connected. Persisting downstream in
+        a subscriber was lossy — any event emitted while no subscriber was
+        attached (new session, orchestrator restart, reconnect window) was
+        silently dropped from events.db even though it streamed live.
+        """
+        if event.get("type") in PERSIST_TYPES:
+            base = self._workspace_base_for(session_id)
+            if base is not None:
+                persist_event(base, session_id, event)
         for q in self._subscribers.get(session_id, set()):
             q.put_nowait(event)
 
