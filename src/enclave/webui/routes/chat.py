@@ -311,9 +311,9 @@ async def get_history(request: Request, session_id: str, limit: int = 100, offse
     """Get conversation history for a session.
 
     Reconstructed entirely from the durable event store (events.db), which the
-    EventPersister keeps populated for all sessions regardless of whether a
-    browser is connected. Falls back to the SDK's session-store.db only for
-    legacy sessions that predate the event store.
+    orchestrator populates at the source (ControlServer._emit) for all sessions
+    regardless of whether a browser is connected. Falls back to the SDK's
+    session-store.db only for legacy sessions that predate the event store.
     """
     from enclave.webui.event_store import get_event_store
 
@@ -521,8 +521,8 @@ async def get_timeline(request: Request, session_id: str, date: str | None = Non
 async def send_message(request: Request, session_id: str, body: SendMessage):
     """Send a message to a session's agent via control socket (preferred) or Matrix."""
     # The user turn is persisted by the orchestrator (notify_user_message →
-    # EventPersister) once the message reaches the agent, so all dispatch paths
-    # are recorded uniformly. No direct persistence here.
+    # ControlServer._emit) once the message reaches the agent, so all dispatch
+    # paths are recorded uniformly. No direct persistence here.
 
     # Try control socket first — this properly wakes idle/stopped agents
     data_dir = Path(request.app.state.config.data_dir)
@@ -813,9 +813,9 @@ async def stream_conversation(websocket: WebSocket, session_id: str, token: str 
                     if event.get("type") in ("ping", "subscribed"):
                         continue
 
-                    # Persistence is handled by the always-on EventPersister,
-                    # not here — this stream only relays events to the browser
-                    # for live display.
+                    # Persistence is handled at the source by the orchestrator
+                    # (ControlServer._emit), not here — this stream only relays
+                    # events to the browser for live display.
                     try:
                         await websocket.send_json(event)
                     except Exception:
