@@ -296,6 +296,11 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
             return
 
+        # The typed list_models() helper raises on SDK 0.3.0 (pydantic rejects
+        # the models.list payload: "Missing required field 'multiplier' in
+        # ModelBilling"), so fall back to the raw JSON-RPC request, which returns
+        # the full model set untouched. Note: c.rpc(...) is not callable on 0.3.0;
+        # use the low-level c._client.request(method, params) transport.
         script = (
             "import asyncio, json\n"
             "from copilot import CopilotClient\n"
@@ -303,12 +308,15 @@ class ControlServer:
             "    c = CopilotClient()\n"
             "    await c.start()\n"
             "    try:\n"
-            "        ms = await c.list_models()\n"
-            "        print(json.dumps(sorted([m.id for m in ms])))\n"
-            "    except Exception:\n"
-            "        raw = await c.rpc('models.list', {})\n"
-            "        print(json.dumps(sorted([m.get('id') for m in raw.get('models',[]) if m.get('id')])))\n"
-            "    await c.stop()\n"
+            "        try:\n"
+            "            ms = await c.list_models()\n"
+            "            ids = [m.id for m in ms]\n"
+            "        except Exception:\n"
+            "            raw = await c._client.request('models.list', {})\n"
+            "            ids = [m.get('id') for m in raw.get('models', []) if m.get('id')]\n"
+            "        print(json.dumps(sorted(ids)))\n"
+            "    finally:\n"
+            "        await c.stop()\n"
             "asyncio.run(main())\n"
         )
 
