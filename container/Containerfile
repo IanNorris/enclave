@@ -97,28 +97,27 @@ RUN pip install --no-cache-dir /build && rm -rf /build
 COPY container/mimir-bin/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/mimir-* 2>/dev/null || true
 
-# The github-copilot-sdk wheel on PyPI ships an older bundled `copilot` binary
-# (e.g. 1.0.21) that returns "Unknown error" on some model requests. Run the
-# CLI's self-update to grab the latest release and replace the in-place binary.
-# HOME must be writable because `copilot update` caches the downloaded tarball
-# under $HOME/.cache/copilot/pkg/. Errors are ignored so builds still succeed
-# offline — the runtime will just use the bundled version in that case.
-# The github-copilot-sdk wheel on PyPI ships a bundled `copilot` binary that
-# extracts its embedded JS bundle to $HOME/.cache/copilot/pkg/<version>/ on
-# first run. CLI 1.0.35 has a regression in Ice() (the user-permission-response
-# resolver): it only accepts the interactive kinds (approve-once / reject /
-# user-not-available) and rejects the SDK result kinds (approved /
-# denied-interactively-by-user / denied-by-rules / ...) that the Python SDK
-# emits — breaking every shell/write/mcp/memory tool call routed via a
-# registered on_permission_request handler with "unexpected user permission
-# response". We:
-#   1. Run the binary once under a known HOME so the JS bundle is extracted.
-#   2. Patch Ice() to add the missing cases (and its renamed twin in app.js).
-#   3. Stage the patched bundle under /opt/copilot-cache so we can seed each
-#      runtime user's $HOME/.cache/copilot from it.
-#   4. Disable auto-update at runtime so the patched files aren't overwritten.
+# github-copilot-sdk 0.3.0 ships a bundled `copilot` binary (CLI 1.0.36-0) that
+# already exposes the current model set (incl. claude-opus-4.8) AND speaks the
+# ACP protocol the 0.3.0 Python client expects. We deliberately DO NOT run
+# `copilot update` here: the latest release (1.0.57-3) uses a newer ACP ping
+# protocol that is incompatible with the 0.3.0 client (ping format mismatch ->
+# ValueError), so self-updating would break every session at runtime. Auto-update
+# is also disabled at runtime (COPILOT_AUTO_UPDATE=false in entrypoint).
+#
+# The bundled binary extracts its embedded JS bundle to
+# $HOME/.cache/copilot/pkg/<version>/ on first run. CLI 1.0.36-0 still carries the
+# 1.0.35 Ice() regression (the user-permission-response resolver only accepts the
+# interactive kinds approve-once / reject / user-not-available and rejects the SDK
+# result kinds approved / denied-interactively-by-user / denied-by-rules / ...
+# that the Python SDK emits, breaking every shell/write/mcp/memory tool call
+# routed via a registered on_permission_request handler with "unexpected user
+# permission response"). The runtime entrypoint runs patch-copilot-cli.py after
+# the bundle is extracted to inject the missing cases (verified to match 1.0.36-0).
+#
+# This RUN just validates the bundled binary works at build time (it extracts the
+# JS bundle as a side effect under a throwaway HOME).
 RUN export HOME=/tmp/copilot-extract && mkdir -p "$HOME" && \
-    /usr/local/lib/python3.12/site-packages/copilot/bin/copilot update 2>&1 | tail -3 && \
     /usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version && \
     rm -rf /tmp/copilot-extract
 

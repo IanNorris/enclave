@@ -23,7 +23,24 @@ RUN pip install --no-cache-dir /build && rm -rf /build
 COPY container/mimir-bin/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/mimir-* 2>/dev/null || true
 
+# Patch the bundled Copilot CLI's Ice() permission-response handler at start.
+# github-copilot-sdk 0.3.0 bundles CLI 1.0.36-0, which carries the 1.0.35 Ice()
+# regression: it only accepts the interactive permission kinds (approve-once /
+# reject / user-not-available) and rejects the SDK result kinds (approved /
+# denied-*) the Python SDK emits, breaking every shell/write/mcp/memory tool
+# call routed via a registered on_permission_request handler. (Earlier SDKs
+# bundled 1.0.21, which predated the regression — hence this patch is new here.)
+# Fails open: if the pattern no longer matches, the agent still starts.
+COPY container/patch-copilot-cli.py /usr/local/bin/patch-copilot-cli.py
+RUN chmod +x /usr/local/bin/patch-copilot-cli.py
+RUN printf '#!/bin/bash\n\
+export COPILOT_AUTO_UPDATE=false\n\
+/usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version >/dev/null 2>&1 || true\n\
+/usr/local/bin/patch-copilot-cli.py || true\n\
+exec python3 -m enclave.agent.main "$@"\n\
+' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
 WORKDIR /workspace
 
 # Agent entry point
-CMD ["python3", "-m", "enclave.agent.main"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
