@@ -1190,10 +1190,12 @@ _MODEL_PREFERENCES: tuple[str, ...] = (
 )
 _REASONING_EFFORT = "medium"
 
-# Models that do not accept a reasoning-effort setting. set_model() raises if
-# reasoning_effort is passed for these, so we retry without it. claude-opus-4.8
-# is one such model (verified against CLI 1.0.57-3 / models.list).
-_NO_REASONING_EFFORT_MODELS: frozenset[str] = frozenset({"claude-opus-4.8"})
+# Models that do not accept a reasoning-effort setting. set_model() raises
+# "Model '...' does not support reasoning effort configuration" for these, so
+# _configure_model retries without it. Empty by default — claude-opus-4.8 was
+# verified to ACCEPT reasoning_effort on github-copilot-sdk 0.3.0; the generic
+# retry in _configure_model still covers any model that rejects it.
+_NO_REASONING_EFFORT_MODELS: frozenset[str] = frozenset()
 
 # Panel archetype model preferences (first available wins).
 # Architect wants the deepest reasoning; Pragmatist & Contrarian favour
