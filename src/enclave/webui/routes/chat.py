@@ -21,63 +21,11 @@ router = APIRouter()
 ws_router = APIRouter()  # Separate router for WebSocket (no OAuth2 dependency)
 public_router = APIRouter()  # Routes that accept ?token= query param auth (for <img> etc.)
 
-# In-memory cache of recent agent responses not yet in session-store.db.
-# Keyed by session_id → list of {role, content, timestamp}.
-# Populated by the WebSocket control socket listener, consumed by history endpoint.
-# Persisted to disk so responses survive webui restarts.
-_response_cache: dict[str, list[dict]] = {}
-_response_cache_path: Path | None = None
-
-
-def _load_response_cache(data_dir: Path) -> None:
-    """Load persisted response cache from disk on startup."""
-    global _response_cache, _response_cache_path
-    _response_cache_path = data_dir / ".webui-response-cache.json"
-    if _response_cache_path.exists():
-        try:
-            _response_cache.update(json.loads(_response_cache_path.read_text()))
-        except (json.JSONDecodeError, OSError):
-            pass
-
-
-def _persist_response_cache() -> None:
-    """Write response cache to disk (called on updates)."""
-    if _response_cache_path:
-        try:
-            _response_cache_path.write_text(json.dumps(_response_cache))
-        except OSError:
-            pass
-
-
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 
 def _workspace_base(request: Request) -> Path:
     return Path(request.app.state.config.container.workspace_base)
-
-
-# Event types worth persisting (major + tool lifecycle).
-# Excludes streaming deltas, thinking tokens, activity, and turn markers.
-_PERSIST_TYPES = frozenset({
-    "tool_start", "tool_complete", "response", "file_send", "ask_user",
-    "user_message", "structured_response",
-})
-
-
-def _persist_event(config: Any, session_id: str, event: dict) -> None:
-    """Persist a control socket event to the session's event store."""
-    from enclave.webui.event_store import get_event_store
-    event_type = event.get("type", "")
-    if event_type not in _PERSIST_TYPES:
-        return
-    try:
-        workspace_base = Path(config.container.workspace_base)
-        store = get_event_store(workspace_base, session_id)
-        # Store all event data except the "ok" and "type" fields (redundant)
-        data = {k: v for k, v in event.items() if k not in ("ok", "type")}
-        store.append(event_type, data)
-    except Exception:
-        pass  # Don't let persistence failures break streaming
 
 
 def _session_store_db(request: Request, session_id: str) -> Path:
@@ -130,6 +78,82 @@ def _read_turns(db_path: Path, limit: int = 100, offset: int = 0) -> list[dict[s
         return rows
     except (sqlite3.Error, OSError):
         return []
+
+
+# Event types that contribute to history reconstruction (ordered conversation).
+_HISTORY_TYPES = ["user_message", "response", "ask_user", "structured_response"]
+
+
+def _reconstruct_turns(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build conversation turns from the chronological event log.
+
+    The event store (events.db) is the single source of truth. Events arrive
+    ordered by insertion id. A ``user_message`` opens a new turn; subsequent
+    agent outputs (``response``/``ask_user``) belong to that turn. Each turn's
+    ``assistant_response`` is the turn's final major output (always shown in the
+    UI); intermediate responses and tool calls are surfaced separately via the
+    ``/events`` endpoint, and ``structured_response`` cards are mapped to turns
+    by timestamp on the client. Agent output emitted before any user message
+    forms a leading turn with ``user_message=None``.
+    """
+    turns: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+
+    def flush() -> None:
+        nonlocal cur
+        if cur is not None:
+            major = cur.pop("_major")
+            cur["assistant_response"] = major[-1] if major else None
+            turns.append(cur)
+            cur = None
+
+    def ensure(ts: str) -> None:
+        nonlocal cur
+        if cur is None:
+            cur = {
+                "turn_index": len(turns),
+                "user_message": None,
+                "assistant_response": None,
+                "timestamp": ts,
+                "_major": [],
+            }
+
+    for evt in events:
+        etype = evt.get("type", "")
+        ts = evt.get("timestamp", "")
+        data = evt.get("data", {})
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+
+        if etype == "user_message":
+            flush()
+            cur = {
+                "turn_index": len(turns),
+                "user_message": data.get("content", ""),
+                "assistant_response": None,
+                "timestamp": ts,
+                "_major": [],
+            }
+        elif etype == "response":
+            ensure(ts)
+            content = data.get("content", "")
+            if content:
+                cur["_major"].append(content)  # type: ignore[index]
+        elif etype == "ask_user":
+            ensure(ts)
+            question = data.get("question", "")
+            if question:
+                cur["_major"].append(f"**Question:** {question}")  # type: ignore[index]
+        elif etype == "structured_response":
+            # Rendered as a card mapped by timestamp on the client; just make
+            # sure a turn exists so the mapping has a target.
+            ensure(ts)
+
+    flush()
+    return turns
 
 
 # ─── Matrix API helpers ─────────────────────────────────────────────────────
@@ -286,218 +310,30 @@ class SendMessage(BaseModel):
 async def get_history(request: Request, session_id: str, limit: int = 100, offset: int = 0):
     """Get conversation history for a session.
 
-    Primary source: session-store.db (SDK turns).
-    Supplement: event store (persisted response events) and in-memory cache.
+    Reconstructed entirely from the durable event store (events.db), which the
+    EventPersister keeps populated for all sessions regardless of whether a
+    browser is connected. Falls back to the SDK's session-store.db only for
+    legacy sessions that predate the event store.
     """
+    from enclave.webui.event_store import get_event_store
+
+    workspace_base = _workspace_base(request)
+    store = get_event_store(workspace_base, session_id)
+    events = store.get_events(types=_HISTORY_TYPES, limit=100000)
+
+    if events:
+        all_turns = _reconstruct_turns(events)
+        # Paginate over the chronological turn list: offset counts back from the
+        # newest turn, limit caps the window size (matches the client's
+        # load-earlier behaviour which passes offset=len(loaded_turns)).
+        total = len(all_turns)
+        end = max(total - offset, 0)
+        start = max(end - limit, 0)
+        return {"turns": all_turns[start:end], "session_id": session_id}
+
+    # Legacy fallback: no event store yet — read SDK turns directly.
     db_path = _session_store_db(request, session_id)
-    sdk_turns = _read_turns(db_path, limit=limit, offset=offset)
-    turns = sdk_turns
-
-    # Fallback: if the SDK DB has no turns, synthesize from event store.
-    # This covers sessions where the SDK doesn't persist a session-store.db.
-    if not sdk_turns and offset == 0:
-        try:
-            from enclave.webui.event_store import get_event_store
-
-            workspace_base = _workspace_base(request)
-            store = get_event_store(workspace_base, session_id)
-            all_events = store.get_events(
-                types=["user_message", "response", "ask_user", "structured_response"],
-                limit=2000,
-            )
-            # Walk events chronologically, building synthetic turns
-            synthetic: list[dict] = []
-            current_user: str | None = None
-            current_ts: str = ""
-            responses: list[str] = []
-            for evt in all_events:
-                data = evt.get("data", {})
-                if isinstance(data, str):
-                    try:
-                        data = json.loads(data)
-                    except (json.JSONDecodeError, TypeError):
-                        data = {}
-                etype = evt.get("type", "")
-                if etype == "user_message":
-                    # Close previous turn
-                    if current_user is not None:
-                        synthetic.append({
-                            "turn_index": len(synthetic),
-                            "user_message": current_user,
-                            "assistant_response": "\n\n".join(responses) if responses else None,
-                            "timestamp": current_ts,
-                        })
-                        responses = []
-                    current_user = data.get("content", "")
-                    current_ts = evt.get("timestamp", "")
-                elif etype == "response":
-                    content = data.get("content", "")
-                    if content:
-                        responses.append(content)
-                elif etype == "ask_user":
-                    q = data.get("question", "")
-                    if q:
-                        responses.append(f"**Question:** {q}")
-            # Close last turn
-            if current_user is not None:
-                synthetic.append({
-                    "turn_index": len(synthetic),
-                    "user_message": current_user,
-                    "assistant_response": "\n\n".join(responses) if responses else None,
-                    "timestamp": current_ts,
-                })
-            turns = synthetic[-limit:] if len(synthetic) > limit else synthetic
-        except Exception:
-            pass
-
-    # Synthetic turns already have responses filled in — return early.
-    # Only fall through to the response-filling logic for SDK turns.
-    if not sdk_turns:
-        return {"turns": turns, "session_id": session_id}
-
-    # Build a list of response content to fill NULL assistant_response fields.
-    # Sources: 1) event store (persisted), 2) in-memory response cache.
-    fill_responses: list[dict] = []  # [{content, timestamp}, ...]
-
-    # 1) Event store responses
-    try:
-        from enclave.webui.event_store import get_event_store
-        workspace_base = _workspace_base(request)
-        store = get_event_store(workspace_base, session_id)
-        resp_events = store.get_events(types=["response"], limit=500)
-        for evt in resp_events:
-            data = evt.get("data", {})
-            if isinstance(data, str):
-                import json as _json
-                try:
-                    data = _json.loads(data)
-                except (ValueError, TypeError):
-                    data = {}
-            content = data.get("content", "")
-            if content:
-                fill_responses.append({
-                    "content": content,
-                    "timestamp": evt.get("timestamp", ""),
-                })
-    except Exception:
-        pass
-
-    # 2) In-memory response cache
-    if session_id in _response_cache:
-        for entry in _response_cache.get(session_id, []):
-            fill_responses.append({
-                "content": entry["content"],
-                "timestamp": entry["timestamp"],
-            })
-
-    # Dedup fill_responses
-    seen = set()
-    unique_fill: list[dict] = []
-    for fr in fill_responses:
-        if fr["content"] not in seen:
-            seen.add(fr["content"])
-            unique_fill.append(fr)
-
-    # Fill NULL assistant_response in turns
-    if unique_fill:
-        # Collect existing responses for dedup
-        db_responses = set()
-        for t in turns:
-            resp = t.get("assistant_response")
-            if resp:
-                db_responses.add(resp)
-
-        # Sort fill responses chronologically
-        unique_fill.sort(key=lambda e: e["timestamp"])
-
-        # For each NULL turn, find responses in its time window (between this
-        # turn's timestamp and the NEXT turn's timestamp — regardless of whether
-        # the next turn has a response or not).  Use the last candidate as the
-        # main response for this turn.
-        for i, turn in enumerate(turns):
-            if turn.get("assistant_response") is not None:
-                continue
-            turn_ts = turn.get("timestamp", "")
-            next_turn_ts = turns[i + 1].get("timestamp", "") if i + 1 < len(turns) else "9999"
-            candidates = [
-                e for e in unique_fill
-                if e["content"] not in db_responses
-                and (not turn_ts or e["timestamp"] >= turn_ts)
-                and e["timestamp"] < next_turn_ts
-            ]
-            if candidates:
-                best = candidates[-1]
-                turn["assistant_response"] = best["content"]
-                db_responses.add(best["content"])
-
-    # Prune in-memory cache entries whose content is now in the DB
-    if offset == 0 and session_id in _response_cache:
-        db_responses_final = {t.get("assistant_response") for t in turns if t.get("assistant_response")}
-        _response_cache[session_id] = [
-            e for e in _response_cache.get(session_id, [])
-            if e["content"] not in db_responses_final
-        ]
-        _persist_response_cache()
-
-    # Append synthetic turns from the event store for events newer than the
-    # last SDK turn.  The SDK DB lags behind because it only writes turns at
-    # idle or checkpoint boundaries, so recent interactions may be missing.
-    if turns and offset == 0:
-        last_ts = turns[-1].get("timestamp", "")
-        if last_ts:
-            try:
-                from enclave.webui.event_store import get_event_store
-                workspace_base = _workspace_base(request)
-                store = get_event_store(workspace_base, session_id)
-                recent_events = store.get_events(
-                    since_timestamp=last_ts,
-                    types=["user_message", "response", "ask_user", "structured_response"],
-                    limit=2000,
-                )
-                if recent_events:
-                    next_index = (turns[-1].get("turn_index", 0) or 0) + 1
-                    current_user: str | None = None
-                    current_ts_r = ""
-                    responses_r: list[str] = []
-                    for evt in recent_events:
-                        data = evt.get("data", {})
-                        if isinstance(data, str):
-                            try:
-                                data = json.loads(data)
-                            except (json.JSONDecodeError, TypeError):
-                                data = {}
-                        etype = evt.get("type", "")
-                        if etype == "user_message":
-                            if current_user is not None:
-                                turns.append({
-                                    "turn_index": next_index,
-                                    "user_message": current_user,
-                                    "assistant_response": "\n\n".join(responses_r) if responses_r else None,
-                                    "timestamp": current_ts_r,
-                                })
-                                next_index += 1
-                                responses_r = []
-                            current_user = data.get("content", "")
-                            current_ts_r = evt.get("timestamp", "")
-                        elif etype == "response":
-                            content = data.get("content", "")
-                            if content:
-                                responses_r.append(content)
-                        elif etype == "ask_user":
-                            q = data.get("question", "")
-                            if q:
-                                responses_r.append(f"**Question:** {q}")
-                    # Close last turn
-                    if current_user is not None:
-                        turns.append({
-                            "turn_index": next_index,
-                            "user_message": current_user,
-                            "assistant_response": "\n\n".join(responses_r) if responses_r else None,
-                            "timestamp": current_ts_r,
-                        })
-            except Exception:
-                pass
-
+    turns = _read_turns(db_path, limit=limit, offset=offset)
     return {"turns": turns, "session_id": session_id}
 
 
@@ -684,11 +520,9 @@ async def get_timeline(request: Request, session_id: str, date: str | None = Non
 @router.post("/{session_id}/send")
 async def send_message(request: Request, session_id: str, body: SendMessage):
     """Send a message to a session's agent via control socket (preferred) or Matrix."""
-    # Persist user message in event store for history reconstruction
-    _persist_event(request.app.state.config, session_id, {
-        "type": "user_message",
-        "content": body.content,
-    })
+    # The user turn is persisted by the orchestrator (notify_user_message →
+    # EventPersister) once the message reaches the agent, so all dispatch paths
+    # are recorded uniformly. No direct persistence here.
 
     # Try control socket first — this properly wakes idle/stopped agents
     data_dir = Path(request.app.state.config.data_dir)
@@ -979,34 +813,9 @@ async def stream_conversation(websocket: WebSocket, session_id: str, token: str 
                     if event.get("type") in ("ping", "subscribed"):
                         continue
 
-                    # Persist event to the event store (all types)
-                    _persist_event(config, session_id, event)
-
-                    # Cache response events for history supplement
-                    etype = event.get("type")
-                    cache_content = None
-                    if etype == "response" and event.get("content"):
-                        cache_content = event["content"]
-                    elif etype == "structured_response" and event.get("summary"):
-                        # For history gap-fill, cache the summary as the turn's response
-                        cache_content = event.get("summary", "")
-                    if cache_content:
-                        from datetime import datetime, timezone
-                        ts = datetime.now(timezone.utc).strftime(
-                            "%Y-%m-%dT%H:%M:%S.%f"
-                        )[:-3] + "Z"
-                        cache = _response_cache.setdefault(session_id, [])
-                        cache.append({
-                            "role": "assistant",
-                            "content": cache_content,
-                            "timestamp": ts,
-                            "structured": event if etype == "structured_response" else None,
-                        })
-                        # Keep cache bounded
-                        if len(cache) > 200:
-                            _response_cache[session_id] = cache[-100:]
-                        _persist_response_cache()
-
+                    # Persistence is handled by the always-on EventPersister,
+                    # not here — this stream only relays events to the browser
+                    # for live display.
                     try:
                         await websocket.send_json(event)
                     except Exception:

@@ -129,95 +129,20 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     async def health():
         return {"status": "ok", "auth_required": user_count() > 0}
 
-    # Background task: subscribe to control socket to cache agent responses
+    # Background task: durably persist agent events for all sessions so chat
+    # history survives reloads even when no browser is connected.
     @app.on_event("startup")
-    async def _start_response_cacher():
+    async def _start_event_persister():
         import asyncio
-        from enclave.webui.routes.chat import _response_cache, _load_response_cache, _persist_response_cache
+        from enclave.webui.event_persister import EventPersister
 
         data_dir = Path(config.data_dir)
         sock_path = data_dir / "control.sock"
+        workspace_base = Path(config.container.workspace_base)
 
-        # Load persisted cache from disk
-        _load_response_cache(data_dir)
-
-        async def _cache_subscriber():
-            """Persistent subscriber that caches all agent responses."""
-            while True:
-                if not sock_path.exists():
-                    await asyncio.sleep(3.0)
-                    continue
-                try:
-                    import json
-                    reader, writer = await asyncio.open_unix_connection(str(sock_path))
-                    # List sessions to subscribe to all
-                    writer.write(json.dumps({"action": "list"}).encode() + b"\n")
-                    await writer.drain()
-                    line = await asyncio.wait_for(reader.readline(), timeout=5)
-                    data = json.loads(line.decode())
-                    writer.close()
-                    await writer.wait_closed()
-
-                    session_ids = [s["id"] for s in data.get("sessions", [])
-                                   if s.get("status") == "running"]
-                    if not session_ids:
-                        await asyncio.sleep(10.0)
-                        continue
-
-                    # Subscribe to each running session
-                    tasks = [
-                        asyncio.create_task(_subscribe_session(sock_path, sid))
-                        for sid in session_ids
-                    ]
-                    # Re-check session list every 60s
-                    await asyncio.sleep(60.0)
-                    for t in tasks:
-                        t.cancel()
-
-                except Exception:
-                    await asyncio.sleep(5.0)
-
-        async def _subscribe_session(sock_path: Path, session_id: str):
-            import json
-            from datetime import datetime, timezone
-            try:
-                reader, writer = await asyncio.open_unix_connection(str(sock_path))
-                writer.write(json.dumps({
-                    "action": "subscribe", "session": session_id
-                }).encode() + b"\n")
-                await writer.drain()
-
-                while True:
-                    line = await reader.readline()
-                    if not line:
-                        break
-                    try:
-                        event = json.loads(line.decode())
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("type") == "response" and event.get("content"):
-                        ts = datetime.now(timezone.utc).strftime(
-                            "%Y-%m-%dT%H:%M:%S.%f"
-                        )[:-3] + "Z"
-                        cache = _response_cache.setdefault(session_id, [])
-                        cache.append({
-                            "role": "assistant",
-                            "content": event["content"],
-                            "timestamp": ts,
-                        })
-                        if len(cache) > 200:
-                            _response_cache[session_id] = cache[-100:]
-                        _persist_response_cache()
-            except (OSError, ConnectionError, asyncio.CancelledError):
-                pass
-            finally:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-        asyncio.create_task(_cache_subscriber())
+        persister = EventPersister(sock_path, workspace_base)
+        app.state.event_persister = persister
+        asyncio.create_task(persister.run())
 
     # Serve Vue SPA static files (built output) — must be last
     frontend_dist = Path(__file__).parent / "frontend" / "dist"

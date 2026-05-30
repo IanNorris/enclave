@@ -69,6 +69,17 @@ class ControlServer:
         if self._socket_path.exists():
             self._socket_path.unlink(missing_ok=True)
 
+    def notify_user_message(self, session_id: str, content: str, sender: str = "") -> None:
+        """Called by the router when a user message is delivered to the agent.
+
+        Emitted from every dispatch path (Matrix project rooms and control-socket
+        injection) so the webui's event persister durably records user turns
+        regardless of where the message originated.
+        """
+        self._emit(session_id, {
+            "ok": True, "type": "user_message", "content": content, "sender": sender,
+        })
+
     def notify_response(self, session_id: str, content: str) -> None:
         """Called by the router when an agent sends a response."""
         self._emit(session_id, {"ok": True, "type": "response", "content": content})

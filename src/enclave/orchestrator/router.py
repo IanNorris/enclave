@@ -354,6 +354,8 @@ class MessageRouter:
         if sent:
             self._touch_activity(session_id)
             log.info("Injected control message to %s: %s", session_id, content[:80])
+            # Record the user turn so the webui can reconstruct history.
+            self._control.notify_user_message(session_id, content, "control")
             # Echo to Matrix so the user can see what was sent
             await self.matrix.send_message(
                 session.room_id,
@@ -862,6 +864,9 @@ class MessageRouter:
                 "❌ Failed to reach the agent. It may have disconnected.",
                 thread_event_id=thread_id,
             )
+        else:
+            # Record the user turn so the webui can reconstruct history.
+            self._control.notify_user_message(session.id, body, sender)
 
     # ------------------------------------------------------------------
     # IPC → Router (agent responses)

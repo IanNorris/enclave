@@ -134,3 +134,29 @@ def get_event_store(workspace_base: Path, session_id: str) -> EventStore:
             db_path = workspace_base / session_id / ".enclave" / "events.db"
             _stores[session_id] = EventStore(db_path)
         return _stores[session_id]
+
+
+# Event types worth persisting (major outputs + tool lifecycle).
+# Excludes streaming deltas, thinking tokens, activity, ping/turn markers.
+PERSIST_TYPES = frozenset({
+    "tool_start", "tool_complete", "response", "file_send", "ask_user",
+    "user_message", "structured_response",
+})
+
+
+def persist_event(workspace_base: Path, session_id: str, event: dict[str, Any]) -> None:
+    """Persist a control-socket event to the session's event store.
+
+    Only event types in PERSIST_TYPES are stored. The ``ok`` and ``type``
+    keys are dropped from the stored payload (``type`` is a column).
+    Failures are swallowed so persistence never disrupts the caller.
+    """
+    event_type = event.get("type", "")
+    if event_type not in PERSIST_TYPES:
+        return
+    try:
+        store = get_event_store(workspace_base, session_id)
+        data = {k: v for k, v in event.items() if k not in ("ok", "type")}
+        store.append(event_type, data)
+    except Exception:
+        pass
