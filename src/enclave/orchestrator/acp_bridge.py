@@ -17,6 +17,7 @@ and translates:
 from __future__ import annotations
 
 import asyncio
+import ssl
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ class ACPBridge:
         remote_cwd: str = ".",
         acp_session_id: str | None = None,
         use_tls: bool = False,
+        ssl_context: "ssl.SSLContext | None" = None,
     ):
         self.session_id = session_id
         self.socket_path = str(socket_path)
@@ -60,6 +62,7 @@ class ACPBridge:
             on_update=self._on_acp_update,
             on_request=self._on_acp_request,
             use_tls=use_tls,
+            ssl_context=ssl_context,
         )
 
         # IPC connection to orchestrator (we act as the agent)

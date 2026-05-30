@@ -10,6 +10,7 @@ import asyncio
 import functools
 import os
 import signal
+import ssl
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -198,10 +199,15 @@ class ContainerManager:
         if profile.fuse:
             fuse_dev = Path("/dev/fuse")
             if fuse_dev.exists():
+                # NOTE: we deliberately do NOT pass `apparmor=unconfined` here.
+                # Disabling confinement entirely is broader than FUSE needs
+                # (security review L6). On hosts without AppArmor this flag is a
+                # no-op anyway; on AppArmor hosts where podman's default profile
+                # blocks mount(2), prefer a scoped FUSE-allowing profile over
+                # fully unconfining the container.
                 cmd.extend([
                     "--device", "/dev/fuse",
                     "--cap-add", "SYS_ADMIN",
-                    "--security-opt", "apparmor=unconfined",
                 ])
                 log.info(
                     "[start:%s] FUSE enabled (/dev/fuse + SYS_ADMIN)",
@@ -440,6 +446,16 @@ class ContainerManager:
             session.id, session.acp_host, session.acp_port,
         )
 
+        # TLS policy: plaintext ACP is only acceptable to a loopback peer.
+        # Any non-loopback ACP endpoint MUST use TLS, otherwise the agent
+        # control channel (prompts, tool I/O, permission grants) crosses the
+        # network in the clear and is open to MITM (security review L3).
+        use_tls, ssl_context, tls_err = self._acp_tls_policy(session.acp_host)
+        if tls_err:
+            session.status = "stopped"
+            log.error("[start:%s] %s", session.id, tls_err)
+            return False, tls_err
+
         bridge = ACPBridge(
             session_id=session.id,
             socket_path=session.socket_path,
@@ -447,6 +463,8 @@ class ContainerManager:
             acp_port=session.acp_port,
             remote_cwd=session.acp_remote_cwd or ".",
             acp_session_id=session.acp_session_id or None,
+            use_tls=use_tls,
+            ssl_context=ssl_context,
         )
 
         try:
@@ -466,6 +484,54 @@ class ContainerManager:
             session.status = "stopped"
             log.error("[start:%s] Failed to start ACP session: %s", session.id, e)
             return False, f"ACP start failed: {e}"
+
+    # CA used to verify remote ACP server certificates. Mirrors the self-signed
+    # CA that the web UI's TLS certs are issued from.
+    _ACP_CA_CERT = "/data/Enclave/tls/ca.crt"
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        """True if host refers to the local machine (no network exposure)."""
+        import ipaddress
+        if not host:
+            return False
+        h = host.strip().lower()
+        if h in ("localhost", "ip6-localhost"):
+            return True
+        # Strip IPv6 brackets if present
+        h = h.strip("[]")
+        try:
+            return ipaddress.ip_address(h).is_loopback
+        except ValueError:
+            return False
+
+    def _acp_tls_policy(
+        self, host: str,
+    ) -> tuple[bool, "ssl.SSLContext | None", str | None]:
+        """Decide the TLS settings for an ACP connection to ``host``.
+
+        Returns ``(use_tls, ssl_context, error)``. Loopback peers may use
+        plaintext; every other peer is required to use TLS verified against the
+        Enclave CA. ``error`` is non-None when the policy cannot be satisfied
+        (e.g. the CA bundle is missing) so the caller can refuse to connect.
+        """
+        if self._is_loopback_host(host):
+            return False, None, None
+
+        ca_path = Path(self._ACP_CA_CERT)
+        if not ca_path.is_file():
+            return False, None, (
+                f"Refusing plaintext ACP to non-loopback host {host!r}: "
+                f"TLS is required but CA bundle {ca_path} is missing."
+            )
+        try:
+            ctx = ssl.create_default_context(cafile=str(ca_path))
+        except Exception as e:
+            return False, None, (
+                f"Refusing ACP to non-loopback host {host!r}: "
+                f"failed to load TLS CA {ca_path}: {e}"
+            )
+        return True, ctx, None
 
     async def _monitor_host_process(
         self, session: Session, proc: asyncio.subprocess.Process
