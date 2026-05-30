@@ -1183,19 +1183,25 @@ def _request_permission_sync(
 
 
 _MODEL_PREFERENCES: tuple[str, ...] = (
-    "claude-opus-4.6",
+    "claude-opus-4.8",
     "claude-opus-4.7",
+    "claude-opus-4.6",
     "gpt-5.5",
 )
 _REASONING_EFFORT = "medium"
 
+# Models that do not accept a reasoning-effort setting. set_model() raises if
+# reasoning_effort is passed for these, so we retry without it. claude-opus-4.8
+# is one such model (verified against CLI 1.0.57-3 / models.list).
+_NO_REASONING_EFFORT_MODELS: frozenset[str] = frozenset({"claude-opus-4.8"})
+
 # Panel archetype model preferences (first available wins).
 # Architect wants the deepest reasoning; Pragmatist & Contrarian favour
-# GPT 5.5 for breadth; Skeptic uses Opus 4.6 for careful analysis.
+# GPT 5.5 for breadth; Skeptic uses Opus for careful analysis.
 _PANEL_MODEL_PREFERENCES: dict[str, tuple[str, ...]] = {
-    "architect": ("claude-opus-4.7-xhigh", "claude-opus-4.6", "claude-opus-4.5"),
+    "architect": ("claude-opus-4.8", "claude-opus-4.7-xhigh", "claude-opus-4.6", "claude-opus-4.5"),
     "pragmatist": ("gpt-5.5", "gpt-5.4", "gpt-5.2"),
-    "skeptic": ("claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.5"),
+    "skeptic": ("claude-opus-4.8", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.5"),
     "contrarian": ("gpt-5.5", "claude-opus-4.7-xhigh", "claude-opus-4.6"),
 }
 
@@ -1272,13 +1278,29 @@ async def _configure_model(
         print(f"[agent] list_models failed (using {target}): {e}", file=sys.stderr)
 
     try:
-        await session.set_model(target, reasoning_effort=_REASONING_EFFORT)
-        print(
-            f"[agent] Model set to {target} (reasoning={_REASONING_EFFORT})",
-            file=sys.stderr,
-        )
+        if target in _NO_REASONING_EFFORT_MODELS:
+            await session.set_model(target)
+            print(f"[agent] Model set to {target} (no reasoning effort)", file=sys.stderr)
+        else:
+            await session.set_model(target, reasoning_effort=_REASONING_EFFORT)
+            print(
+                f"[agent] Model set to {target} (reasoning={_REASONING_EFFORT})",
+                file=sys.stderr,
+            )
     except Exception as e:
-        print(f"[agent] set_model failed (non-fatal): {e}", file=sys.stderr)
+        # Some models reject a reasoning-effort setting; retry without it rather
+        # than silently keeping the SDK default model.
+        if "reasoning effort" in str(e).lower():
+            try:
+                await session.set_model(target)
+                print(
+                    f"[agent] Model set to {target} (no reasoning effort support)",
+                    file=sys.stderr,
+                )
+            except Exception as e2:
+                print(f"[agent] set_model retry failed (non-fatal): {e2}", file=sys.stderr)
+        else:
+            print(f"[agent] set_model failed (non-fatal): {e}", file=sys.stderr)
 
     # Write available models to workspace for webui consumption
     try:
