@@ -38,11 +38,14 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     # Store config in app state for access in route handlers
     app.state.config = config
 
-    # CORS — allow the webui port from any origin (needed when exposed off-localhost)
+    # CORS — the API authenticates via Bearer tokens in the Authorization
+    # header (never cookies), so credentials mode is unnecessary. Keeping
+    # allow_credentials=True together with allow_origins=["*"] would let any
+    # origin make credentialed cross-origin requests (security review L2).
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )

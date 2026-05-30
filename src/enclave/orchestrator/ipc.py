@@ -185,6 +185,15 @@ class IPCServer:
     ) -> None:
         """Handle a new agent connection."""
         conn = IPCConnection(session_id, reader, writer)
+        # If a stale connection for this session is still registered (e.g. the
+        # agent reconnected before the old socket was torn down), close it
+        # first so we don't leak the previous writer/fd (security review L7).
+        prev = self._connections.get(session_id)
+        if prev is not None and not prev.is_closed:
+            try:
+                await prev.close()
+            except Exception as e:
+                log.warning("Error closing stale IPC connection for %s: %s", session_id, e)
         self._connections[session_id] = conn
         log.info("Agent connected: %s", session_id)
 

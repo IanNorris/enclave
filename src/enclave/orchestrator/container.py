@@ -290,9 +290,13 @@ class ContainerManager:
         if self.config.dns and network != "none":
             cmd.extend(["--dns", self.config.dns])
 
-        # Pass GitHub token for Copilot SDK auth
+        # Pass GitHub token for Copilot SDK auth. Use podman's name-only `-e`
+        # form so the secret value is read from the orchestrator's environment
+        # and never appears on the podman argv / host process list (L5).
+        run_env: dict | None = None
         if self.config.github_token:
-            cmd.extend(["-e", f"GITHUB_TOKEN={self.config.github_token}"])
+            cmd.extend(["-e", "GITHUB_TOKEN"])
+            run_env = {**os.environ, "GITHUB_TOKEN": self.config.github_token}
 
         # Pass profile info so the agent can adapt its behaviour
         cmd.extend([
@@ -322,7 +326,7 @@ class ContainerManager:
         try:
             # First container run after image build can take ~35s (overlay setup).
             # Use generous timeout to avoid killing it and corrupting storage.
-            result = await _run_command(cmd, timeout=120.0)
+            result = await _run_command(cmd, timeout=120.0, env=run_env)
             log.debug("Container run result: rc=%d stdout=%s stderr=%s",
                        result.returncode, result.stdout[:40], result.stderr[:100])
             if result.returncode == 0:
@@ -588,7 +592,7 @@ class CommandResult:
     stderr: str
 
 
-def _run_command_sync(cmd: list[str], timeout: float) -> CommandResult:
+def _run_command_sync(cmd: list[str], timeout: float, env: dict | None = None) -> CommandResult:
     """Run a command synchronously (for use in thread pool)."""
     try:
         result = subprocess.run(
@@ -596,6 +600,7 @@ def _run_command_sync(cmd: list[str], timeout: float) -> CommandResult:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return CommandResult(
             returncode=result.returncode,
@@ -606,11 +611,11 @@ def _run_command_sync(cmd: list[str], timeout: float) -> CommandResult:
         return CommandResult(returncode=-1, stdout="", stderr="timeout")
 
 
-async def _run_command(cmd: list[str], timeout: float = 30.0) -> CommandResult:
+async def _run_command(cmd: list[str], timeout: float = 30.0, env: dict | None = None) -> CommandResult:
     """Run a command in a thread pool to avoid event loop deadlocks."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, functools.partial(_run_command_sync, cmd, timeout)
+        None, functools.partial(_run_command_sync, cmd, timeout, env)
     )
 
 

@@ -3109,17 +3109,10 @@ class MessageRouter:
             command = command.replace("/workspace", session.workspace_path)
             log.debug("Translated GUI command path: %s", command)
 
-            # Container-built binaries may need libraries from the container's
-            # nix store or system libs.  Resolve missing shared libs on the host.
-            extra_lib_dirs = await self._resolve_missing_libs(command)
-            if extra_lib_dirs:
-                existing = os.environ.get("LD_LIBRARY_PATH", "")
-                extra_env["LD_LIBRARY_PATH"] = ":".join(extra_lib_dirs) + (
-                    f":{existing}" if existing else ""
-                )
-                log.info("Added LD_LIBRARY_PATH for GUI: %s", extra_env["LD_LIBRARY_PATH"])
-
-        # Require approval for GUI launches
+        # Require approval for GUI launches. Do this BEFORE touching the
+        # agent-supplied binary (e.g. ldd in _resolve_missing_libs), since
+        # running ldd on an untrusted binary can execute code on the host
+        # (security review L8).
         status, scope, pattern = await self._approval.request_permission(
             session_id=session.id,
             session_name=session.name,
@@ -3138,6 +3131,18 @@ class MessageRouter:
                 reply_to=msg.id,
             ))
             return
+
+        # Approved: now it's safe to inspect the binary. Container-built
+        # binaries may need libraries from the container's nix store or system
+        # libs — resolve missing shared libs on the host.
+        if session.workspace_path and command.startswith(session.workspace_path):
+            extra_lib_dirs = await self._resolve_missing_libs(command)
+            if extra_lib_dirs:
+                existing = os.environ.get("LD_LIBRARY_PATH", "")
+                extra_env["LD_LIBRARY_PATH"] = ":".join(extra_lib_dirs) + (
+                    f":{existing}" if existing else ""
+                )
+                log.info("Added LD_LIBRARY_PATH for GUI: %s", extra_env["LD_LIBRARY_PATH"])
 
         success = await self._display.launch_app(command, extra_env=extra_env)
         await self.ipc.send_to(session.id, Message(

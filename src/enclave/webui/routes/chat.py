@@ -878,9 +878,13 @@ async def proxy_workspace_file(
                 workspace = d
                 break
 
-    # Resolve and sanitize — must stay within workspace
+    # Resolve and sanitize — must stay within workspace. Use relative_to rather
+    # than a string startswith, which would treat a sibling like
+    # "<workspace>-evil" as inside the workspace (security review L1).
     resolved = (workspace / file_path).resolve()
-    if not str(resolved).startswith(str(workspace.resolve())):
+    try:
+        resolved.relative_to(workspace.resolve())
+    except ValueError:
         raise HTTPException(status_code=403, detail="Path traversal denied")
     if not resolved.is_file():
         raise HTTPException(status_code=404, detail="File not found")

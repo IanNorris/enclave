@@ -77,6 +77,9 @@ class ACPBridge:
         self._replay_mode = False
         self._reconnect_task: asyncio.Task | None = None
         self._reconnecting = False
+        # Set once reconnection has permanently failed so the monitor stops
+        # re-attempting every 5s forever (security review L4).
+        self._reconnect_failed = False
 
     @property
     def acp_session_id(self) -> str | None:
@@ -415,6 +418,12 @@ class ACPBridge:
         """Store the pending permission and forward to orchestrator via IPC."""
         import uuid
         enclave_id = str(uuid.uuid4())
+        # Bound the map so a remote agent that floods permission requests the
+        # user never answers can't grow it without limit (security review L4).
+        _MAX_PENDING = 256
+        while len(self._pending_permissions) >= _MAX_PENDING:
+            oldest = next(iter(self._pending_permissions))
+            self._pending_permissions.pop(oldest, None)
         self._pending_permissions[enclave_id] = request_id
 
         # Extract permission details from ACP format
@@ -445,6 +454,11 @@ class ACPBridge:
 
                 if self._acp.connected or self._reconnecting:
                     continue
+
+                # Reconnection already exhausted its attempts — stop monitoring
+                # instead of looping a fresh 30-attempt storm every 5s.
+                if self._reconnect_failed:
+                    break
 
                 # Connection lost — attempt reconnect
                 log.warning("[%s] ACP connection lost, attempting reconnect...", self.session_id)
@@ -514,6 +528,7 @@ class ACPBridge:
 
         # All attempts exhausted
         log.error("[%s] Failed to reconnect after %d attempts", self.session_id, max_attempts)
+        self._reconnect_failed = True
         await self._ipc_send(Message(
             type=MessageType.STATUS_UPDATE,
             payload={"status": "❌ Remote agent unreachable — reconnect failed"},
