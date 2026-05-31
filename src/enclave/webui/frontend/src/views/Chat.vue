@@ -327,7 +327,7 @@ const selectedSession = computed(() => selectedSessionId.value)
 const turns = ref([])
 const hasMore = ref(false)
 const loadingMore = ref(false)
-const INITIAL_LIMIT = 50
+const INITIAL_LIMIT = 120
 const draft = ref('')
 const sending = ref(false)
 const messagesEl = ref(null)
@@ -453,12 +453,14 @@ async function loadEvents() {
       sinceTimestamp: firstTs || undefined,
     })
     const events = data.events || []
-    // Group events by turn, then split into segments separated by responses.
-    // Each segment: { tools: [...], response: null | string }
-    // This preserves the chronological interleaving of tool calls and responses.
+    // Tool calls (and file sends) are collapsed under their turn. Agent
+    // responses and structured cards are NOT grouped here: history
+    // reconstruction now surfaces every response as its own bubble and marks
+    // structured cards on dedicated turns, so grouping them here would
+    // duplicate (responses) or double-map (cards) them.
     const grouped = {}
     for (const evt of events) {
-      if (!['tool_start', 'tool_complete', 'file_send', 'response', 'structured_response'].includes(evt.type)) continue
+      if (!['tool_start', 'tool_complete', 'file_send'].includes(evt.type)) continue
       // Find the best matching turn (latest turn that started before this event)
       let bestTurn = null
       for (const t of turns.value) {
@@ -470,39 +472,7 @@ async function loadEvents() {
       }
       if (bestTurn == null) continue
       if (!grouped[bestTurn]) grouped[bestTurn] = [{ tools: [], response: null }]
-
-      const segments = grouped[bestTurn]
-      if (evt.type === 'structured_response') {
-        // Apply structured data to the matching turn
-        const matchTurn = turns.value.find(t => t.turn_index === bestTurn)
-        if (matchTurn) {
-          matchTurn.structured = evt.data || {}
-          matchTurn.is_major = true
-        }
-      } else if (evt.type === 'response') {
-        // A response closes the current segment and starts a new one
-        const content = evt.data?.content || ''
-        if (content) {
-          segments[segments.length - 1].response = content
-          // Update the response timestamp to the latest event in this segment
-          const lastTool = segments[segments.length - 1].tools
-          if (lastTool.length > 0) {
-            segments[segments.length - 1].responseTimestamp = lastTool[lastTool.length - 1].timestamp
-          } else {
-            segments[segments.length - 1].responseTimestamp = evt.timestamp
-          }
-          segments.push({ tools: [], response: null })
-        }
-      } else {
-        segments[segments.length - 1].tools.push(evt)
-      }
-    }
-    // Clean up trailing empty segments
-    for (const key of Object.keys(grouped)) {
-      const segs = grouped[key]
-      if (segs.length > 0 && segs[segs.length - 1].tools.length === 0 && !segs[segs.length - 1].response) {
-        segs.pop()
-      }
+      grouped[bestTurn][0].tools.push(evt)
     }
     turnEvents.value = grouped
   } catch (e) {

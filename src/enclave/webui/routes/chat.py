@@ -88,13 +88,18 @@ def _reconstruct_turns(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build conversation turns from the chronological event log.
 
     The event store (events.db) is the single source of truth. Events arrive
-    ordered by insertion id. A ``user_message`` opens a new turn; subsequent
-    agent outputs (``response``/``ask_user``) belong to that turn. Each turn's
-    ``assistant_response`` is the turn's final major output (always shown in the
-    UI); intermediate responses and tool calls are surfaced separately via the
-    ``/events`` endpoint, and ``structured_response`` cards are mapped to turns
-    by timestamp on the client. Agent output emitted before any user message
-    forms a leading turn with ``user_message=None``.
+    ordered by insertion id. A ``user_message`` opens a new turn whose first
+    agent output attaches to it (rendered as the answer). EVERY agent output
+    (``response``/``ask_user``) is preserved as its own visible bubble: the
+    first attaches to the current turn, and each subsequent one becomes its own
+    anonymous turn (``user_message=None``). This mirrors the live stream, which
+    renders every agent response separately — so a reload no longer collapses a
+    multi-response turn into a single bubble and silently drops the rest.
+
+    ``structured_response`` (major update) cards are server-authoritative: each
+    one becomes its own dedicated turn carrying the full ``structured`` payload,
+    so the card survives reload without fragile client-side timestamp mapping.
+    Tool calls are surfaced separately via the ``/events`` endpoint.
     """
     turns: list[dict[str, Any]] = []
     cur: dict[str, Any] | None = None
@@ -102,21 +107,29 @@ def _reconstruct_turns(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def flush() -> None:
         nonlocal cur
         if cur is not None:
-            major = cur.pop("_major")
-            cur["assistant_response"] = major[-1] if major else None
             turns.append(cur)
             cur = None
 
-    def ensure(ts: str) -> None:
+    def new_turn(ts: str, user_message: str | None = None) -> dict[str, Any]:
+        return {
+            "turn_index": 0,
+            "user_message": user_message,
+            "assistant_response": None,
+            "timestamp": ts,
+        }
+
+    def add_agent_output(ts: str, content: str) -> None:
+        # Each agent response/question is its own visible bubble. The first
+        # output after a user message (or as a leading anonymous turn) attaches
+        # to the current turn; once that slot is filled, the next output starts
+        # a fresh anonymous turn so nothing is lost on reload.
         nonlocal cur
         if cur is None:
-            cur = {
-                "turn_index": len(turns),
-                "user_message": None,
-                "assistant_response": None,
-                "timestamp": ts,
-                "_major": [],
-            }
+            cur = new_turn(ts)
+        elif cur.get("assistant_response") is not None:
+            flush()
+            cur = new_turn(ts)
+        cur["assistant_response"] = content
 
     for evt in events:
         etype = evt.get("type", "")
@@ -130,29 +143,26 @@ def _reconstruct_turns(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         if etype == "user_message":
             flush()
-            cur = {
-                "turn_index": len(turns),
-                "user_message": data.get("content", ""),
-                "assistant_response": None,
-                "timestamp": ts,
-                "_major": [],
-            }
+            cur = new_turn(ts, user_message=data.get("content", ""))
         elif etype == "response":
-            ensure(ts)
             content = data.get("content", "")
             if content:
-                cur["_major"].append(content)  # type: ignore[index]
+                add_agent_output(ts, content)
         elif etype == "ask_user":
-            ensure(ts)
             question = data.get("question", "")
             if question:
-                cur["_major"].append(f"**Question:** {question}")  # type: ignore[index]
+                add_agent_output(ts, f"**Question:** {question}")
         elif etype == "structured_response":
-            # Rendered as a card mapped by timestamp on the client; just make
-            # sure a turn exists so the mapping has a target.
-            ensure(ts)
+            # Major update: its own dedicated, server-authoritative card turn.
+            flush()
+            card = new_turn(ts)
+            card["structured"] = data
+            card["is_major"] = True
+            turns.append(card)
 
     flush()
+    for i, t in enumerate(turns):
+        t["turn_index"] = i
     return turns
 
 

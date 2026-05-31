@@ -9,19 +9,38 @@ def _evt(etype: str, ts: str, **data):
     return {"type": etype, "timestamp": ts, "data": data}
 
 
-def test_basic_user_then_responses_groups_into_one_turn():
+def test_first_response_attaches_extra_responses_split_into_own_turns():
+    # Every agent response must survive reload. The first attaches to the user
+    # turn; each subsequent one becomes its own (anonymous) bubble so none are
+    # lost the way the old _major[-1] collapse dropped them.
     events = [
         _evt("user_message", "t1", content="hello"),
         _evt("response", "t2", content="first"),
-        _evt("response", "t3", content="final"),
+        _evt("response", "t3", content="middle"),
+        _evt("response", "t4", content="final"),
+    ]
+    turns = _reconstruct_turns(events)
+    assert len(turns) == 3
+    assert turns[0]["user_message"] == "hello"
+    assert turns[0]["assistant_response"] == "first"
+    assert turns[1]["user_message"] is None
+    assert turns[1]["assistant_response"] == "middle"
+    assert turns[2]["user_message"] is None
+    assert turns[2]["assistant_response"] == "final"
+    assert [t["turn_index"] for t in turns] == [0, 1, 2]
+    assert turns[0]["timestamp"] == "t1"
+    assert turns[1]["timestamp"] == "t3"
+
+
+def test_single_response_turn_unchanged():
+    events = [
+        _evt("user_message", "t1", content="hello"),
+        _evt("response", "t2", content="only"),
     ]
     turns = _reconstruct_turns(events)
     assert len(turns) == 1
     assert turns[0]["user_message"] == "hello"
-    # assistant_response is the turn's final major output
-    assert turns[0]["assistant_response"] == "final"
-    assert turns[0]["turn_index"] == 0
-    assert turns[0]["timestamp"] == "t1"
+    assert turns[0]["assistant_response"] == "only"
 
 
 def test_multiple_turns_get_sequential_indexes():
@@ -48,6 +67,7 @@ def test_leading_agent_output_forms_anonymous_turn():
     assert turns[0]["user_message"] is None
     assert turns[0]["assistant_response"] == "autonomous"
     assert turns[1]["user_message"] == "hi"
+    assert turns[1]["assistant_response"] == "reply"
 
 
 def test_ask_user_is_surfaced_as_response():
@@ -59,16 +79,21 @@ def test_ask_user_is_surfaced_as_response():
     assert turns[0]["assistant_response"] == "**Question:** Which one?"
 
 
-def test_structured_response_creates_turn_without_overwriting_response():
-    # A structured_response alone (no plain response) still yields a turn so the
-    # client can map the card by timestamp; assistant_response stays None.
+def test_structured_response_is_its_own_card_turn():
+    # A structured_response becomes a dedicated, server-authoritative card turn
+    # carrying the full payload — it never overwrites a regular response.
     events = [
         _evt("user_message", "t1", content="make a card"),
-        _evt("structured_response", "t2", summary="card summary"),
+        _evt("response", "t2", content="working on it"),
+        _evt("structured_response", "t3", title="Done", summary="card summary"),
     ]
     turns = _reconstruct_turns(events)
-    assert len(turns) == 1
-    assert turns[0]["assistant_response"] is None
+    assert len(turns) == 2
+    assert turns[0]["assistant_response"] == "working on it"
+    assert "structured" not in turns[0]
+    assert turns[1]["assistant_response"] is None
+    assert turns[1]["structured"] == {"title": "Done", "summary": "card summary"}
+    assert turns[1]["is_major"] is True
 
 
 def test_empty_events_yields_no_turns():
