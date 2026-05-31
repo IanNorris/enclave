@@ -968,19 +968,34 @@ class MessageRouter:
                 total_tokens=msg.payload.get("total_tokens", 0),
                 model=msg.payload.get("model", ""),
             )
-            # Account-level "AI Credits" (premium request quota). The SDK reports
-            # the same account quota on every session, so persist the latest
-            # snapshot and push it live to any subscribed web UI.
+            # Account-level "AI Credits" entitlement (premium request quota) +
+            # per-session consumed AI Units. The SDK reports the same account
+            # quota on every session (persist latest snapshot), and per-call
+            # consumption as nano AI Units (accumulate per session). Push both
+            # live to any subscribed web UI.
             quota = msg.payload.get("quota_snapshots") or {}
+            nano_aiu = msg.payload.get("nano_aiu", 0.0) or 0.0
+            cost = msg.payload.get("cost", 0.0)
+            model = msg.payload.get("model", "")
             if quota:
-                cost = msg.payload.get("cost", 0.0)
-                model = msg.payload.get("model", "")
                 self._cost.record_credits(quota, cost, model)
-                if self._control:
-                    self._control.notify_credits(
-                        session.id,
-                        {"snapshots": quota, "last_cost": cost, "model": model},
-                    )
+            session_credits = None
+            if nano_aiu:
+                session_credits = self._cost.add_session_aiu(
+                    session.id, nano_aiu=nano_aiu, premium_cost=cost, model=model,
+                )
+            if (quota or nano_aiu) and self._control:
+                if session_credits is None:
+                    session_credits = self._cost.get_session_credits(session.id)
+                self._control.notify_credits(
+                    session.id,
+                    {
+                        "snapshots": quota,
+                        "last_cost": cost,
+                        "model": model,
+                        "session": session_credits or {},
+                    },
+                )
         elif msg.type == MessageType.NIX_SHELL_REQUEST:
             await self._handle_nix_shell_request(session, msg)
         elif msg.type == MessageType.PORT_REQUEST:

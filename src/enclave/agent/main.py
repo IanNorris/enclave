@@ -710,10 +710,16 @@ def setup_session_listener(
                 total_tokens = getattr(data, "total_tokens", 0)
                 model = getattr(data, "model", "")
                 cost = getattr(data, "cost", 0.0) or 0.0
+                # Consumed "AI Credits" = AI Units. The SDK reports per-call
+                # consumption as copilotUsage.totalNanoAiu (nano AI Units).
+                nano_aiu = 0.0
+                copilot_usage = getattr(data, "copilot_usage", None)
+                if copilot_usage is not None:
+                    nano_aiu = getattr(copilot_usage, "total_nano_aiu", 0.0) or 0.0
                 quota_snapshots = _serialize_quota_snapshots(
                     getattr(data, "quota_snapshots", None)
                 )
-                if input_tokens or output_tokens or total_tokens or quota_snapshots:
+                if input_tokens or output_tokens or total_tokens or quota_snapshots or nano_aiu:
                     _fire_and_forget(ipc.send(Message(
                         type=MessageType.USAGE_REPORT,
                         payload={
@@ -722,6 +728,7 @@ def setup_session_listener(
                             "total_tokens": total_tokens,
                             "model": model or "",
                             "cost": cost,
+                            "nano_aiu": nano_aiu,
                             "quota_snapshots": quota_snapshots,
                         },
                     )))

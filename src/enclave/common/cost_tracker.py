@@ -63,6 +63,15 @@ class CostTracker:
                 model TEXT DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS session_credits (
+                session_id TEXT PRIMARY KEY,
+                nano_aiu REAL DEFAULT 0,
+                requests INTEGER DEFAULT 0,
+                premium_cost REAL DEFAULT 0,
+                model TEXT DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_usage_session
                 ON usage_events(session_id);
             CREATE INDEX IF NOT EXISTS idx_usage_ts
@@ -272,6 +281,61 @@ class CostTracker:
             "snapshots": snapshots,
             "last_cost": row["last_cost"],
             "model": row["model"],
+        }
+
+    def add_session_aiu(
+        self,
+        session_id: str,
+        nano_aiu: float = 0.0,
+        premium_cost: float = 0.0,
+        model: str = "",
+    ) -> dict[str, Any]:
+        """Accumulate consumed AI Units ("AI Credits") for a session.
+
+        The Copilot SDK reports per-API-call consumption as
+        ``copilotUsage.totalNanoAiu`` (nano AI Units). One AI Unit equals one
+        "AI Credit" in the GitHub usage-based billing model. We sum these per
+        Enclave session so the web UI can show the running total (mirroring the
+        Copilot CLI's "AI Credits" indicator). ``premium_cost`` is the legacy
+        premium-request cost (1 per frontier-model call) kept for reference.
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            """INSERT INTO session_credits
+                 (session_id, nano_aiu, requests, premium_cost, model, updated_at)
+               VALUES (?, ?, 1, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 nano_aiu = nano_aiu + excluded.nano_aiu,
+                 requests = requests + 1,
+                 premium_cost = premium_cost + excluded.premium_cost,
+                 model = excluded.model,
+                 updated_at = excluded.updated_at""",
+            (session_id, float(nano_aiu or 0.0), float(premium_cost or 0.0), model or "", ts),
+        )
+        self._conn.commit()
+        return self.get_session_credits(session_id) or {}
+
+    def get_session_credits(self, session_id: str) -> dict[str, Any] | None:
+        """Return cumulative AI Credits (AIU) consumed for a session.
+
+        ``aiu`` is the human-facing AI Credits figure (nano AIU / 1e9).
+        """
+        row = self._conn.execute(
+            """SELECT nano_aiu, requests, premium_cost, model, updated_at
+               FROM session_credits WHERE session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        nano = row["nano_aiu"] or 0.0
+        return {
+            "session_id": session_id,
+            "nano_aiu": nano,
+            "aiu": round(nano / 1_000_000_000, 2),
+            "requests": row["requests"] or 0,
+            "premium_cost": row["premium_cost"] or 0.0,
+            "model": row["model"] or "",
+            "updated_at": row["updated_at"],
         }
 
     def close(self) -> None:

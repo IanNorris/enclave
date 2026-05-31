@@ -419,21 +419,28 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": str(e)})
 
     async def _handle_credits(self, req: dict, writer: asyncio.StreamWriter) -> None:
-        """Return the latest account-level "AI Credits" snapshot.
+        """Return AI Credits info: account entitlement snapshot + per-session usage.
 
-        Account-global (not per-session); served from the cost tracker's most
-        recent persisted snapshot so it survives orchestrator restarts and is
-        available on the web UI's initial load.
+        The account entitlement snapshot (often "Unlimited") is global. The
+        consumed AI Units ("AI Credits") figure is per session — pass ``session``
+        to include the running total for that session. Served from the cost
+        tracker so it survives orchestrator restarts and is available on initial
+        web UI load.
         """
+        session_id = req.get("session", "")
         try:
-            credits = self._router._cost.get_credits()
+            credits = self._router._cost.get_credits() or {}
+            session_credits = (
+                self._router._cost.get_session_credits(session_id)
+                if session_id else None
+            )
         except Exception as e:
             await self._write(writer, {"ok": False, "error": str(e)})
             return
-        if not credits:
-            await self._write(writer, {"ok": True, "type": "credits", "snapshots": {}})
-            return
-        await self._write(writer, {"ok": True, "type": "credits", **credits})
+        payload = {"ok": True, "type": "credits", "snapshots": {}}
+        payload.update(credits)
+        payload["session"] = session_credits or {}
+        await self._write(writer, payload)
 
     async def _handle_subscribe(
         self,

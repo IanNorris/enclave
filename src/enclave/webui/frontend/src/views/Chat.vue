@@ -531,7 +531,17 @@ function pickCreditsSnapshot(snapshots) {
 }
 
 const creditsLabel = computed(() => {
-  const snap = pickCreditsSnapshot(aiCredits.value?.snapshots)
+  const c = aiCredits.value
+  // Consumed AI Units ("AI Credits") for this session — the primary figure,
+  // mirroring the Copilot CLI's "AI Credits" indicator.
+  const aiu = Number(c?.session?.aiu)
+  if (Number.isFinite(aiu) && aiu > 0) {
+    const shown = aiu >= 100 ? Math.round(aiu) : Math.round(aiu * 10) / 10
+    return `AI Credits: ${shown.toLocaleString()}`
+  }
+  // Fall back to the account entitlement snapshot (e.g. "Unlimited") until the
+  // session has consumed anything.
+  const snap = pickCreditsSnapshot(c?.snapshots)
   if (!snap) return ''
   if (snap.is_unlimited) return 'AI Credits: Unlimited'
   const ent = Number(snap.entitlement)
@@ -549,12 +559,16 @@ const creditsLabel = computed(() => {
 
 const creditsTitle = computed(() => {
   const c = aiCredits.value
-  const snap = pickCreditsSnapshot(c?.snapshots)
-  if (!snap) return ''
   const parts = []
-  if (snap.reset_date) parts.push(`Resets: ${new Date(snap.reset_date).toLocaleString()}`)
-  if (Number.isFinite(Number(snap.remaining_percentage))) {
-    parts.push(`${Math.round(Number(snap.remaining_percentage))}% remaining`)
+  const sess = c?.session
+  if (sess && Number.isFinite(Number(sess.aiu))) {
+    parts.push(`${Number(sess.aiu).toLocaleString()} AI Units consumed this session`)
+    if (sess.requests) parts.push(`${sess.requests} requests`)
+  }
+  const snap = pickCreditsSnapshot(c?.snapshots)
+  if (snap) {
+    if (snap.is_unlimited) parts.push('Entitlement: Unlimited')
+    if (snap.reset_date) parts.push(`Resets: ${new Date(snap.reset_date).toLocaleString()}`)
   }
   if (c?.model) parts.push(`Last model: ${c.model}`)
   if (c?.ts) parts.push(`Updated: ${new Date(c.ts).toLocaleString()}`)
@@ -562,9 +576,12 @@ const creditsTitle = computed(() => {
 })
 
 async function loadCredits() {
+  if (!selectedSession.value) return
   try {
-    const data = await api.getCredits()
-    if (data && data.snapshots && Object.keys(data.snapshots).length) {
+    const data = await api.getCredits(selectedSession.value)
+    const hasSnapshots = data && data.snapshots && Object.keys(data.snapshots).length
+    const hasSession = data && data.session && Object.keys(data.session).length
+    if (hasSnapshots || hasSession) {
       aiCredits.value = data
     }
   } catch (e) {
@@ -619,10 +636,13 @@ function handleStreamEvent(msg) {
   const type = msg.type
 
   if (type === 'credits') {
-    // Live account "AI Credits" update from the orchestrator.
-    if (msg.snapshots && Object.keys(msg.snapshots).length) {
+    // Live "AI Credits" update from the orchestrator: account entitlement
+    // snapshot + per-session consumed AI Units.
+    if ((msg.snapshots && Object.keys(msg.snapshots).length) ||
+        (msg.session && Object.keys(msg.session).length)) {
       aiCredits.value = {
-        snapshots: msg.snapshots,
+        snapshots: msg.snapshots || aiCredits.value?.snapshots || {},
+        session: msg.session || aiCredits.value?.session || {},
         ts: msg.ts || new Date().toISOString(),
         last_cost: msg.last_cost || 0,
         model: msg.model || '',

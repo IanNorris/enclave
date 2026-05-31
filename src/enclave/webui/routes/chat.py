@@ -317,21 +317,25 @@ class SendMessage(BaseModel):
 
 
 @router.get("/credits")
-async def get_credits(request: Request):
-    """Return the latest account-level "AI Credits" (premium request quota).
+async def get_credits(request: Request, session: str = ""):
+    """Return AI Credits: account entitlement snapshot + per-session usage.
 
-    Account-global, not per-session: the Copilot SDK reports the same quota on
-    every session. Served from the orchestrator's control socket, which reads
-    the cost tracker's most recent persisted snapshot.
+    The account entitlement snapshot (often "Unlimited") is global. The consumed
+    AI Units ("AI Credits") figure is per session — pass ``session`` to include
+    the running total. Served from the orchestrator's control socket, which reads
+    the persisted cost tracker data.
     """
     data_dir = Path(request.app.state.config.data_dir)
     sock_path = data_dir / "control.sock"
-    empty = {"snapshots": {}, "ts": None, "last_cost": 0, "model": ""}
+    empty = {"snapshots": {}, "ts": None, "last_cost": 0, "model": "", "session": {}}
     if not sock_path.exists():
         return empty
     try:
         reader, writer = await asyncio.open_unix_connection(str(sock_path))
-        writer.write(json.dumps({"action": "credits"}).encode() + b"\n")
+        req = {"action": "credits"}
+        if session:
+            req["session"] = session
+        writer.write(json.dumps(req).encode() + b"\n")
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout=5.0)
         writer.close()
@@ -344,6 +348,7 @@ async def get_credits(request: Request):
                     "ts": resp.get("ts"),
                     "last_cost": resp.get("last_cost", 0),
                     "model": resp.get("model", ""),
+                    "session": resp.get("session", {}),
                 }
     except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as e:
         import logging
