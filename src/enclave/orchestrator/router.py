@@ -968,6 +968,19 @@ class MessageRouter:
                 total_tokens=msg.payload.get("total_tokens", 0),
                 model=msg.payload.get("model", ""),
             )
+            # Account-level "AI Credits" (premium request quota). The SDK reports
+            # the same account quota on every session, so persist the latest
+            # snapshot and push it live to any subscribed web UI.
+            quota = msg.payload.get("quota_snapshots") or {}
+            if quota:
+                cost = msg.payload.get("cost", 0.0)
+                model = msg.payload.get("model", "")
+                self._cost.record_credits(quota, cost, model)
+                if self._control:
+                    self._control.notify_credits(
+                        session.id,
+                        {"snapshots": quota, "last_cost": cost, "model": model},
+                    )
         elif msg.type == MessageType.NIX_SHELL_REQUEST:
             await self._handle_nix_shell_request(session, msg)
         elif msg.type == MessageType.PORT_REQUEST:

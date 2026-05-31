@@ -91,6 +91,7 @@ export const api = {
     body: JSON.stringify({ content }),
   }),
   getModels: (session, refresh = false) => request(`/chat/${session}/models${refresh ? '?refresh=true' : ''}`),
+  getCredits: () => request(`/chat/credits`),
   setModel: (session, model) => request(`/chat/${session}/model`, {
     method: 'POST',
     body: JSON.stringify({ content: model }),

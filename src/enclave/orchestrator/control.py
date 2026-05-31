@@ -147,6 +147,15 @@ class ControlServer:
         """Called by the router when an agent turn begins."""
         self._emit(session_id, {"ok": True, "type": "turn_start"})
 
+    def notify_credits(self, session_id: str, payload: dict) -> None:
+        """Called by the router with the latest account "AI Credits" snapshot.
+
+        Live-only (not in PERSIST_TYPES): the durable copy lives in the cost
+        tracker DB; this just pushes an update to any subscribed web UI so the
+        header refreshes without a reload.
+        """
+        self._emit(session_id, {"ok": True, "type": "credits", **payload})
+
     def _workspace_base_for(self, session_id: str) -> Path | None:
         """Resolve the workspace_base for a session's event store, or None.
 
@@ -234,6 +243,8 @@ class ControlServer:
                 await self._handle_delete(req, writer)
             elif action == "models":
                 await self._handle_models(req, writer)
+            elif action == "credits":
+                await self._handle_credits(req, writer)
             else:
                 await self._write(writer, {"ok": False, "error": f"Unknown action: {action}"})
         except asyncio.TimeoutError:
@@ -406,6 +417,23 @@ class ControlServer:
         except Exception as e:
             log.warning("Models query error for %s: %s", session_id, e)
             await self._write(writer, {"ok": False, "error": str(e)})
+
+    async def _handle_credits(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Return the latest account-level "AI Credits" snapshot.
+
+        Account-global (not per-session); served from the cost tracker's most
+        recent persisted snapshot so it survives orchestrator restarts and is
+        available on the web UI's initial load.
+        """
+        try:
+            credits = self._router._cost.get_credits()
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        if not credits:
+            await self._write(writer, {"ok": True, "type": "credits", "snapshots": {}})
+            return
+        await self._write(writer, {"ok": True, "type": "credits", **credits})
 
     async def _handle_subscribe(
         self,

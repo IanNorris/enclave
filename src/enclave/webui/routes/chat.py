@@ -316,6 +316,41 @@ class SendMessage(BaseModel):
 # ─── Endpoints ──────────────────────────────────────────────────────────────
 
 
+@router.get("/credits")
+async def get_credits(request: Request):
+    """Return the latest account-level "AI Credits" (premium request quota).
+
+    Account-global, not per-session: the Copilot SDK reports the same quota on
+    every session. Served from the orchestrator's control socket, which reads
+    the cost tracker's most recent persisted snapshot.
+    """
+    data_dir = Path(request.app.state.config.data_dir)
+    sock_path = data_dir / "control.sock"
+    empty = {"snapshots": {}, "ts": None, "last_cost": 0, "model": ""}
+    if not sock_path.exists():
+        return empty
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        writer.write(json.dumps({"action": "credits"}).encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        writer.close()
+        await writer.wait_closed()
+        if line:
+            resp = json.loads(line.decode())
+            if resp.get("ok"):
+                return {
+                    "snapshots": resp.get("snapshots", {}),
+                    "ts": resp.get("ts"),
+                    "last_cost": resp.get("last_cost", 0),
+                    "model": resp.get("model", ""),
+                }
+    except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        import logging
+        logging.getLogger("enclave.webui").warning("Credits query failed: %s", e)
+    return empty
+
+
 @router.get("/{session_id}/history")
 async def get_history(request: Request, session_id: str, limit: int = 100, offset: int = 0):
     """Get conversation history for a session.

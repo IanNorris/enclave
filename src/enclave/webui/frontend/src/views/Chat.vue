@@ -7,6 +7,7 @@
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
       <div class="model-picker" v-if="selectedSession">
+        <span v-if="creditsLabel" class="ai-credits" :title="creditsTitle">{{ creditsLabel }}</span>
         <select v-if="models.available.length" v-model="currentModel" @change="changeModel" class="model-select">
           <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
         </select>
@@ -337,6 +338,7 @@ const dragging = ref(false)
 const models = ref({ current: null, available: [], preferences: [] })
 const currentModel = ref('')
 const modelsRefreshing = ref(false)
+const aiCredits = ref(null)
 
 // Live streaming state
 const liveEvents = ref([])
@@ -438,6 +440,7 @@ async function loadHistory() {
     scrollToBottom(true)
     connectWebSocket()
     loadModels()
+    loadCredits()
   } catch (e) {
     console.error('Failed to load history:', e)
   }
@@ -514,6 +517,61 @@ async function loadModels() {
   }
 }
 
+// Pick the account "AI Credits" snapshot (premium request quota) from the
+// SDK's quota snapshots, tolerating naming differences across SDK versions.
+function pickCreditsSnapshot(snapshots) {
+  if (!snapshots) return null
+  const keys = Object.keys(snapshots)
+  if (!keys.length) return null
+  const preferred = keys.find(k => /premium/i.test(k))
+    || keys.find(k => /credit/i.test(k))
+    || keys.find(k => /interaction/i.test(k))
+    || keys[0]
+  return { key: preferred, ...snapshots[preferred] }
+}
+
+const creditsLabel = computed(() => {
+  const snap = pickCreditsSnapshot(aiCredits.value?.snapshots)
+  if (!snap) return ''
+  if (snap.is_unlimited) return 'AI Credits: Unlimited'
+  const ent = Number(snap.entitlement)
+  const used = Number(snap.used)
+  if (Number.isFinite(ent) && Number.isFinite(used)) {
+    const remaining = Math.max(ent - used, 0)
+    const rounded = Math.round(remaining * 10) / 10
+    return `AI Credits: ${rounded}/${ent}`
+  }
+  if (Number.isFinite(Number(snap.remaining_percentage))) {
+    return `AI Credits: ${Math.round(Number(snap.remaining_percentage))}%`
+  }
+  return ''
+})
+
+const creditsTitle = computed(() => {
+  const c = aiCredits.value
+  const snap = pickCreditsSnapshot(c?.snapshots)
+  if (!snap) return ''
+  const parts = []
+  if (snap.reset_date) parts.push(`Resets: ${new Date(snap.reset_date).toLocaleString()}`)
+  if (Number.isFinite(Number(snap.remaining_percentage))) {
+    parts.push(`${Math.round(Number(snap.remaining_percentage))}% remaining`)
+  }
+  if (c?.model) parts.push(`Last model: ${c.model}`)
+  if (c?.ts) parts.push(`Updated: ${new Date(c.ts).toLocaleString()}`)
+  return parts.join(' · ')
+})
+
+async function loadCredits() {
+  try {
+    const data = await api.getCredits()
+    if (data && data.snapshots && Object.keys(data.snapshots).length) {
+      aiCredits.value = data
+    }
+  } catch (e) {
+    console.error('Failed to load AI credits:', e)
+  }
+}
+
 async function refreshModels() {
   if (!selectedSession.value) return
   modelsRefreshing.value = true
@@ -559,6 +617,19 @@ function connectWebSocket() {
 
 function handleStreamEvent(msg) {
   const type = msg.type
+
+  if (type === 'credits') {
+    // Live account "AI Credits" update from the orchestrator.
+    if (msg.snapshots && Object.keys(msg.snapshots).length) {
+      aiCredits.value = {
+        snapshots: msg.snapshots,
+        ts: msg.ts || new Date().toISOString(),
+        last_cost: msg.last_cost || 0,
+        model: msg.model || '',
+      }
+    }
+    return
+  }
 
   if (type === 'turn') {
     // Completed turn from SQLite — merge into turns list
@@ -1174,6 +1245,17 @@ function formatTime(ts) {
   align-items: center;
   gap: 0.35rem;
   margin-left: auto;
+}
+
+.ai-credits {
+  font-size: 0.78rem;
+  padding: 0.3rem 0.55rem;
+  background: var(--bg-main);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  white-space: nowrap;
+  cursor: default;
 }
 
 .model-select {

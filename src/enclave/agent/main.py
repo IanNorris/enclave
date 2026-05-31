@@ -204,6 +204,37 @@ async def _mimir_compaction_submit(
         print(f"[agent] Mimir compaction submit error: {e}", file=sys.stderr)
 
 
+def _serialize_quota_snapshots(raw: object) -> dict:
+    """Normalise SDK ``assistant.usage`` quota snapshots to plain JSON dicts.
+
+    The Copilot SDK exposes account "AI Credits" as ``quota_snapshots`` — a dict
+    keyed by quota type (e.g. ``premium_interactions``), each value an
+    ``AssistantUsageQuotaSnapshot``. We flatten each to a small snake_case dict
+    so it can travel over IPC and render in the web UI.
+    """
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, snap in raw.items():
+        if snap is None:
+            continue
+        reset = getattr(snap, "reset_date", None)
+        if hasattr(reset, "isoformat"):
+            try:
+                reset = reset.isoformat()
+            except Exception:
+                reset = None
+        out[str(key)] = {
+            "entitlement": getattr(snap, "entitlement_requests", None),
+            "used": getattr(snap, "used_requests", None),
+            "remaining_percentage": getattr(snap, "remaining_percentage", None),
+            "is_unlimited": getattr(snap, "is_unlimited_entitlement", None),
+            "overage": getattr(snap, "overage", None),
+            "reset_date": reset,
+        }
+    return out
+
+
 def setup_session_listener(
     ipc: IPCClient,
     sdk_session: _CopilotSession,
@@ -678,7 +709,11 @@ def setup_session_listener(
                 output_tokens = getattr(data, "output_tokens", 0) or getattr(data, "completion_tokens", 0)
                 total_tokens = getattr(data, "total_tokens", 0)
                 model = getattr(data, "model", "")
-                if input_tokens or output_tokens or total_tokens:
+                cost = getattr(data, "cost", 0.0) or 0.0
+                quota_snapshots = _serialize_quota_snapshots(
+                    getattr(data, "quota_snapshots", None)
+                )
+                if input_tokens or output_tokens or total_tokens or quota_snapshots:
                     _fire_and_forget(ipc.send(Message(
                         type=MessageType.USAGE_REPORT,
                         payload={
@@ -686,6 +721,8 @@ def setup_session_listener(
                             "output_tokens": output_tokens,
                             "total_tokens": total_tokens,
                             "model": model or "",
+                            "cost": cost,
+                            "quota_snapshots": quota_snapshots,
                         },
                     )))
             elif etype_str == "session.idle":

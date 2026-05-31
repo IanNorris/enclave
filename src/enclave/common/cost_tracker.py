@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,14 @@ class CostTracker:
                 session_id TEXT PRIMARY KEY,
                 max_tokens INTEGER DEFAULT 0,
                 alert_threshold REAL DEFAULT 0.8
+            );
+
+            CREATE TABLE IF NOT EXISTS credits_snapshot (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                ts TEXT NOT NULL,
+                snapshots TEXT NOT NULL,
+                last_cost REAL DEFAULT 0,
+                model TEXT DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS idx_usage_session
@@ -222,6 +231,48 @@ class CostTracker:
             (session_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def record_credits(
+        self, snapshots: dict[str, Any], last_cost: float = 0.0, model: str = ""
+    ) -> None:
+        """Persist the latest account-wide premium-quota ("AI Credits") snapshot.
+
+        The Copilot SDK reports the same account-level quota on every session's
+        ``assistant.usage`` event, so we keep a single most-recent snapshot
+        (id=1) rather than one per session. ``snapshots`` is the quota dict keyed
+        by type (e.g. ``premium_interactions``), each value a dict with
+        entitlement/used/remaining_percentage/reset_date fields.
+        """
+        if not snapshots:
+            return
+        ts = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            """INSERT INTO credits_snapshot (id, ts, snapshots, last_cost, model)
+               VALUES (1, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 ts=excluded.ts, snapshots=excluded.snapshots,
+                 last_cost=excluded.last_cost, model=excluded.model""",
+            (ts, json.dumps(snapshots), float(last_cost or 0.0), model or ""),
+        )
+        self._conn.commit()
+
+    def get_credits(self) -> dict[str, Any] | None:
+        """Return the latest persisted AI Credits snapshot, or None if unset."""
+        row = self._conn.execute(
+            "SELECT ts, snapshots, last_cost, model FROM credits_snapshot WHERE id = 1",
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            snapshots = json.loads(row["snapshots"])
+        except (json.JSONDecodeError, TypeError):
+            snapshots = {}
+        return {
+            "ts": row["ts"],
+            "snapshots": snapshots,
+            "last_cost": row["last_cost"],
+            "model": row["model"],
+        }
 
     def close(self) -> None:
         """Close the database connection."""
