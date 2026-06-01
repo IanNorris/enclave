@@ -25,6 +25,35 @@
             {{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
           </option>
         </select>
+        <button class="new-session-btn" title="New session" @click="openNewSession">＋</button>
+      </div>
+
+      <!-- New session modal -->
+      <div v-if="showNewSession" class="modal-overlay" @click.self="closeNewSession">
+        <div class="modal">
+          <h3>New Session</h3>
+          <label class="modal-label">Name</label>
+          <input
+            v-model="newName"
+            class="modal-input"
+            placeholder="my-project"
+            :disabled="creating"
+            @keydown.enter.prevent="submitNewSession"
+          />
+          <label class="modal-label">Profile</label>
+          <select v-model="newProfile" class="modal-input" :disabled="creating || !profiles.length">
+            <option v-for="p in profiles" :key="p.name" :value="p.name">
+              {{ p.name }}{{ p.description ? ` — ${p.description}` : '' }}{{ p.default ? ' (default)' : '' }}
+            </option>
+          </select>
+          <p v-if="createError" class="modal-error">{{ createError }}</p>
+          <div class="modal-actions">
+            <button class="secondary" :disabled="creating" @click="closeNewSession">Cancel</button>
+            <button class="primary" :disabled="creating || !newName.trim()" @click="submitNewSession">
+              {{ creating ? 'Creating…' : 'Create' }}
+            </button>
+          </div>
+        </div>
       </div>
 
       <ul class="nav-links">
@@ -74,17 +103,65 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from './stores/session.js'
 import { api } from './api.js'
 
 const route = useRoute()
+const router = useRouter()
 const sidebarOpen = ref(false)
 const { sessions, selectedSessionId, loadSessions } = useSessionStore()
 const activeSessions = computed(() => sessions.value.filter(s => !s.archived))
 const isLoginPage = computed(() => route.name === 'login')
 const hasToken = ref(!!localStorage.getItem('enclave_token'))
 const pendingAsks = ref(0)
+
+// ─── New session ───
+const showNewSession = ref(false)
+const newName = ref('')
+const newProfile = ref('')
+const profiles = ref([])
+const creating = ref(false)
+const createError = ref('')
+
+async function openNewSession() {
+  showNewSession.value = true
+  newName.value = ''
+  createError.value = ''
+  if (!profiles.value.length) {
+    try {
+      const data = await api.getProfiles()
+      profiles.value = data.profiles || []
+    } catch (e) {
+      createError.value = `Failed to load profiles: ${e.message}`
+    }
+  }
+  const def = profiles.value.find(p => p.default) || profiles.value[0]
+  newProfile.value = def ? def.name : ''
+}
+
+function closeNewSession() {
+  if (creating.value) return
+  showNewSession.value = false
+}
+
+async function submitNewSession() {
+  const name = newName.value.trim()
+  if (!name || creating.value) return
+  creating.value = true
+  createError.value = ''
+  try {
+    const data = await api.createSession(name, newProfile.value)
+    await loadSessions()
+    if (data.session) selectedSessionId.value = data.session
+    showNewSession.value = false
+    router.push('/chat')
+  } catch (e) {
+    createError.value = e.message || 'Failed to create session'
+  } finally {
+    creating.value = false
+  }
+}
 
 async function pollAskCount() {
   if (!hasToken.value) return
@@ -155,6 +232,9 @@ watch(isLoginPage, (isLogin) => {
 .session-selector {
   padding: 0.5rem 1rem;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
 }
 
 .session-select {
@@ -165,6 +245,105 @@ watch(isLoginPage, (isLogin) => {
   color: var(--text-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm, 4px);
+}
+
+.new-session-btn {
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  font-size: 1.1rem;
+  line-height: 1;
+  background: var(--bg-main);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.new-session-btn:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem;
+  width: 320px;
+  max-width: 90vw;
+}
+
+.modal h3 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+  color: var(--text-primary);
+}
+
+.modal-label {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin: 0.6rem 0 0.25rem;
+}
+
+.modal-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.5rem;
+  background: var(--bg-main);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+}
+
+.modal-error {
+  color: #ef4444;
+  font-size: 0.8rem;
+  margin: 0.6rem 0 0;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.modal-actions button {
+  padding: 0.4rem 0.9rem;
+  font-size: 0.85rem;
+  border-radius: var(--radius-sm, 4px);
+  cursor: pointer;
+  border: 1px solid var(--border);
+}
+
+.modal-actions .primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.modal-actions .primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.modal-actions .secondary {
+  background: var(--bg-main);
+  color: var(--text-primary);
 }
 
 .nav-links {

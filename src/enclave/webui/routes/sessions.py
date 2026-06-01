@@ -53,6 +53,39 @@ def _snapshots_dir() -> Path:
     return d
 
 
+def _control_socket(request: Request) -> Path:
+    return Path(_get_config(request).data_dir) / "control.sock"
+
+
+async def _control_request(
+    request: Request, payload: dict[str, Any], timeout: float = 10.0
+) -> dict[str, Any]:
+    """Send a one-shot request to the orchestrator control socket."""
+    sock_path = _control_socket(request)
+    if not sock_path.exists():
+        raise HTTPException(status_code=503, detail="Orchestrator not running")
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        writer.write(json.dumps(payload).encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, asyncio.TimeoutError) as e:
+        raise HTTPException(status_code=504, detail=f"Control socket error: {e}")
+    if not line:
+        raise HTTPException(status_code=502, detail="Empty response from orchestrator")
+    try:
+        return json.loads(line.decode())
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid response: {e}")
+
+
+class CreateSession(BaseModel):
+    name: str
+    profile: str = ""
+
+
 def _discover_sessions(request: Request) -> list[dict[str, Any]]:
     """Discover sessions from workspace directories."""
     ws_base = _workspace_base(request)
@@ -142,6 +175,33 @@ class SnapshotCreate(BaseModel):
 async def list_sessions(request: Request):
     """List all known sessions with their status."""
     return _discover_sessions(request)
+
+
+@router.get("/profiles")
+async def list_profiles(request: Request):
+    """List the configured container profiles available for new sessions."""
+    resp = await _control_request(request, {"action": "profiles"})
+    if not resp.get("ok"):
+        raise HTTPException(status_code=502, detail=resp.get("error", "Failed to list profiles"))
+    return {"profiles": resp.get("profiles", [])}
+
+
+@router.post("")
+async def create_session(request: Request, body: CreateSession):
+    """Create a new project session via the orchestrator control socket."""
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Project name is required")
+    # Project setup creates a room and starts a container, which can take a
+    # while — allow a generous timeout.
+    resp = await _control_request(
+        request,
+        {"action": "create", "name": name, "profile": body.profile},
+        timeout=120.0,
+    )
+    if not resp.get("ok"):
+        raise HTTPException(status_code=502, detail=resp.get("error", "Failed to create session"))
+    return {"session": resp.get("session", ""), "name": name}
 
 
 @router.get("/{session_id}")

@@ -245,6 +245,10 @@ class ControlServer:
                 await self._handle_models(req, writer)
             elif action == "credits":
                 await self._handle_credits(req, writer)
+            elif action == "profiles":
+                await self._handle_profiles(writer)
+            elif action == "create":
+                await self._handle_create(req, writer)
             else:
                 await self._write(writer, {"ok": False, "error": f"Unknown action: {action}"})
         except asyncio.TimeoutError:
@@ -441,6 +445,44 @@ class ControlServer:
         payload.update(credits)
         payload["session"] = session_credits or {}
         await self._write(writer, payload)
+
+    async def _handle_profiles(self, writer: asyncio.StreamWriter) -> None:
+        """Return the configured container profiles for project creation."""
+        try:
+            cfg = self._router.containers.config
+            profiles = []
+            for name, prof in cfg.profiles.items():
+                profiles.append({
+                    "name": name,
+                    "description": getattr(prof, "description", "") or "",
+                    "default": name == cfg.default_profile,
+                })
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        await self._write(writer, {"ok": True, "type": "profiles", "profiles": profiles})
+
+    async def _handle_create(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Create a new project session (web UI "new session" button)."""
+        name = (req.get("name") or "").strip()
+        profile = (req.get("profile") or "").strip()
+        if not name:
+            await self._write(writer, {"ok": False, "error": "Missing project name"})
+            return
+
+        log.info("Create requested via control socket: name=%s profile=%s",
+                 name, profile or "<default>")
+        try:
+            session_id, error = await self._router.create_project(name, profile)
+        except Exception as e:
+            log.warning("Project creation via control socket failed: %s", e)
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+
+        if error:
+            await self._write(writer, {"ok": False, "error": error})
+            return
+        await self._write(writer, {"ok": True, "type": "created", "session": session_id})
 
     async def _handle_subscribe(
         self,

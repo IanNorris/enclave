@@ -2888,8 +2888,11 @@ class MessageRouter:
 
     async def _cmd_project_inner(
         self, sender: str, project_name: str, profile: str = ""
-    ) -> None:
-        """Inner implementation of project creation."""
+    ) -> Any:
+        """Inner implementation of project creation.
+
+        Returns the created session on success, or ``None`` on failure.
+        """
         resolved_profile = profile or self.containers.config.default_profile
         profile_obj = self.containers.config.get_profile(resolved_profile)
 
@@ -2905,7 +2908,7 @@ class MessageRouter:
             await self._reply_control(
                 f"❌ Failed to create room for **{project_name}**."
             )
-            return
+            return None
 
         log.info("[project:%s] Room created: %s", project_name, room_id)
 
@@ -2984,6 +2987,41 @@ class MessageRouter:
                 f"failed to start: {error}\n"
                 f"Session ID: `{session.id}`"
             )
+        return session
+
+    async def create_project(
+        self, name: str, profile: str = "", sender: str = ""
+    ) -> tuple[str, str]:
+        """Create a project session on behalf of the web UI.
+
+        Mirrors the Matrix ``project`` command (creates a room, container and
+        session). Returns ``(session_id, error)`` — ``error`` is empty on
+        success.
+        """
+        name = (name or "").strip()
+        if not name:
+            return "", "Project name is required"
+
+        profiles = self.containers.config.profiles
+        resolved = profile or self.containers.config.default_profile
+        if resolved not in profiles:
+            return "", f"Unknown profile: {resolved}"
+
+        if name in self._creating_projects:
+            return "", f"Already creating project '{name}'"
+
+        if not sender:
+            sender = next(iter(self._user_mappings), "")
+
+        self._creating_projects.add(name)
+        try:
+            session = await self._cmd_project_inner(sender, name, resolved)
+        finally:
+            self._creating_projects.discard(name)
+
+        if session is None:
+            return "", "Failed to create project"
+        return session.id, ""
 
     # ------------------------------------------------------------------
     # Scheduler IPC handlers

@@ -35,6 +35,11 @@ async function request(path, options = {}) {
 export const api = {
   // Sessions
   getSessions: () => request('/sessions'),
+  getProfiles: () => request('/sessions/profiles'),
+  createSession: (name, profile = '') => request('/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ name, profile }),
+  }),
   getSession: (id) => request(`/sessions/${id}`),
   stopSession: (id) => request(`/sessions/${id}/stop`, { method: 'POST' }),
   restartSession: (id) => request(`/sessions/${id}/restart`, { method: 'POST' }),
