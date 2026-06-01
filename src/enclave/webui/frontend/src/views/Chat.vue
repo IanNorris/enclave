@@ -843,7 +843,11 @@ function handleStreamEvent(msg) {
       streamingText.value = ''
     }
     activityText.value = ''
-    liveEvents.value.forEach(e => { e.collapsed = true })
+    // Flush the live tool/thinking blocks — they belong to the segment we just
+    // finalized into a turn above, and leaving them here pins them to the
+    // bottom while later segments render above (only cleared on reload before).
+    liveEvents.value = []
+    currentThinkingIdx = -1
     nextTick(() => scrollToBottom())
     return
   }
@@ -870,7 +874,8 @@ function handleStreamEvent(msg) {
       streamingText.value = ''
     }
     activityText.value = ''
-    liveEvents.value.forEach(e => { e.collapsed = true })
+    liveEvents.value = []
+    currentThinkingIdx = -1
     nextTick(() => scrollToBottom())
     return
   }
