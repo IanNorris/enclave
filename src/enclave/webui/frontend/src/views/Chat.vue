@@ -389,6 +389,13 @@ const turnEvents = ref({})
 const expandedTurns = ref({})
 const TOOL_ICONS_MAP = TOOL_ICONS
 
+// Stream events that indicate the agent has resumed work after an ask_user
+// (used to auto-dismiss a lingering question card).
+const AGENT_PROGRESS_EVENTS = new Set([
+  'turn_start', 'delta', 'thinking', 'tool_start', 'tool_complete',
+  'structured_response', 'turn', 'turn_end',
+])
+
 function countSegmentEvents(segments) {
   if (!segments) return 0
   return segments.reduce((sum, seg) => sum + seg.tools.length + (seg.response ? 1 : 0), 0)
@@ -635,6 +642,15 @@ function connectWebSocket() {
 function handleStreamEvent(msg) {
   const type = msg.type
 
+  // Any sign of the agent resuming forward progress means a pending ask_user
+  // question has been answered (via the composer, Matrix, or another client),
+  // so clear the lingering question card. ask_user blocks the turn, so these
+  // events only arrive after the answer was delivered.
+  if (askUserPrompt.value && AGENT_PROGRESS_EVENTS.has(type)) {
+    askUserPrompt.value = null
+    askUserAnswer.value = ''
+  }
+
   if (type === 'credits') {
     // Live "AI Credits" update from the orchestrator: account entitlement
     // snapshot + per-session consumed AI Units.
@@ -874,6 +890,12 @@ async function send() {
   const content = draft.value.trim()
   draft.value = ''
   sending.value = true
+
+  // Sending a message answers any pending ask_user question — dismiss its card.
+  if (askUserPrompt.value) {
+    askUserPrompt.value = null
+    askUserAnswer.value = ''
+  }
 
   // Immediately show the message as "queued"
   if (content) {
