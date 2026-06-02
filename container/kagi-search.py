@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """kagi — query the Kagi Search API for high-quality, rankable result URLs.
 
-This is a thin convenience wrapper around the Kagi Search API. Its purpose is
-*not* to answer questions, but to surface real primary-source URLs from Kagi's
-index, which you then fetch and quote verbatim. Treat the URLs as the trustworthy
-output; do not treat any summarised prose as a citation.
+This is a thin convenience wrapper around the Kagi Search API (v1). Its purpose
+is *not* to answer questions, but to surface real primary-source URLs from
+Kagi's index, which you then fetch and quote verbatim. Treat the URLs as the
+trustworthy output; do not treat any summarised prose as a citation.
 
 Usage:
     kagi <query...>
     kagi --limit 5 <query...>
-    kagi --json <query...>          # raw JSON for scripting
+    kagi --json <query...>            # raw JSON for scripting
 
 Requires the KAGI_TOKEN environment variable (injected by the orchestrator when
 a Kagi token is configured). The token is never printed.
@@ -18,11 +18,11 @@ a Kagi token is configured). The token is never printed.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 
 API_URL = "https://kagi.com/api/v1/search"
@@ -51,15 +51,46 @@ def main() -> int:
         print("error: empty query", file=sys.stderr)
         return 2
 
-    url = f"{API_URL}?{urllib.parse.urlencode({'q': query})}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bot {token}"})
+    # The v1 Search API is POST + Bearer auth with a JSON body. Pass `limit`
+    # so Kagi caps the result set server-side (valid range is 1-1024).
+    server_limit = max(1, min(1024, args.limit))
+    body = json.dumps(
+        {"query": query, "workflow": "search", "limit": server_limit}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        API_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    def _extract_errors(obj: dict) -> str | None:
+        # The Search API uses "error" (singular array) for 4xx bodies, while
+        # some responses (e.g. ip_not_allowed) use "errors" (plural). Handle both.
+        errs = obj.get("error") or obj.get("errors")
+        if not errs:
+            return None
+        if isinstance(errs, list):
+            return "; ".join(str(x.get("message") or x.get("code") or x) for x in errs)
+        return str(errs)
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:500]
-        print(f"error: Kagi API returned HTTP {e.code}: {body}", file=sys.stderr)
+        body_text = e.read().decode("utf-8", "replace")
+        msg = body_text[:500]
+        # Kagi returns structured errors; surface the message if present.
+        try:
+            parsed = _extract_errors(json.loads(body_text))
+            if parsed:
+                msg = parsed
+        except Exception:
+            pass
+        print(f"error: Kagi API returned HTTP {e.code}: {msg}", file=sys.stderr)
         return 1
     except (urllib.error.URLError, TimeoutError) as e:
         print(f"error: could not reach Kagi API: {e}", file=sys.stderr)
@@ -68,29 +99,27 @@ def main() -> int:
         print(f"error: invalid JSON from Kagi API: {e}", file=sys.stderr)
         return 1
 
-    # Surface API-level errors (Kagi returns them in an "error" list).
-    errors = payload.get("error")
-    if errors:
-        msgs = "; ".join(str(e.get("msg", e)) for e in errors) if isinstance(errors, list) else str(errors)
-        print(f"error: Kagi API error: {msgs}", file=sys.stderr)
+    # Surface API-level errors returned alongside a 200 status.
+    err_msg = _extract_errors(payload)
+    if err_msg:
+        print(f"error: Kagi API error: {err_msg}", file=sys.stderr)
         return 1
 
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
 
-    data = payload.get("data", []) or []
-    # t==0 are search results; t==1 are "related searches" — keep only results.
-    results = [d for d in data if d.get("t") == 0][: args.limit]
-    related = next((d.get("list", []) for d in data if d.get("t") == 1), [])
+    data = payload.get("data") or {}
+    results = (data.get("search") or [])[: args.limit]
+    related = [r.get("title") for r in (data.get("related_search") or []) if r.get("title")]
 
     if not results:
         print("No results.", file=sys.stderr)
     for i, r in enumerate(results, 1):
-        title = (r.get("title") or "").strip()
+        title = html.unescape((r.get("title") or "").strip())
         rurl = (r.get("url") or "").strip()
-        snippet = " ".join((r.get("snippet") or "").split())
-        published = r.get("published")
+        snippet = html.unescape(" ".join((r.get("snippet") or "").split()))
+        published = r.get("time") or r.get("published")
         print(f"{i}. {title}")
         print(f"   {rurl}")
         if published:
@@ -100,12 +129,8 @@ def main() -> int:
         print()
 
     if related:
-        print("Related searches: " + ", ".join(related[:8]), file=sys.stderr)
+        print("Related searches: " + ", ".join(html.unescape(s) for s in related[:8]), file=sys.stderr)
 
-    # Remaining API balance helps the user keep an eye on spend.
-    balance = payload.get("meta", {}).get("api_balance")
-    if balance is not None:
-        print(f"[kagi] api_balance: {balance}", file=sys.stderr)
     return 0
 
 
