@@ -1556,23 +1556,30 @@ async def try_init_copilot(
                 )
                 print(f"[agent] Loaded session prompt ({len(session_prompt_text)} chars)", file=sys.stderr)
 
-        # Advertise the Kagi search helper when a token is available, with the
-        # verification discipline that makes it useful.
+        # Advertise the Kagi search + extract helpers when a token is available,
+        # with the verification discipline that makes them useful.
         if os.environ.get("KAGI_TOKEN", "").strip():
             prompt_parts.append(
-                "# Web search: Kagi\n\n"
-                "A high-quality search tool is available via the `kagi` command "
-                "(e.g. `kagi \"<query>\"`, or `kagi --json \"<query>\"` for raw "
-                "results). It returns ranked result URLs from Kagi's index.\n\n"
-                "Use it to find **primary sources**, then open those URLs with "
-                "your fetch tool and quote them verbatim. The trustworthy output "
-                "is the list of URLs — never treat a summarised answer (from any "
+                "# Web search & extraction: Kagi\n\n"
+                "Two high-quality tools are available when reliable sources matter:\n\n"
+                "- `kagi_search \"<query>\"` — returns ranked result URLs from "
+                "Kagi's index (add `-n N` to cap results, `--json` for raw data). "
+                "Use it to find **primary sources**.\n"
+                "- `kagi_extract <url> [url...]` — fetches the readable content of "
+                "up to 10 pages as clean **markdown**. Prefer this over scraping "
+                "HTML yourself; it is far more reliable. You can also pass "
+                "`kagi_search --extract N \"<query>\"` to extract the top N results "
+                "inline in one call.\n\n"
+                "Workflow: search for primary sources, extract the actual document, "
+                "and quote it verbatim. The trustworthy output is the URLs and the "
+                "extracted page text — never treat a summarised answer (from any "
                 "tool, including LLM-based search) as a citation. A figure is only "
                 "verified once you have opened the actual primary document. Prefer "
-                "`kagi` over the built-in web search when source reliability "
-                "matters. It is pay-per-use, so search deliberately, not in loops."
+                "these tools over the built-in web search/fetch when source "
+                "reliability matters. They are pay-per-use, so work deliberately, "
+                "not in loops (and `--extract` costs extra)."
             )
-            print("[agent] Kagi search enabled", file=sys.stderr)
+            print("[agent] Kagi search/extract enabled", file=sys.stderr)
 
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)

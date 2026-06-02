@@ -33,8 +33,10 @@ RUN chmod +x /usr/local/bin/mimir-* 2>/dev/null || true
 # Fails open: if the pattern no longer matches, the agent still starts.
 COPY container/patch-copilot-cli.py /usr/local/bin/patch-copilot-cli.py
 RUN chmod +x /usr/local/bin/patch-copilot-cli.py
-COPY container/kagi-search.py /usr/local/bin/kagi
-RUN chmod +x /usr/local/bin/kagi
+COPY container/kagi.py /usr/local/bin/kagi
+RUN chmod +x /usr/local/bin/kagi && \
+    ln -sf kagi /usr/local/bin/kagi_search && \
+    ln -sf kagi /usr/local/bin/kagi_extract
 RUN printf '#!/bin/bash\n\
 export COPILOT_AUTO_UPDATE=false\n\
 /usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version >/dev/null 2>&1 || true\n\

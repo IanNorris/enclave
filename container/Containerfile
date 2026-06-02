@@ -134,10 +134,13 @@ RUN export HOME=/tmp/copilot-extract && mkdir -p "$HOME" && \
 COPY container/patch-copilot-cli.py /usr/local/bin/patch-copilot-cli.py
 RUN chmod +x /usr/local/bin/patch-copilot-cli.py
 
-# Kagi search helper — a thin wrapper over the Kagi Search API for fetching
-# high-quality primary-source URLs. Only functional when KAGI_TOKEN is set.
-COPY container/kagi-search.py /usr/local/bin/kagi
-RUN chmod +x /usr/local/bin/kagi
+# Kagi search + extract helpers — thin wrappers over the Kagi v1 Search and
+# Extract APIs (ranked primary-source URLs; page content as clean markdown).
+# Only functional when KAGI_TOKEN is set. Exposed as kagi_search/kagi_extract.
+COPY container/kagi.py /usr/local/bin/kagi
+RUN chmod +x /usr/local/bin/kagi && \
+    ln -sf kagi /usr/local/bin/kagi_search && \
+    ln -sf kagi /usr/local/bin/kagi_extract
 
 WORKDIR /workspace
 
