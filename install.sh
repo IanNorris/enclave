@@ -116,6 +116,11 @@ build_image() {
 
     $runtime build -t enclave-agent:latest -f "$SCRIPT_DIR/container/Containerfile" "$SCRIPT_DIR"
     info "Container image built: enclave-agent:latest"
+
+    # Also build the minimal "light" image used by the light profile so the
+    # two images stay in sync (kept lightweight: no nix/dev toolchain).
+    $runtime build -t enclave-light:latest -f "$SCRIPT_DIR/container/Containerfile.light" "$SCRIPT_DIR"
+    info "Container image built: enclave-light:latest"
 }
 
 # ── Main ───────────────────────────────────────────────────────
