@@ -134,6 +134,11 @@ RUN export HOME=/tmp/copilot-extract && mkdir -p "$HOME" && \
 COPY container/patch-copilot-cli.py /usr/local/bin/patch-copilot-cli.py
 RUN chmod +x /usr/local/bin/patch-copilot-cli.py
 
+# Kagi search helper — a thin wrapper over the Kagi Search API for fetching
+# high-quality primary-source URLs. Only functional when KAGI_TOKEN is set.
+COPY container/kagi-search.py /usr/local/bin/kagi
+RUN chmod +x /usr/local/bin/kagi
+
 WORKDIR /workspace
 
 # Entrypoint: install Nix on first run (if profile uses it), then start agent

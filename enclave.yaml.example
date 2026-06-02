@@ -28,6 +28,7 @@ container:
   socket_dir: "~/.local/share/enclave/sockets"
   nix_store: "~/.local/share/enclave/nix"   # Host path for /nix bind-mount
   github_token: ""                          # Copilot SDK auth (or set ENCLAVE_GITHUB_TOKEN)
+  kagi_token: ""                            # Optional: Kagi Search API token for the `kagi` helper (or set ENCLAVE_KAGI_TOKEN). Use a dedicated, scoped, capped key.
   default_profile: "dev"
 
   # Container profiles — users pick a profile when creating a session.

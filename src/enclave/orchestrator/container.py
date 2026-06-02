@@ -310,13 +310,20 @@ class ContainerManager:
         if self.config.dns and network != "none":
             cmd.extend(["--dns", self.config.dns])
 
-        # Pass GitHub token for Copilot SDK auth. Use podman's name-only `-e`
-        # form so the secret value is read from the orchestrator's environment
-        # and never appears on the podman argv / host process list (L5).
+        # Pass GitHub token for Copilot SDK auth, and the optional Kagi search
+        # token, using podman's name-only `-e` form so the secret values are
+        # read from the orchestrator's environment and never appear on the
+        # podman argv / host process list (L5).
         run_env: dict | None = None
+        secrets: dict[str, str] = {}
         if self.config.github_token:
-            cmd.extend(["-e", "GITHUB_TOKEN"])
-            run_env = {**os.environ, "GITHUB_TOKEN": self.config.github_token}
+            secrets["GITHUB_TOKEN"] = self.config.github_token
+        if self.config.kagi_token:
+            secrets["KAGI_TOKEN"] = self.config.kagi_token
+        if secrets:
+            for name in secrets:
+                cmd.extend(["-e", name])
+            run_env = {**os.environ, **secrets}
 
         # Pass profile info so the agent can adapt its behaviour
         cmd.extend([

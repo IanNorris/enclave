@@ -1556,6 +1556,24 @@ async def try_init_copilot(
                 )
                 print(f"[agent] Loaded session prompt ({len(session_prompt_text)} chars)", file=sys.stderr)
 
+        # Advertise the Kagi search helper when a token is available, with the
+        # verification discipline that makes it useful.
+        if os.environ.get("KAGI_TOKEN", "").strip():
+            prompt_parts.append(
+                "# Web search: Kagi\n\n"
+                "A high-quality search tool is available via the `kagi` command "
+                "(e.g. `kagi \"<query>\"`, or `kagi --json \"<query>\"` for raw "
+                "results). It returns ranked result URLs from Kagi's index.\n\n"
+                "Use it to find **primary sources**, then open those URLs with "
+                "your fetch tool and quote them verbatim. The trustworthy output "
+                "is the list of URLs — never treat a summarised answer (from any "
+                "tool, including LLM-based search) as a citation. A figure is only "
+                "verified once you have opened the actual primary document. Prefer "
+                "`kagi` over the built-in web search when source reliability "
+                "matters. It is pay-per-use, so search deliberately, not in loops."
+            )
+            print("[agent] Kagi search enabled", file=sys.stderr)
+
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)
         )

@@ -63,6 +63,7 @@ class ContainerConfig:
     socket_dir: str = str(Path.home() / ".local" / "share" / "enclave" / "sockets")
     nix_store: str = str(Path.home() / ".local" / "share" / "enclave" / "nix")
     github_token: str = ""
+    kagi_token: str = ""
     # Port mapping settings
     public_hostname: str = ""  # hostname reported to users (e.g. "dev.local"); auto-detected if empty
     port_range_start: int = 9000
@@ -217,6 +218,7 @@ def _apply_env_overrides(config: EnclaveConfig) -> None:
         "ENCLAVE_CONTAINER_IMAGE": ("container", "image"),
         "ENCLAVE_CONTAINER_SOCKET_DIR": ("container", "socket_dir"),
         "ENCLAVE_GITHUB_TOKEN": ("container", "github_token"),
+        "ENCLAVE_KAGI_TOKEN": ("container", "kagi_token"),
         "ENCLAVE_LOG_LEVEL": ("log_level",),
         "ENCLAVE_DATA_DIR": ("data_dir",),
         "ENCLAVE_MIMIR_WORKSPACE_ROOT": ("mimir", "workspace_root"),
@@ -320,6 +322,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 socket_dir=c.get("socket_dir", config.container.socket_dir),
                 nix_store=c.get("nix_store", config.container.nix_store),
                 github_token=c.get("github_token", ""),
+                kagi_token=c.get("kagi_token", ""),
                 default_profile=c.get("default_profile", config.container.default_profile),
                 public_hostname=c.get("public_hostname", config.container.public_hostname),
                 port_range_start=c.get("port_range_start", config.container.port_range_start),
