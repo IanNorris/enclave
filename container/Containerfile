@@ -142,6 +142,12 @@ RUN chmod +x /usr/local/bin/kagi && \
     ln -sf kagi /usr/local/bin/kagi_search && \
     ln -sf kagi /usr/local/bin/kagi_extract
 
+# markitdown — Microsoft's local document -> Markdown converter. Lets agents read
+# binary documents they cannot ingest natively (PDF / Word / PowerPoint / Excel /
+# images / HTML / CSV / JSON / XML / EPub / ZIP). Complements kagi_extract, which
+# handles remote web pages; markitdown handles local files. Exposed as `markitdown`.
+RUN pip install --no-cache-dir 'markitdown[pdf,docx,pptx,xlsx,xls]'
+
 WORKDIR /workspace
 
 # Entrypoint: install Nix on first run (if profile uses it), then start agent

@@ -37,6 +37,10 @@ COPY container/kagi.py /usr/local/bin/kagi
 RUN chmod +x /usr/local/bin/kagi && \
     ln -sf kagi /usr/local/bin/kagi_search && \
     ln -sf kagi /usr/local/bin/kagi_extract
+
+# markitdown — local document -> Markdown converter (see Containerfile for rationale).
+RUN pip install --no-cache-dir 'markitdown[pdf,docx,pptx,xlsx,xls]'
+
 RUN printf '#!/bin/bash\n\
 export COPILOT_AUTO_UPDATE=false\n\
 /usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version >/dev/null 2>&1 || true\n\

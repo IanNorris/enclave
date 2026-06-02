@@ -1581,6 +1581,20 @@ async def try_init_copilot(
             )
             print("[agent] Kagi search/extract enabled", file=sys.stderr)
 
+        # Advertise markitdown for reading local binary documents the agent
+        # cannot ingest natively. Available unconditionally (no token needed).
+        prompt_parts.append(
+            "# Reading local documents: markitdown\n\n"
+            "`markitdown <file>` converts a local document to clean **markdown** "
+            "and prints it to stdout (use `-o out.md` to write a file). It handles "
+            "formats you cannot read directly — PDF, Word (.docx), PowerPoint "
+            "(.pptx), Excel (.xlsx/.xls), images, HTML, CSV, JSON, XML, EPub and "
+            "ZIP archives. When you need the text of a binary file on disk, run it "
+            "through markitdown instead of trying to read the raw bytes. This "
+            "complements `kagi_extract` (remote web pages): markitdown for local "
+            "files, kagi_extract for URLs."
+        )
+
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)
         )
