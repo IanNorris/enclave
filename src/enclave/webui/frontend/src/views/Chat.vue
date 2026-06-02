@@ -316,6 +316,36 @@ import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
 
+// Render ```mermaid fenced code blocks as diagram containers; everything else
+// falls through to the default fenced-code renderer. The raw source is HTML
+// escaped so textContent recovers it for mermaid to parse.
+const defaultFence = md.renderer.rules.fence?.bind(md.renderer.rules) ||
+  ((tokens, idx, opts, env, self) => self.renderToken(tokens, idx, opts))
+md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+  const info = (tokens[idx].info || '').trim().toLowerCase()
+  if (info === 'mermaid') {
+    return `<div class="mermaid">${md.utils.escapeHtml(tokens[idx].content)}</div>`
+  }
+  return defaultFence(tokens, idx, options, env, self)
+}
+
+// Lazily load mermaid only when a diagram is actually present (it is a large
+// dependency, so keep it out of the initial bundle).
+let _mermaidPromise = null
+function ensureMermaid() {
+  if (!_mermaidPromise) {
+    _mermaidPromise = import('mermaid').then(({ default: mermaid }) => {
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: 'dark',
+        securityLevel: 'strict',
+      })
+      return mermaid
+    })
+  }
+  return _mermaidPromise
+}
+
 const TOOL_ICONS = {
   bash: '🖥️', read_bash: '📖', write_bash: '⌨️', stop_bash: '⏹️',
   view: '📄', edit: '✏️', create: '📝', grep: '🔍', glob: '📁',
@@ -333,6 +363,26 @@ const draft = ref('')
 const sending = ref(false)
 const messagesEl = ref(null)
 const inputEl = ref(null)
+
+// ─── Mermaid diagram rendering ───
+let _mermaidObserver = null
+let _mermaidTimer = null
+async function processMermaid() {
+  const root = messagesEl.value
+  if (!root) return
+  const nodes = root.querySelectorAll('div.mermaid:not([data-processed])')
+  if (!nodes.length) return
+  try {
+    const mermaid = await ensureMermaid()
+    await mermaid.run({ nodes: Array.from(nodes), suppressErrors: true })
+  } catch { /* incomplete/invalid diagram — ignore */ }
+}
+function scheduleMermaid() {
+  if (_mermaidTimer) clearTimeout(_mermaidTimer)
+  // Debounce so streaming deltas don't trigger renders on every frame.
+  _mermaidTimer = setTimeout(processMermaid, 300)
+}
+
 const pendingFiles = ref([])
 const dragging = ref(false)
 const models = ref({ current: null, available: [], preferences: [] })
@@ -411,8 +461,22 @@ onMounted(async () => {
   window.addEventListener('keydown', onLightboxKey)
 })
 
+// Attach a MutationObserver to the messages container so mermaid diagrams are
+// rendered whenever new content is injected via v-html (history, live stream,
+// structured responses). Re-attaches if the container is recreated.
+watch(messagesEl, (el) => {
+  if (_mermaidObserver) { _mermaidObserver.disconnect(); _mermaidObserver = null }
+  if (el) {
+    _mermaidObserver = new MutationObserver(scheduleMermaid)
+    _mermaidObserver.observe(el, { childList: true, subtree: true })
+    scheduleMermaid()
+  }
+})
+
 onUnmounted(() => {
   if (ws) ws.close()
+  if (_mermaidObserver) { _mermaidObserver.disconnect(); _mermaidObserver = null }
+  if (_mermaidTimer) clearTimeout(_mermaidTimer)
   pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
   window.removeEventListener('keydown', onLightboxKey)
 })
@@ -1542,6 +1606,29 @@ function formatTime(ts) {
   font-size: 0.85em;
 }
 .message-body :deep(a) { color: var(--accent); }
+
+/* Mermaid diagrams */
+.message-body :deep(.mermaid) {
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  margin: 0 0 0.5rem;
+  overflow-x: auto;
+  text-align: center;
+  line-height: normal;
+}
+.message-body :deep(.mermaid svg) {
+  max-width: 100%;
+  height: auto;
+}
+.message-body :deep(.mermaid:not([data-processed])) {
+  white-space: pre;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  text-align: left;
+  color: var(--text-secondary);
+}
 
 .typing-indicator {
   animation: blink 1.2s infinite;

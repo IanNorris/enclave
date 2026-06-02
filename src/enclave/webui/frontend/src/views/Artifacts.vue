@@ -65,7 +65,7 @@
 
         <!-- Normal content view -->
         <template v-else>
-          <div v-if="selectedArtifact.filename.endsWith('.md')" class="artifact-rendered" v-html="renderMarkdown(artifactContent)"></div>
+          <div v-if="selectedArtifact.filename.endsWith('.md')" ref="renderedEl" class="artifact-rendered" v-html="renderMarkdown(artifactContent)"></div>
           <pre v-else>{{ artifactContent }}</pre>
         </template>
       </div>
@@ -79,12 +79,46 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { useSessionStore } from '../stores/session.js'
 import { api } from '../api.js'
 import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt({ html: true, linkify: true, breaks: true })
+
+// Render ```mermaid blocks as diagram containers (see Chat.vue for rationale).
+const defaultFence = md.renderer.rules.fence?.bind(md.renderer.rules) ||
+  ((tokens, idx, opts, env, self) => self.renderToken(tokens, idx, opts))
+md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+  const info = (tokens[idx].info || '').trim().toLowerCase()
+  if (info === 'mermaid') {
+    return `<div class="mermaid">${md.utils.escapeHtml(tokens[idx].content)}</div>`
+  }
+  return defaultFence(tokens, idx, options, env, self)
+}
+
+let _mermaidPromise = null
+function ensureMermaid() {
+  if (!_mermaidPromise) {
+    _mermaidPromise = import('mermaid').then(({ default: mermaid }) => {
+      mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' })
+      return mermaid
+    })
+  }
+  return _mermaidPromise
+}
+async function processMermaid() {
+  const root = renderedEl.value
+  if (!root) return
+  const nodes = root.querySelectorAll('div.mermaid:not([data-processed])')
+  if (!nodes.length) return
+  try {
+    const mermaid = await ensureMermaid()
+    await mermaid.run({ nodes: Array.from(nodes), suppressErrors: true })
+  } catch { /* ignore */ }
+}
+
+const renderedEl = ref(null)
 const { selectedSessionId } = useSessionStore()
 const selectedSession = computed(() => selectedSessionId.value)
 
@@ -140,6 +174,7 @@ async function viewArtifact(art) {
     if (art.filename.match(/\.(md|txt|json|yaml|yml|csv|log)$/i)) {
       const data = await api.getArtifactContent(selectedSession.value, art.filename)
       artifactContent.value = data.content || ''
+      nextTick(processMermaid)
     } else {
       window.open(authArtifactUrl(art.filename), '_blank')
       selectedArtifact.value = null
@@ -461,6 +496,23 @@ function formatSize(bytes) {
   font-size: 0.85em;
 }
 .artifact-rendered :deep(a) { color: var(--accent); }
+.artifact-rendered :deep(.mermaid) {
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  margin: 0 0 0.5rem;
+  overflow-x: auto;
+  text-align: center;
+}
+.artifact-rendered :deep(.mermaid svg) { max-width: 100%; height: auto; }
+.artifact-rendered :deep(.mermaid:not([data-processed])) {
+  white-space: pre;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  text-align: left;
+  color: var(--text-secondary);
+}
 .artifact-rendered :deep(img) { max-width: 100%; border-radius: var(--radius-sm); }
 
 /* ─── Mobile ─── */
