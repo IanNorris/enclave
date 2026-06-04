@@ -1595,6 +1595,31 @@ async def try_init_copilot(
             "files, kagi_extract for URLs."
         )
 
+        # How to surface files/images to the user. Agents otherwise reach for a
+        # self-hosted HTTP server + request_port, which needs a session restart
+        # to go live and breaks if the files are later deleted.
+        prompt_parts.append(
+            "# Showing files & images to the user\n\n"
+            "To let the user SEE a file you produced (screenshot, render, report, "
+            "generated asset), use one of these — never stand up your own web "
+            "server for it:\n\n"
+            "- `send_file <path>` — delivers the file into the chat (Matrix). Best "
+            "for a single image or document you want pushed to the user.\n"
+            "- `structured_response` with `images: [\"<workspace path>\", ...]` — "
+            "embeds images inline in a card in the web UI. Best for showing several "
+            "shots together with explanation.\n\n"
+            "The web UI streams these straight from your workspace on the host, so "
+            "**no port mapping or restart is needed**. Crucially, **keep the files "
+            "in your workspace** — do not delete or move them after sending. The UI "
+            "references them by their workspace path and re-fetches them on every "
+            "load, so removing a file leaves a broken image. Put shareable assets "
+            "in a stable location (e.g. `shots/` or `artifacts/`) and leave them "
+            "there.\n\n"
+            "`request_port` is only for **live network services** the user connects "
+            "to (dev servers, game servers, APIs) — not for serving static files. "
+            "It also requires a session restart before the port is reachable."
+        )
+
         sys_msg = SystemMessageAppendConfig(
             content="\n\n".join(prompt_parts)
         )
@@ -3107,7 +3132,11 @@ async def try_init_copilot(
                     "images": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Workspace file paths for images to embed in the card.",
+                        "description": (
+                            "Workspace file paths for images to embed in the card. "
+                            "Keep these files in the workspace — the UI re-fetches "
+                            "them on every load, so do not delete them after sending."
+                        ),
                     },
                 },
                 "required": ["summary"],
@@ -3330,13 +3359,13 @@ async def try_init_copilot(
         request_port_tool = Tool(
             name="request_port",
             description=(
-                "Request a host port mapping for this container session. "
-                "Maps a container port to a host port so users can access "
-                "services running inside the container (e.g., dev servers, "
-                "web apps, game servers). The mapping is permanent and "
-                "persists across restarts. A session restart is required "
-                "to activate new mappings. Use this when you need to expose "
-                "a service for the user to connect to."
+                "Request a host port mapping so the user can reach a **live "
+                "network service** running inside this container (dev server, "
+                "web app, game server, API). NOT for sharing static files or "
+                "images — for those use send_file or structured_response images, "
+                "which need no port and no restart. A session restart is required "
+                "before a new mapping becomes reachable; the mapping is permanent "
+                "and persists across restarts."
             ),
             handler=_request_port_handler,
             parameters={
