@@ -2,6 +2,58 @@
 
 ## Implemented
 
+### Web UI / Management Dashboard ✅
+
+Full web dashboard (`enclave-webui`, FastAPI + Vue 3) served over HTTPS with
+token-based auth, complementing the Matrix interface.
+
+- Modules: `src/enclave/webui/` (`app.py`, `routes/`, `frontend/`)
+- Live chat with streaming responses and inline image gallery/lightbox
+- Mermaid diagram rendering in chat and artifacts
+- Timeline view — three-level drill-down through session history
+- Artifacts panel — versioned report/document artifacts
+- Bug tracker, Memories browser, and an Asks inbox for deferred questions
+- AI Credits (premium-request quota) and consumed AI Units shown per session
+- Durable, single-source event log so chat history survives reloads/restarts
+- Run via `enclave-webui` or the `services/enclave-webui.service` user unit
+
+### Web Search & Document Tools ✅
+
+Baked-in agent helpers for getting reliable, readable source material.
+
+- `kagi_search` / `kagi_extract` — Kagi Search API v1 (ranked primary-source
+  URLs and clean-markdown page content). Module: `container/kagi.py`,
+  enabled when `kagi_token` / `ENCLAVE_KAGI_TOKEN` is set
+- `markitdown` — converts local PDF/Word/PowerPoint/Excel/image/HTML/etc.
+  documents into Markdown the agent can read
+
+### Structured Responses & Deferred Asks ✅
+
+- `structured_response` — rich scannable cards with embedded images and
+  action buttons, delivered to Matrix and the web UI immediately
+- `ask_deferred` — non-blocking questions collected in the web UI Asks inbox
+- `send_file` — deliver files to chat; images preview inline
+
+### Port Mapping ✅
+
+Agents can expose a container service on a host port via the `request_port`
+tool (allocated from a configured range; activated on session restart).
+Module: `src/enclave/orchestrator/router.py`, `container.py`.
+
+### ACP Remote Agents ✅
+
+External agents connect over the Agent Client Protocol (TCP) and appear as
+virtual agents on the IPC socket, with reconnection and exponential backoff.
+
+- Modules: `src/enclave/orchestrator/acp_bridge.py`, `acp_client.py`
+- TLS is enforced for non-loopback ACP connections
+
+### Bug Tracker & Artifacts ✅
+
+- Workspace-local bug tracker (source of truth in the workspace, mirrored to
+  the web UI). Module: `src/enclave/agent/bug_tracker.py`
+- `publish_artifact` — versioned documents shown in the web UI Artifacts panel
+
 ### Landlock Kernel Sandboxing ✅
 
 Kernel-level filesystem restrictions for host-mode agents using Linux
@@ -263,7 +315,14 @@ but adapted for Enclave's multi-container architecture.
 
 ### Management Dashboard
 
-**Priority:** High | **Effort:** High
+**Status:** ✅ Largely delivered — see **Web UI / Management Dashboard** under
+*Implemented* above. The web UI provides live chat, session/timeline views,
+artifacts, bug tracking, memories, and the Asks inbox over HTTPS with token
+auth. The remaining backlog ideas below (LDAP auth, live `podman stats`
+resource graphs, WebSocket log streaming, auto-archive room cleanup policy)
+are not yet implemented.
+
+**Priority:** Medium | **Effort:** Medium
 
 Web-based management UI for Enclave administrators. Provides real-time
 visibility into running agents, resource usage, and session lifecycle

@@ -187,7 +187,23 @@ Runs inside the orchestrator. Detects and bridges to the desktop.
 - Or in a tmux session managed by the orchestrator
 - Optional: headless Wayland compositor (cage/weston) for apps requiring a display
 
-### 5. Matrix Room Model
+### 5. Web UI (`enclave-webui`)
+
+A FastAPI + Vue 3 dashboard that runs as a separate process and reads the same
+config and session/event stores as the orchestrator. It complements Matrix —
+Matrix is for conversational control, the web UI is for richer operations and
+review.
+
+- **Auth:** token-based (JWT); browser `<img>`/download links use a `?token=`
+  query param. Served over HTTPS by default (`--no-tls` for trusted networks)
+- **Views:** Chat (streaming, inline image gallery, Mermaid), three-level
+  Timeline drill-down, Artifacts, Bug tracker, Memories, and an Asks inbox
+- **File serving:** `/api/chat/{session}/file/{path}` streams workspace files
+  straight from the host (no container port mapping required)
+- **History:** reads a durable, single-source event log so chat survives reloads
+- Modules: `src/enclave/webui/` (`app.py`, `routes/`, `frontend/`)
+
+### 6. Matrix Room Model
 
 **Bot-managed rooms** — the bot owns the room lifecycle. On first startup,
 bot creates a Space and control room, invites the user. Project rooms are
@@ -262,9 +278,17 @@ response = await session.prompt(user_message)
 - `read_file`, `write_file`, `list_directory` — scoped to /workspace
 - `shell_exec` — runs commands inside the container
 - `request_permission` — asks orchestrator for file/directory access
+- `request_port` — expose a container service on a host port
 - `launch_gui` — requests GUI app launch on desktop
 - `screenshot` — requests desktop screenshot
-- `send_file` — sends a file to the Matrix room
+- `send_file` — sends a file to the Matrix room (and web UI)
+- `structured_response` — rich card update (images, action buttons)
+- `ask_deferred` — non-blocking question routed to the web UI Asks inbox
+- `publish_artifact` — versioned document shown in the web UI Artifacts panel
+- bug tracker (`report_bug`, `list_bugs`, …) — workspace-local issue tracking
+- `kagi_search` / `kagi_extract` — web search + page-to-markdown extraction (when configured)
+- `markitdown` (CLI) — convert local PDF/Office/etc. documents to Markdown
+- memory (`remember`, `recall`, …) and scheduling (`schedule_cron`, `set_timer`)
 
 **MCP servers:** The SDK supports MCP, so you could also expose tools via MCP servers running alongside the agent.
 
@@ -291,6 +315,7 @@ Nothing existing combines: **AI agent + chat control + sandboxed containers + ap
 - **github-copilot-sdk** — AI agent runtime
 - **matrix-nio[e2ee]** — Matrix E2EE client
 - **podman** — rootless container sandboxing
+- **FastAPI + Vue 3** — web UI (HTTPS, token auth)
 - **systemd** — service management (orchestrator)
 - **Conduit** — lightweight Matrix homeserver (Rust)
 - **SQLite** — session persistence, permission state
@@ -344,6 +369,13 @@ or ignore it and just see the result in the main conversation.
 ---
 
 ## Search Isolation (Prompt Injection Defense)
+
+> **Implementation note:** In addition to (or instead of) the isolated
+> search-agent model below, agents can use the baked-in **Kagi** tools
+> (`kagi_search` / `kagi_extract`, see `container/kagi.py`) when a token is
+> configured. These call the Kagi API directly and return ranked URLs and
+> clean-markdown page content. The agent prompt instructs treating extracted
+> text as the source of truth and verifying figures against primary documents.
 
 Web search is always allowed, but never done by the main agent directly:
 
