@@ -129,4 +129,12 @@ export const api = {
     const qs = params.toString()
     return request(`/chat/${session}/timeline${qs ? '?' + qs : ''}`)
   },
+
+  // Consult panel configuration
+  getPanel: () => request('/panel'),
+  updatePanel: (members) => request('/panel', {
+    method: 'PUT',
+    body: JSON.stringify({ members }),
+  }),
+  getPanelModels: () => request('/panel/models'),
 }

@@ -29,6 +29,11 @@ const routes = [
     component: () => import('./views/Memories.vue'),
   },
   {
+    path: '/panel',
+    name: 'panel',
+    component: () => import('./views/Panel.vue'),
+  },
+  {
     path: '/chat',
     name: 'chat',
     component: () => import('./views/Chat.vue'),

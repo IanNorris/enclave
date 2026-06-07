@@ -19,6 +19,7 @@ from enclave.common.audit import AuditLog
 from enclave.common.config import UserMapping
 from enclave.common.cost_tracker import CostTracker
 from enclave.common.logging import get_logger
+from enclave.common import panel as panel_mod
 from enclave.common.protocol import Message, MessageType
 from enclave.orchestrator.approval import ApprovalManager
 from enclave.orchestrator.commands import (
@@ -2960,6 +2961,15 @@ class MessageRouter:
         await self.ipc.remove_socket(f"pending-{project_name}")
         socket_path = await self.ipc.create_socket(session.id)
         session.socket_path = str(socket_path)
+
+        # Seed the workspace with the current panel definition so the
+        # consult_panel tool is data-driven (and private model ids stay on
+        # the host, never in the repo).
+        try:
+            panel_doc = panel_mod.load_panel(self._data_dir)
+            panel_mod.write_workspace_panel(session.workspace_path, panel_doc)
+        except Exception as e:
+            log.warning("[project:%s] Failed to seed panel: %s", project_name, e)
 
         log.info("[project:%s] Starting container...", project_name)
         started, error = await self.containers.start_session(session.id)

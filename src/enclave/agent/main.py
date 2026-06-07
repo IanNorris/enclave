@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from enclave.agent.ipc_client import IPCClient
+from enclave.common import panel as _panel_mod
 from enclave.common.protocol import Message, MessageType
 
 if TYPE_CHECKING:
@@ -1241,15 +1242,9 @@ _REASONING_EFFORT = "medium"
 # retry in _configure_model still covers any model that rejects it.
 _NO_REASONING_EFFORT_MODELS: frozenset[str] = frozenset()
 
-# Panel archetype model preferences (first available wins).
-# Architect wants the deepest reasoning; Pragmatist & Contrarian favour
-# GPT 5.5 for breadth; Skeptic uses Opus for careful analysis.
-_PANEL_MODEL_PREFERENCES: dict[str, tuple[str, ...]] = {
-    "architect": ("claude-opus-4.8", "claude-opus-4.7-xhigh", "claude-opus-4.6", "claude-opus-4.5"),
-    "pragmatist": ("gpt-5.5", "gpt-5.4", "gpt-5.2"),
-    "skeptic": ("claude-opus-4.8", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.5"),
-    "contrarian": ("gpt-5.5", "claude-opus-4.7-xhigh", "claude-opus-4.6"),
-}
+# Panel archetype definitions (roles, prompts, and per-role model preferences)
+# are now data-driven — see enclave.common.panel.DEFAULT_PANEL and the
+# orchestrator-seeded .enclave-panel.json. consult_panel loads them at runtime.
 
 # Populated at startup by _configure_model(); shared with consult_panel.
 _AVAILABLE_MODEL_IDS: set[str] = set()
@@ -4151,116 +4146,21 @@ async def try_init_copilot(
                     result_type="error",
                 )
 
-            def _archetype_prompt(role: str, voice: str, focus: str) -> str:
-                return (
-                    f"You are **{role}**, one member of a 4-person expert panel "
-                    "consulted by a fellow engineer who is stuck on a technical "
-                    "problem. The other panelists have different perspectives — "
-                    "your job is to bring YOUR distinct lens, not to produce a "
-                    "balanced take.\n\n"
-                    f"**Your voice:** {voice}\n\n"
-                    f"**What you look for:** {focus}\n\n"
-                    "**DO NOT do your own background research.** The calling "
-                    "engineer has already done the investigation and attached "
-                    "their findings in the problem description. Reason from "
-                    "the evidence they provided. Only fire off tool calls to "
-                    "research something if you have a specific idea that isn't "
-                    "covered by their attached material AND that idea is "
-                    "central to your recommendation — never for general "
-                    "background. If you want more evidence, name what's "
-                    "missing in your 'sharp question' instead of hunting for "
-                    "it yourself.\n\n"
-                    "Stay in character. Be direct, specific, and concrete. "
-                    "Do NOT hedge with 'it depends' — pick a position and defend "
-                    "it. Your perspective will be synthesized with the others, "
-                    "so redundancy with a balanced middle-ground is wasted effort.\n\n"
-                    "Structure your response as:\n"
-                    "1. **Your take** (2-4 sentences: the core point from your lens)\n"
-                    "2. **What the engineer is likely missing** (concrete risks or "
-                    "opportunities through your lens)\n"
-                    "3. **Concrete recommendation** (what you would do, and why)\n"
-                    "4. **A sharp question** (one question that if answered would "
-                    "materially change the approach)\n\n"
-                    "--- Problem Description ---\n"
-                    f"{problem}"
+            # Load the data-driven panel seeded into the workspace by the
+            # orchestrator (falls back to the built-in default roster).
+            panel_doc = _panel_mod.load_workspace_panel(working_directory)
+            members = _panel_mod.enabled_members(panel_doc)
+            if not members:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: the consult_panel roster is empty. Enable at "
+                        "least one panelist (with a voice/focus) in the panel "
+                        "configuration."
+                    ),
+                    result_type="error",
                 )
 
-            architect_prompt = _archetype_prompt(
-                role="The Architect",
-                voice=(
-                    "'What does this look like in 2 years at 10x scale? Who "
-                    "maintains this?' You care about long-term stewardship, "
-                    "cohesion, extension points, and keeping the mental model "
-                    "clean."
-                ),
-                focus=(
-                    "Coupling, hidden assumptions baked into code, decisions "
-                    "that are cheap now but expensive to reverse later, "
-                    "abstractions that will or won't hold up, interfaces that "
-                    "shape future work. Call out when a quick fix is actually "
-                    "a load-bearing decision in disguise."
-                ),
-            )
-
-            pragmatist_prompt = _archetype_prompt(
-                role="The Pragmatist",
-                voice=(
-                    "'What's the simplest thing that could work? Ship it, "
-                    "iterate later.' You distrust complexity, premature "
-                    "abstraction, and analysis paralysis. Think VERY hard and "
-                    "carefully before speaking — the engineer will rely on "
-                    "your judgment about what's truly necessary vs. what's "
-                    "gold-plating."
-                ),
-                focus=(
-                    "YAGNI violations, over-engineering, scope creep, "
-                    "speculative generality. What's the smallest diff that "
-                    "actually solves the user's real problem today? What can "
-                    "be deleted, deferred, or faked? Call out when the "
-                    "engineer is solving a problem they don't actually have."
-                ),
-            )
-
-            skeptic_prompt = _archetype_prompt(
-                role="The Skeptic",
-                voice=(
-                    "'How does this fail? What's the attacker's move? What "
-                    "if the input is null, malicious, or huge?' You assume "
-                    "the happy path is a lie and every assumption is wrong "
-                    "until proven otherwise."
-                ),
-                focus=(
-                    "Edge cases, security holes, race conditions, silent "
-                    "failures, unvalidated inputs, data integrity, error "
-                    "paths, partial failures, concurrency bugs, trust "
-                    "boundaries. What inputs break this? What happens on a "
-                    "crash mid-operation? What does an adversary do?"
-                ),
-            )
-
-            contrarian_prompt = _archetype_prompt(
-                role="The Contrarian",
-                voice=(
-                    "'What if the framing is wrong? What if we should do the "
-                    "literal opposite?' You question premises, flip "
-                    "assumptions, and look for the problem behind the "
-                    "problem."
-                ),
-                focus=(
-                    "Unquestioned assumptions in how the problem is framed, "
-                    "false dichotomies, wrong-level solutions, cases where "
-                    "NOT doing the thing is the right answer. If everyone "
-                    "else is agreeing, dig for what they're all missing. "
-                    "Surface the option nobody proposed."
-                ),
-            )
-
-            architect_model = _resolve_model(_PANEL_MODEL_PREFERENCES["architect"])
-            pragmatist_model = _resolve_model(_PANEL_MODEL_PREFERENCES["pragmatist"])
-            skeptic_model = _resolve_model(_PANEL_MODEL_PREFERENCES["skeptic"])
-            contrarian_model = _resolve_model(_PANEL_MODEL_PREFERENCES["contrarian"])
-
-            # Launch all 4 panelists in parallel via copilot -p subprocesses.
+            # Launch every enabled panelist in parallel via copilot -p subprocesses.
             try:
                 import copilot as _copilot_pkg
                 cli_dir = os.path.dirname(_copilot_pkg.__file__)
@@ -4268,12 +4168,12 @@ async def try_init_copilot(
             except Exception:
                 cli_bin = "copilot"
 
-            panelists = [
-                ("The Architect", architect_model, architect_prompt),
-                ("The Pragmatist", pragmatist_model, pragmatist_prompt),
-                ("The Skeptic", skeptic_model, skeptic_prompt),
-                ("The Contrarian", contrarian_model, contrarian_prompt),
-            ]
+            panelists = []
+            for member in members:
+                prefs = tuple(member.get("models") or ())
+                model = _resolve_model(prefs) if prefs else _resolve_model(_MODEL_PREFERENCES)
+                prompt_text = _panel_mod.build_panelist_prompt(member, problem)
+                panelists.append((member["name"], model, prompt_text))
 
             async def _run_panelist(
                 name: str, model: str, prompt: str,
@@ -4308,9 +4208,10 @@ async def try_init_copilot(
                     return (name, f"[Error: {e}]")
 
             print(
-                f"[agent] consult_panel: launching 4 panelists "
-                f"({architect_model}, {pragmatist_model}, "
-                f"{skeptic_model}, {contrarian_model})",
+                "[agent] consult_panel: launching %d panelists (%s)" % (
+                    len(panelists),
+                    ", ".join(f"{n}:{m}" for n, m, _ in panelists),
+                ),
                 file=sys.stderr,
             )
 
@@ -4325,12 +4226,13 @@ async def try_init_copilot(
                 sections.append(f"## {name}\n\n{response}")
 
             consolidated = "\n\n---\n\n".join(sections)
+            count = len(sections)
             return ToolResult(
                 text_result_for_llm=(
-                    "Here are the four panel perspectives. Expect sharp "
+                    f"Here are the {count} panel perspectives. Expect sharp "
                     "disagreement — that's where the signal is. Synthesize "
                     "the takes that best fit your actual constraints; don't "
-                    "try to please all four.\n\n"
+                    "try to please all of them.\n\n"
                     + consolidated
                 ),
             )
@@ -4338,9 +4240,10 @@ async def try_init_copilot(
         consult_panel_tool = Tool(
             name="consult_panel",
             description=(
-                "Convene a 4-person panel of expert agents with deliberately "
-                "different archetypes (Architect, Pragmatist, Skeptic, "
-                "Contrarian) at high-leverage decision points. Use BEFORE "
+                "Convene a panel of expert agents with deliberately "
+                "different archetypes (e.g. Architect, Pragmatist, Skeptic, "
+                "Contrarian — the roster is configurable) at high-leverage "
+                "decision points. Use BEFORE "
                 "starting any large new piece of work, when designing an API "
                 "or architecture, when choosing between viable approaches, on "
                 "the 2nd attempt at a problem, or when stuck. Each panelist "

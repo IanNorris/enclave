@@ -7,6 +7,14 @@
     <div class="mobile-header">
       <button class="hamburger" @click="sidebarOpen = !sidebarOpen">☰</button>
       <span class="mobile-title">Enclave</span>
+      <!-- Session selector surfaced in the top bar while the sidebar is collapsed -->
+      <select v-model="selectedSessionId" class="mobile-session-select" aria-label="Active session">
+        <option value="">No session</option>
+        <option v-for="s in activeSessions" :key="s.id" :value="s.id">
+          {{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
+        </option>
+      </select>
+      <button class="mobile-new-session-btn" title="New session" @click="openNewSession">➕</button>
     </div>
 
     <!-- Sidebar overlay for mobile -->
@@ -25,7 +33,7 @@
             {{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
           </option>
         </select>
-        <button class="new-session-btn" title="New session" @click="openNewSession">＋</button>
+        <button class="new-session-btn" title="New session" @click="openNewSession">➕</button>
       </div>
 
       <!-- New session modal -->
@@ -75,6 +83,11 @@
         <li>
           <router-link to="/memories" active-class="active" @click="sidebarOpen = false">
             <span class="icon">🧠</span> Memories
+          </router-link>
+        </li>
+        <li>
+          <router-link to="/panel" active-class="active" @click="sidebarOpen = false">
+            <span class="icon">🎛️</span> Panel
           </router-link>
         </li>
         <li>
@@ -251,7 +264,10 @@ watch(isLoginPage, (isLogin) => {
   flex-shrink: 0;
   width: 2rem;
   height: 2rem;
-  font-size: 1.1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.95rem;
   line-height: 1;
   background: var(--bg-main);
   color: var(--text-primary);
@@ -427,6 +443,33 @@ watch(isLoginPage, (isLogin) => {
     font-size: 1.1rem;
     font-weight: 600;
     color: var(--text-primary);
+  }
+
+  .mobile-session-select {
+    margin-left: auto;
+    max-width: 55vw;
+    font-size: 0.85rem;
+    padding: 0.35rem 0.5rem;
+    background: var(--bg-main);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+  }
+
+  .mobile-new-session-btn {
+    flex-shrink: 0;
+    width: 2rem;
+    height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.95rem;
+    line-height: 1;
+    background: var(--bg-main);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    cursor: pointer;
   }
 
   .sidebar {

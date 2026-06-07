@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from enclave.webui.event_store import PERSIST_TYPES, persist_event
+from enclave.common import panel as panel_mod
 
 if TYPE_CHECKING:
     from .router import MessageRouter
@@ -247,6 +248,10 @@ class ControlServer:
                 await self._handle_credits(req, writer)
             elif action == "profiles":
                 await self._handle_profiles(writer)
+            elif action == "panel_get":
+                await self._handle_panel_get(writer)
+            elif action == "panel_set":
+                await self._handle_panel_set(req, writer)
             elif action == "create":
                 await self._handle_create(req, writer)
             else:
@@ -461,6 +466,47 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": str(e)})
             return
         await self._write(writer, {"ok": True, "type": "profiles", "profiles": profiles})
+
+    async def _handle_panel_get(self, writer: asyncio.StreamWriter) -> None:
+        """Return the editable consult_panel definition from the host."""
+        try:
+            data_dir = self._router._data_dir
+            panel = panel_mod.load_panel(data_dir)
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        await self._write(writer, {"ok": True, "type": "panel", "panel": panel})
+
+    async def _handle_panel_set(
+        self, req: dict, writer: asyncio.StreamWriter,
+    ) -> None:
+        """Persist a new panel definition and push it to active workspaces."""
+        try:
+            data_dir = self._router._data_dir
+            incoming = req.get("panel", req.get("members"))
+            panel = panel_mod.save_panel(data_dir, incoming)
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+
+        # Propagate to every known session workspace so running agents pick up
+        # the change on their next consult_panel call (no restart required).
+        pushed = 0
+        try:
+            for session in self._router.containers.list_sessions():
+                ws = getattr(session, "workspace_path", "")
+                if ws and Path(ws).is_dir():
+                    try:
+                        panel_mod.write_workspace_panel(ws, panel)
+                        pushed += 1
+                    except Exception as e:
+                        log.warning("Failed to push panel to %s: %s", ws, e)
+        except Exception as e:
+            log.warning("Panel propagation failed: %s", e)
+
+        await self._write(
+            writer, {"ok": True, "type": "panel", "panel": panel, "pushed": pushed},
+        )
 
     async def _handle_create(self, req: dict, writer: asyncio.StreamWriter) -> None:
         """Create a new project session (web UI "new session" button)."""
