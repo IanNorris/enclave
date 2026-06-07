@@ -76,6 +76,13 @@ COPY pyproject.toml /build/
 COPY src/ /build/src/
 RUN pip install --no-cache-dir /build && rm -rf /build
 
+# Graphify (MIT) — turns the workspace into a queryable code knowledge graph so
+# agents can query structure instead of grepping large trees. Code extraction is
+# fully local via tree-sitter (cpp/c/objc + 25 more grammars) — no API key, no LLM
+# cost. The [mcp] extra ships the optional stdio graph server. Exposed to agents as
+# the graphify_build / graphify_query tools (see src/enclave/agent/main.py).
+RUN pip install --no-cache-dir "graphifyy[mcp]"
+
 # Mimir memory backend binaries.
 #
 # We deliberately COPY pre-built host binaries rather than building from

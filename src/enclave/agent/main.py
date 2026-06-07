@@ -1590,6 +1590,37 @@ async def try_init_copilot(
             "files, kagi_extract for URLs."
         )
 
+        # Advertise the graphify code knowledge graph when the CLI is present in
+        # the image (post-rebuild). Lets agents query project structure instead of
+        # grepping large trees — code (incl. C/C++/headers) is parsed locally via
+        # tree-sitter, so building and querying need no API key and no LLM cost.
+        import shutil as _shutil
+        if _shutil.which("graphify"):
+            prompt_parts.append(
+                "# Code knowledge graph: graphify\n\n"
+                "`graphify` turns the workspace into a queryable knowledge graph of "
+                "symbols and their relationships — far better than grepping a large "
+                "or unfamiliar codebase (especially C/C++):\n\n"
+                "- `graphify extract . --no-viz` — build the graph (writes "
+                "`graphify-out/`). Code is parsed locally with tree-sitter (C, C++, "
+                "headers, and 25+ other languages) — **no API key, no cost**. Add "
+                "`--update` to re-extract only changed files, or `--force` if a "
+                "refactor deleted files and the node count dropped.\n"
+                "- `graphify query \"<question>\"` — return the relevant subgraph to "
+                "answer a structural question (e.g. \"what calls RenderFrame?\").\n"
+                "- `graphify path \"A\" \"B\"` — shortest relationship path between two "
+                "symbols; `graphify explain \"Symbol\"` — summarise a node + its "
+                "neighbours.\n\n"
+                "Workflow: build once with `graphify extract . --no-viz`, then prefer "
+                "`graphify query`/`path`/`explain` over grepping the whole tree. Re-run "
+                "`graphify extract . --update` after significant edits so the graph "
+                "stays current. Keep `graphify-out/` in the workspace. Note: doc/PDF/"
+                "image semantic enrichment needs an LLM backend that is not configured "
+                "here, but all code-structure extraction and graph queries work fully "
+                "offline."
+            )
+            print("[agent] graphify code graph enabled", file=sys.stderr)
+
         # How to surface files/images to the user. Agents otherwise reach for a
         # self-hosted HTTP server + request_port, which needs a session restart
         # to go live and breaks if the files are later deleted.
