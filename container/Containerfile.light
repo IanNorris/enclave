@@ -41,6 +41,11 @@ RUN chmod +x /usr/local/bin/kagi && \
 # markitdown — local document -> Markdown converter (see Containerfile for rationale).
 RUN pip install --no-cache-dir 'markitdown[pdf,docx,pptx,xlsx,xls]'
 
+# Graphify (MIT) — queryable code knowledge graph (see Containerfile for rationale).
+# Code extraction is local tree-sitter (C/C++/Obj-C + 25 more) — no API key, no cost.
+# Exposed to agents as graphify_* CLI + an MCP server (src/enclave/agent/main.py).
+RUN pip install --no-cache-dir "graphifyy[mcp]"
+
 RUN printf '#!/bin/bash\n\
 export COPILOT_AUTO_UPDATE=false\n\
 /usr/local/lib/python3.12/site-packages/copilot/bin/copilot --version >/dev/null 2>&1 || true\n\
