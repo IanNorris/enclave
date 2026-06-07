@@ -145,3 +145,85 @@ class TestAgentProtocol:
 
         assert restored.type == msg.type
         assert restored.payload == msg.payload
+
+
+class TestConfigureGraphifyMcp:
+    """Tests for graphify MCP server registration (phase 2)."""
+
+    def _graph(self, workspace) -> None:
+        out = workspace / "graphify-out"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "graph.json").write_text('{"nodes": [], "links": []}')
+
+    def test_registers_server_when_graph_present(self, tmp_path, monkeypatch) -> None:
+        import json as _json
+
+        from enclave.agent import main as agent_main
+
+        monkeypatch.setattr(agent_main.shutil, "which", lambda _n: "/usr/local/bin/graphify", raising=False)
+        ws = tmp_path / "ws"
+        state = tmp_path / "state"
+        ws.mkdir()
+        state.mkdir()
+        self._graph(ws)
+
+        agent_main._configure_graphify_mcp(str(ws), str(state))
+
+        cfg = _json.loads((state / "mcp-config.json").read_text())
+        gfy = cfg["mcpServers"]["graphify"]
+        assert gfy["type"] == "local"
+        assert gfy["args"][:2] == ["-m", "graphify.serve"]
+        assert gfy["args"][2].endswith("graphify-out/graph.json")
+        assert gfy["tools"] == ["*"]
+
+    def test_no_config_written_when_graph_absent(self, tmp_path, monkeypatch) -> None:
+        from enclave.agent import main as agent_main
+
+        monkeypatch.setattr(agent_main.shutil, "which", lambda _n: "/usr/local/bin/graphify", raising=False)
+        ws = tmp_path / "ws"
+        state = tmp_path / "state"
+        ws.mkdir()
+        state.mkdir()
+
+        agent_main._configure_graphify_mcp(str(ws), str(state))
+
+        assert not (state / "mcp-config.json").exists()
+
+    def test_removes_stale_entry_when_graph_deleted(self, tmp_path, monkeypatch) -> None:
+        import json as _json
+
+        from enclave.agent import main as agent_main
+
+        monkeypatch.setattr(agent_main.shutil, "which", lambda _n: "/usr/local/bin/graphify", raising=False)
+        ws = tmp_path / "ws"
+        state = tmp_path / "state"
+        ws.mkdir()
+        state.mkdir()
+        (state / "mcp-config.json").write_text(
+            '{"mcpServers": {"graphify": {"type": "local"}, "other": {"type": "local"}}}'
+        )
+
+        agent_main._configure_graphify_mcp(str(ws), str(state))
+
+        cfg = _json.loads((state / "mcp-config.json").read_text())
+        assert "graphify" not in cfg["mcpServers"]
+        assert "other" in cfg["mcpServers"]
+
+    def test_preserves_other_servers(self, tmp_path, monkeypatch) -> None:
+        import json as _json
+
+        from enclave.agent import main as agent_main
+
+        monkeypatch.setattr(agent_main.shutil, "which", lambda _n: "/usr/local/bin/graphify", raising=False)
+        ws = tmp_path / "ws"
+        state = tmp_path / "state"
+        ws.mkdir()
+        state.mkdir()
+        self._graph(ws)
+        (state / "mcp-config.json").write_text('{"mcpServers": {"other": {"type": "local"}}}')
+
+        agent_main._configure_graphify_mcp(str(ws), str(state))
+
+        cfg = _json.loads((state / "mcp-config.json").read_text())
+        assert "other" in cfg["mcpServers"]
+        assert "graphify" in cfg["mcpServers"]

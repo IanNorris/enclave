@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from collections import Counter, deque
@@ -1358,6 +1359,71 @@ async def _configure_model(
         print(f"[agent] Failed to write models info: {e}", file=sys.stderr)
 
 
+def _configure_graphify_mcp(working_directory: str, state_dir: str) -> None:
+    """Wire graphify's MCP server into the in-container copilot config.
+
+    Phase 2 of the graphify integration: when a code knowledge graph has been
+    built for the workspace (``graphify-out/graph.json`` exists) and the
+    ``graphify`` CLI is installed, register graphify's stdio MCP server in
+    ``<state_dir>/mcp-config.json`` so copilot exposes structured graph tools
+    (``query_graph``, ``get_node``, ``get_neighbors``, ``shortest_path``, …) in
+    addition to the phase-1 ``graphify`` CLI commands.
+
+    The copilot CLI auto-loads ``mcp-config.json`` from its ``--config-dir``.
+    We merge into any existing config rather than clobbering it, and remove the
+    entry when no graph is present so a deleted graph doesn't leave a dangling
+    server that fails to start. Best-effort: any error is logged and ignored so
+    MCP wiring can never break session startup.
+    """
+    config_path = os.path.join(state_dir, "mcp-config.json")
+    graph_path = os.path.join(working_directory, "graphify-out", "graph.json")
+    have_graph = bool(shutil.which("graphify")) and os.path.isfile(graph_path)
+
+    try:
+        config: dict = {}
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path) as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    config = loaded
+            except (json.JSONDecodeError, OSError):
+                config = {}
+
+        servers = config.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+            config["mcpServers"] = servers
+
+        existing = servers.get("graphify")
+        if have_graph:
+            desired = {
+                "type": "local",
+                "command": sys.executable,
+                "args": ["-m", "graphify.serve", os.path.abspath(graph_path)],
+                "tools": ["*"],
+            }
+            if existing == desired:
+                return
+            servers["graphify"] = desired
+        else:
+            if "graphify" not in servers:
+                return
+            servers.pop("graphify", None)
+
+        os.makedirs(state_dir, exist_ok=True)
+        with open(config_path, "w") as fh:
+            json.dump(config, fh, indent=2)
+        if have_graph:
+            print(
+                "[agent] graphify MCP server registered "
+                f"(graph={os.path.abspath(graph_path)})",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(f"[agent] Failed to configure graphify MCP server: {e}", file=sys.stderr)
+
+
 async def try_init_copilot(
     working_directory: str = "/workspace",
     ipc: IPCClient | None = None,
@@ -1400,6 +1466,10 @@ async def try_init_copilot(
             # survives container restarts.
             state_dir = os.path.join(working_directory, ".copilot-state")
             os.makedirs(state_dir, exist_ok=True)
+
+            # Register graphify's MCP server if a graph has been built for the
+            # workspace (structured graph tools alongside the phase-1 CLI).
+            _configure_graphify_mcp(working_directory, state_dir)
 
             cli_args = ["--config-dir", state_dir]
             sdk_config = SubprocessConfig(
@@ -1620,6 +1690,18 @@ async def try_init_copilot(
                 "offline."
             )
             print("[agent] graphify code graph enabled", file=sys.stderr)
+            # When a graph already exists, copilot also exposes graphify's MCP
+            # tools (query_graph/get_node/get_neighbors/shortest_path) — point the
+            # agent at them for structured, repeatable access.
+            if os.path.isfile(os.path.join(working_directory, "graphify-out", "graph.json")):
+                prompt_parts.append(
+                    "A graph is already built for this workspace, so structured "
+                    "graphify MCP tools are available too: `query_graph`, `get_node`, "
+                    "`get_neighbors`, and `shortest_path`. Prefer these for precise, "
+                    "repeated lookups; they return structured results rather than CLI "
+                    "text. Re-run `graphify extract . --update` after edits to keep the "
+                    "graph current (the MCP tools refresh on the next session)."
+                )
 
         # How to surface files/images to the user. Agents otherwise reach for a
         # self-hosted HTTP server + request_port, which needs a session restart
