@@ -8,10 +8,12 @@ from enclave.common import panel
 
 
 class TestDefaults:
-    def test_default_panel_has_four_members(self) -> None:
+    def test_default_panel_has_five_members(self) -> None:
         p = panel.default_panel()
         ids = [m["id"] for m in p["members"]]
-        assert ids == ["architect", "pragmatist", "skeptic", "contrarian"]
+        assert ids == [
+            "architect", "pragmatist", "skeptic", "contrarian", "operator",
+        ]
         assert all(m["enabled"] for m in p["members"])
 
     def test_defaults_only_reference_public_models(self) -> None:
@@ -45,7 +47,7 @@ class TestPersistence:
     def test_load_seeds_defaults(self, tmp_path: Path) -> None:
         loaded = panel.load_panel(tmp_path)
         assert panel.panel_path(tmp_path).exists()
-        assert len(loaded["members"]) == 4
+        assert len(loaded["members"]) == 5
 
     def test_save_then_load_roundtrip(self, tmp_path: Path) -> None:
         saved = panel.save_panel(
@@ -62,7 +64,7 @@ class TestPersistence:
     def test_corrupt_file_falls_back_to_defaults(self, tmp_path: Path) -> None:
         panel.panel_path(tmp_path).write_text("{ not json")
         loaded = panel.load_panel(tmp_path)
-        assert len(loaded["members"]) == 4
+        assert len(loaded["members"]) == 5
 
 
 class TestWorkspace:
@@ -80,7 +82,7 @@ class TestWorkspace:
 
     def test_missing_workspace_file_uses_defaults(self, tmp_path: Path) -> None:
         wp = panel.load_workspace_panel(tmp_path)
-        assert len(wp["members"]) == 4
+        assert len(wp["members"]) == 5
 
     def test_build_prompt_includes_role_and_problem(self) -> None:
         member = {"name": "The Skeptic", "voice": "v", "focus": "f"}

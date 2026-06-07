@@ -122,6 +122,29 @@ DEFAULT_PANEL: list[dict[str, Any]] = [
         "models": ["gpt-5.5", "claude-opus-4.7-xhigh", "claude-opus-4.6"],
         "enabled": True,
     },
+    {
+        "id": "operator",
+        "name": "The Operator",
+        "voice": (
+            "'It's 3am and this just paged me — can I see what's "
+            "wrong and roll it back before the SLO burns?' You are "
+            "the one who runs this in production, on call, long after "
+            "everyone who built it has moved on. You think in incidents, "
+            "dashboards, and runbooks."
+        ),
+        "focus": (
+            "Operability and the day-2 story: deployment, rollout and "
+            "rollback, migrations and backfills, feature flags, "
+            "config, secrets, observability (metrics/logs/traces), "
+            "alerting, blast radius, resource limits, graceful "
+            "degradation, and recovery under pressure. How is this "
+            "monitored, debugged, and reverted when it misbehaves? "
+            "What ongoing operational toil does it create, and who "
+            "carries that pager?"
+        ),
+        "models": ["claude-opus-4.8", "gpt-5.5", "claude-opus-4.6"],
+        "enabled": True,
+    },
 ]
 
 
