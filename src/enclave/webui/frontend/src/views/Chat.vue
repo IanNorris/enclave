@@ -6,15 +6,6 @@
         <span class="status-indicator"></span>
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
-      <div class="model-picker" v-if="selectedSession">
-        <span v-if="creditsLabel" class="ai-credits" :title="creditsTitle">{{ creditsLabel }}</span>
-        <select v-if="models.available.length" v-model="currentModel" @change="changeModel" class="model-select">
-          <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
-        </select>
-        <button class="model-refresh" @click="refreshModels" :disabled="modelsRefreshing" title="Refresh model list">
-          {{ modelsRefreshing ? '⟳' : '↻' }}
-        </button>
-      </div>
       <div v-if="selectedSession" class="doc-controls">
         <button
           v-if="openDoc && !isMobilePortrait"
@@ -360,6 +351,7 @@ import { ref, reactive, onMounted, onUnmounted, nextTick, watch, computed } from
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api.js'
 import { useSessionStore } from '../stores/session.js'
+import { useModels } from '../composables/useModels.js'
 import DocumentPane from '../components/DocumentPane.vue'
 import MarkdownIt from 'markdown-it'
 
@@ -525,10 +517,7 @@ function scheduleMermaid() {
 
 const pendingFiles = ref([])
 const dragging = ref(false)
-const models = ref({ current: null, available: [], preferences: [] })
-const currentModel = ref('')
-const modelsRefreshing = ref(false)
-const aiCredits = ref(null)
+const { loadModels, loadCredits, applyCreditsUpdate } = useModels()
 
 // Live streaming state
 const liveEvents = ref([])
@@ -670,8 +659,8 @@ async function loadHistory() {
     await nextTick()
     scrollToBottom(true)
     connectWebSocket()
-    loadModels()
-    loadCredits()
+    loadModels(selectedSession.value)
+    loadCredits(selectedSession.value)
   } catch (e) {
     console.error('Failed to load history:', e)
   }
@@ -738,111 +727,6 @@ async function loadEarlier() {
   }
 }
 
-async function loadModels() {
-  try {
-    const data = await api.getModels(selectedSession.value)
-    models.value = data
-    currentModel.value = data.current || ''
-  } catch (e) {
-    console.error('Failed to load models:', e)
-  }
-}
-
-// Pick the account "AI Credits" snapshot (premium request quota) from the
-// SDK's quota snapshots, tolerating naming differences across SDK versions.
-function pickCreditsSnapshot(snapshots) {
-  if (!snapshots) return null
-  const keys = Object.keys(snapshots)
-  if (!keys.length) return null
-  const preferred = keys.find(k => /premium/i.test(k))
-    || keys.find(k => /credit/i.test(k))
-    || keys.find(k => /interaction/i.test(k))
-    || keys[0]
-  return { key: preferred, ...snapshots[preferred] }
-}
-
-const creditsLabel = computed(() => {
-  const c = aiCredits.value
-  // Consumed AI Units ("AI Credits") for this session — the primary figure,
-  // mirroring the Copilot CLI's "AI Credits" indicator.
-  const aiu = Number(c?.session?.aiu)
-  if (Number.isFinite(aiu) && aiu > 0) {
-    const shown = aiu >= 100 ? Math.round(aiu) : Math.round(aiu * 10) / 10
-    return `AI Credits: ${shown.toLocaleString()}`
-  }
-  // Fall back to the account entitlement snapshot (e.g. "Unlimited") until the
-  // session has consumed anything.
-  const snap = pickCreditsSnapshot(c?.snapshots)
-  if (!snap) return ''
-  if (snap.is_unlimited) return 'AI Credits: Unlimited'
-  const ent = Number(snap.entitlement)
-  const used = Number(snap.used)
-  if (Number.isFinite(ent) && Number.isFinite(used)) {
-    const remaining = Math.max(ent - used, 0)
-    const rounded = Math.round(remaining * 10) / 10
-    return `AI Credits: ${rounded}/${ent}`
-  }
-  if (Number.isFinite(Number(snap.remaining_percentage))) {
-    return `AI Credits: ${Math.round(Number(snap.remaining_percentage))}%`
-  }
-  return ''
-})
-
-const creditsTitle = computed(() => {
-  const c = aiCredits.value
-  const parts = []
-  const sess = c?.session
-  if (sess && Number.isFinite(Number(sess.aiu))) {
-    parts.push(`${Number(sess.aiu).toLocaleString()} AI Units consumed this session`)
-    if (sess.requests) parts.push(`${sess.requests} requests`)
-  }
-  const snap = pickCreditsSnapshot(c?.snapshots)
-  if (snap) {
-    if (snap.is_unlimited) parts.push('Entitlement: Unlimited')
-    if (snap.reset_date) parts.push(`Resets: ${new Date(snap.reset_date).toLocaleString()}`)
-  }
-  if (c?.model) parts.push(`Last model: ${c.model}`)
-  if (c?.ts) parts.push(`Updated: ${new Date(c.ts).toLocaleString()}`)
-  return parts.join(' · ')
-})
-
-async function loadCredits() {
-  if (!selectedSession.value) return
-  try {
-    const data = await api.getCredits(selectedSession.value)
-    const hasSnapshots = data && data.snapshots && Object.keys(data.snapshots).length
-    const hasSession = data && data.session && Object.keys(data.session).length
-    if (hasSnapshots || hasSession) {
-      aiCredits.value = data
-    }
-  } catch (e) {
-    console.error('Failed to load AI credits:', e)
-  }
-}
-
-async function refreshModels() {
-  if (!selectedSession.value) return
-  modelsRefreshing.value = true
-  try {
-    const data = await api.getModels(selectedSession.value, true)
-    models.value = data
-    currentModel.value = data.current || currentModel.value || ''
-  } catch (e) {
-    console.error('Failed to refresh models:', e)
-  } finally {
-    modelsRefreshing.value = false
-  }
-}
-
-async function changeModel() {
-  if (!currentModel.value || !selectedSession.value) return
-  try {
-    await api.setModel(selectedSession.value, currentModel.value)
-  } catch (e) {
-    console.error('Failed to change model:', e)
-  }
-}
-
 function connectWebSocket() {
   if (ws) ws.close()
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -884,17 +768,9 @@ function handleStreamEvent(msg) {
 
   if (type === 'credits') {
     // Live "AI Credits" update from the orchestrator: account entitlement
-    // snapshot + per-session consumed AI Units.
-    if ((msg.snapshots && Object.keys(msg.snapshots).length) ||
-        (msg.session && Object.keys(msg.session).length)) {
-      aiCredits.value = {
-        snapshots: msg.snapshots || aiCredits.value?.snapshots || {},
-        session: msg.session || aiCredits.value?.session || {},
-        ts: msg.ts || new Date().toISOString(),
-        last_cost: msg.last_cost || 0,
-        model: msg.model || '',
-      }
-    }
+    // snapshot + per-session consumed AI Units. Routed through the shared
+    // composable so the global tab bar reflects it too.
+    applyCreditsUpdate(msg)
     return
   }
 

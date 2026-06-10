@@ -25,15 +25,72 @@
         <h1>Enclave</h1>
       </div>
 
-      <!-- Global session selector -->
-      <div class="session-selector">
-        <select v-model="selectedSessionId" class="session-select">
-          <option value="">No session</option>
-          <option v-for="s in activeSessions" :key="s.id" :value="s.id">
-            {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
-          </option>
-        </select>
-        <button class="new-session-btn" title="New session" @click="openNewSession">➕</button>
+      <!-- Recency-sorted session switcher -->
+      <div class="session-list-section">
+        <div class="session-list-header">
+          <span>Sessions</span>
+          <button class="new-session-btn" title="New session" @click="openNewSession">➕</button>
+        </div>
+        <ul class="session-list">
+          <li
+            v-for="s in recentSessions"
+            :key="s.id"
+            class="session-row"
+            :class="{ active: s.id === selectedSessionId }"
+          >
+            <button class="session-pick" @click="pickSession(s.id)">
+              <span class="session-name">
+                {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}<span v-if="s.status === 'running'" class="run-dot">●</span>
+              </span>
+            </button>
+            <button
+              v-if="!s.concierge"
+              class="session-archive"
+              title="Archive (hide from list)"
+              @click.stop="archiveSession(s)"
+            >🗄️</button>
+          </li>
+          <li v-if="!recentSessions.length" class="session-empty muted">No sessions</li>
+        </ul>
+        <button v-if="hasMoreSessions" class="session-more" @click="showAllSessions = true">
+          More… ({{ activeSessions.length }})
+        </button>
+      </div>
+
+      <!-- All-sessions popup -->
+      <div v-if="showAllSessions" class="modal-overlay" @click.self="showAllSessions = false">
+        <div class="modal session-modal">
+          <div class="session-modal-head">
+            <h3>All sessions</h3>
+            <label class="show-archived">
+              <input type="checkbox" v-model="showArchived" /> Show archived
+            </label>
+          </div>
+          <ul class="session-modal-list">
+            <li
+              v-for="s in allSessionsSorted"
+              :key="s.id"
+              class="session-row"
+              :class="{ active: s.id === selectedSessionId }"
+            >
+              <button class="session-pick" @click="pickSession(s.id); showAllSessions = false">
+                <span class="session-name">
+                  {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}<span v-if="s.status === 'running'" class="run-dot">●</span>
+                </span>
+                <span v-if="s.archived" class="archived-tag">archived</span>
+              </button>
+              <button
+                v-if="!s.concierge"
+                class="session-archive"
+                :title="s.archived ? 'Unarchive' : 'Archive'"
+                @click.stop="archiveSession(s)"
+              >{{ s.archived ? '↩️' : '🗄️' }}</button>
+            </li>
+          </ul>
+          <div class="modal-actions">
+            <button class="secondary" @click="showAllSessions = false">Close</button>
+          </div>
+        </div>
       </div>
 
       <!-- New session modal -->
@@ -64,54 +121,7 @@
         </div>
       </div>
 
-      <ul class="nav-links">
-        <li>
-          <router-link to="/sessions" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">⚙</span> Sessions
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/chat" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">💬</span> Chat
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/bugs" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">🐛</span> Bugs
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/memories" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">🧠</span> Memories
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/panel" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">🎛️</span> Panel
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/schedules" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">⏰</span> Schedules
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/artifacts" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">📎</span> Artifacts
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/asks" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">❓</span> Asks
-            <span v-if="pendingAsks > 0" class="nav-badge">{{ pendingAsks }}</span>
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/timeline" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">📅</span> Timeline
-          </router-link>
-        </li>
-      </ul>
+      <div class="sidebar-spacer"></div>
 
       <!-- Notification panel: sessions awaiting a reply -->
       <div v-if="notifications.length" class="notif-panel">
@@ -134,9 +144,34 @@
           </li>
         </ul>
       </div>
+
+      <!-- Settings: global / cross-session sections -->
+      <div class="settings-footer">
+        <div v-if="settingsOpen" class="settings-menu">
+          <router-link
+            v-for="item in settingsItems"
+            :key="item.to"
+            :to="item.to"
+            class="settings-item"
+            active-class="active"
+            @click="onSettingsNav"
+          >
+            <span class="icon">{{ item.icon }}</span> {{ item.label }}
+            <span v-if="item.badge" class="nav-badge">{{ item.badge }}</span>
+          </router-link>
+        </div>
+        <button class="settings-btn" :class="{ open: settingsOpen }" @click="settingsOpen = !settingsOpen">
+          <span class="icon">⚙</span> Settings
+          <span v-if="pendingAsks > 0" class="nav-badge">{{ pendingAsks }}</span>
+          <span class="settings-caret">{{ settingsOpen ? '▾' : '▸' }}</span>
+        </button>
+      </div>
     </nav>
     <main class="content">
-      <router-view />
+      <SessionTabBar v-if="isSessionRoute" />
+      <div class="content-body">
+        <router-view />
+      </div>
     </main>
   </div>
 </template>
@@ -146,20 +181,73 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from './stores/session.js'
 import { api } from './api.js'
+import SessionTabBar from './components/SessionTabBar.vue'
 
 const route = useRoute()
 const router = useRouter()
 const sidebarOpen = ref(false)
 const { sessions, selectedSessionId, loadSessions } = useSessionStore()
-const activeSessions = computed(() => {
-  const list = sessions.value.filter(s => !s.archived)
-  // Pin the concierge to the top of the list.
+
+// Sort helper: concierge pinned to the top, then most-recently-active first.
+function byRecency(list) {
   return list.slice().sort((a, b) => {
     if (a.concierge && !b.concierge) return -1
     if (b.concierge && !a.concierge) return 1
-    return 0
+    return (b.last_active || 0) - (a.last_active || 0)
   })
+}
+
+const activeSessions = computed(() => byRecency(sessions.value.filter(s => !s.archived)))
+
+// How many sessions to show in the sidebar before "More…" (configurable).
+const SESSION_LIST_LIMIT = Number(localStorage.getItem('enclave_session_list_limit')) || 10
+const recentSessions = computed(() => activeSessions.value.slice(0, SESSION_LIST_LIMIT))
+const hasMoreSessions = computed(() => activeSessions.value.length > SESSION_LIST_LIMIT)
+
+// All-sessions popup
+const showAllSessions = ref(false)
+const showArchived = ref(false)
+const allSessionsSorted = computed(() => {
+  const list = showArchived.value ? sessions.value : sessions.value.filter(s => !s.archived)
+  return byRecency(list)
 })
+
+function pickSession(id) {
+  selectedSessionId.value = id
+  sidebarOpen.value = false
+  // If we're on a global/settings page, jump into the session's chat.
+  if (!isSessionRoute.value) router.push('/chat')
+}
+
+async function archiveSession(s) {
+  try {
+    await api.archiveSession(s.id)
+    await loadSessions()
+  } catch (e) {
+    console.error('Failed to archive session:', e)
+  }
+}
+
+// ─── Settings menu (global / cross-session sections) ───
+const settingsOpen = ref(false)
+const settingsItems = computed(() => [
+  { to: '/sessions', icon: '🗂️', label: 'Sessions' },
+  { to: '/memories', icon: '🧠', label: 'Memories' },
+  { to: '/panel', icon: '🎛️', label: 'Panel' },
+  { to: '/schedules', icon: '⏰', label: 'Schedules' },
+  { to: '/asks', icon: '❓', label: 'Asks', badge: pendingAsks.value || 0 },
+])
+function onSettingsNav() {
+  settingsOpen.value = false
+  sidebarOpen.value = false
+}
+
+// Routes that operate on the selected session (show the session tab bar).
+const SESSION_ROUTE_NAMES = new Set([
+  'chat', 'bugs', 'bug-detail', 'artifacts', 'artifact-preview', 'timeline', 'session-settings',
+])
+const isSessionRoute = computed(() => SESSION_ROUTE_NAMES.has(route.name))
+
 const isLoginPage = computed(() => route.name === 'login')
 const hasToken = ref(!!localStorage.getItem('enclave_token'))
 const pendingAsks = ref(0)
@@ -376,22 +464,171 @@ watch(isLoginPage, (isLogin) => {
   margin: 0;
 }
 
-.session-selector {
-  padding: 0.5rem 1rem;
+.session-list-section {
+  padding: 0.5rem 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 0.4rem;
-  align-items: center;
 }
 
-.session-select {
-  width: 100%;
-  font-size: 0.85rem;
-  padding: 0.4rem 0.5rem;
-  background: var(--bg-main);
-  color: var(--text-primary);
-  border: 1px solid var(--border);
+.session-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.session-list {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
   border-radius: var(--radius-sm, 4px);
+}
+
+.session-row:hover {
+  background: var(--bg-hover);
+}
+
+.session-row.active {
+  background: var(--bg-active);
+}
+
+.session-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  padding: 0.45rem 0.5rem;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.session-row.active .session-pick {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.session-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.run-dot {
+  color: #22c55e;
+  font-size: 0.6rem;
+}
+
+.session-archive {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.45rem;
+  opacity: 0;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+
+.session-row:hover .session-archive {
+  opacity: 0.7;
+}
+
+.session-archive:hover {
+  opacity: 1;
+}
+
+.session-empty {
+  padding: 0.45rem 0.5rem;
+  font-size: 0.82rem;
+}
+
+.session-more {
+  width: 100%;
+  margin-top: 0.35rem;
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.session-more:hover {
+  text-decoration: underline;
+}
+
+.session-modal {
+  width: 420px;
+  max-width: 92vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.session-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.session-modal-head h3 {
+  margin: 0;
+}
+
+.show-archived {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+}
+
+.session-modal-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.session-modal-list .session-pick {
+  justify-content: space-between;
+}
+
+.session-modal-list .session-archive {
+  opacity: 0.7;
+}
+
+.archived-tag {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 0.35rem;
+  margin-left: 0.4rem;
+}
+
+.sidebar-spacer {
+  flex: 1;
 }
 
 .new-session-btn {
@@ -541,7 +778,6 @@ watch(isLoginPage, (isLogin) => {
 }
 
 .notif-panel {
-  margin-top: auto;
   border-top: 1px solid var(--border);
   padding: 0.5rem 0;
   max-height: 40vh;
@@ -627,10 +863,79 @@ watch(isLoginPage, (isLogin) => {
 
 .content {
   flex: 1;
-  overflow-y: auto;
-  padding: 2rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--bg-main);
   min-width: 0;
+}
+
+.content-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 2rem;
+  min-height: 0;
+}
+
+/* ─── Settings footer ─── */
+.settings-footer {
+  border-top: 1px solid var(--border);
+  padding: 0.5rem;
+}
+
+.settings-menu {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0.35rem;
+}
+
+.settings-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.85rem;
+  border-radius: var(--radius-sm, 4px);
+}
+
+.settings-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.settings-item.active {
+  background: var(--bg-active);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.settings-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.6rem;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text-primary);
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+.settings-btn:hover {
+  background: var(--bg-hover);
+}
+
+.settings-btn.open {
+  color: var(--accent);
+}
+
+.settings-caret {
+  margin-left: auto;
+  font-size: 0.75rem;
 }
 
 /* ─── Mobile ─── */
@@ -720,9 +1025,12 @@ watch(isLoginPage, (isLogin) => {
   }
 
   .content {
-    padding: 1rem;
     flex: 1;
-    overflow-y: auto;
+    overflow: hidden;
+  }
+
+  .content-body {
+    padding: 1rem;
   }
 }
 </style>
