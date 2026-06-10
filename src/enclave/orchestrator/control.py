@@ -60,6 +60,10 @@ class ControlServer:
         # Global subscribers receiving cross-session notification events
         # (awaiting_input / deferred_ask) for the Web UI notification panel.
         self._notification_subscribers: set[asyncio.Queue[dict]] = set()
+        # Coarse per-session activity state (idle/thinking/tool/responding),
+        # broadcast on the global channel so the Web UI sidebar can show a live
+        # per-session indicator. Only re-broadcast on change to avoid spam.
+        self._activity_state: dict[str, str] = {}
 
     async def start(self) -> None:
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,10 +95,12 @@ class ControlServer:
 
     def notify_response(self, session_id: str, content: str) -> None:
         """Called by the router when an agent sends a response."""
+        self._set_activity(session_id, "responding")
         self._emit(session_id, {"ok": True, "type": "response", "content": content})
 
     def notify_delta(self, session_id: str, content: str) -> None:
         """Called by the router on streaming text delta."""
+        self._set_activity(session_id, "responding")
         self._emit(session_id, {"ok": True, "type": "delta", "content": content})
 
     def notify_thinking(self, session_id: str, content: str, phase: str = "delta") -> None:
@@ -102,14 +108,17 @@ class ControlServer:
 
         phase: "start" (new thinking block), "delta" (streaming update), "end" (finalized)
         """
+        self._set_activity(session_id, "thinking")
         self._emit(session_id, {"ok": True, "type": "thinking", "content": content, "phase": phase})
 
     def notify_tool_start(self, session_id: str, name: str, detail: str = "") -> None:
         """Called by the router when a tool starts executing."""
+        self._set_activity(session_id, "tool")
         self._emit(session_id, {"ok": True, "type": "tool_start", "name": name, "detail": detail})
 
     def notify_tool_complete(self, session_id: str, name: str, success: bool = True) -> None:
         """Called by the router when a tool finishes."""
+        self._set_activity(session_id, "thinking")
         self._emit(session_id, {"ok": True, "type": "tool_complete", "name": name, "success": success})
 
     def notify_activity(self, session_id: str, text: str) -> None:
@@ -162,6 +171,7 @@ class ControlServer:
         """Called by the router when an agent turn begins."""
         # A new turn means any previous "awaiting input" state is resolved.
         self._awaiting_input.pop(session_id, None)
+        self._set_activity(session_id, "thinking")
         self._emit(session_id, {"ok": True, "type": "turn_start"})
 
     def is_awaiting_input(self, session_id: str) -> bool:
@@ -195,6 +205,23 @@ class ControlServer:
         """Push a cross-session notification event to all global subscribers."""
         for q in list(self._notification_subscribers):
             q.put_nowait(event)
+
+    def _set_activity(self, session_id: str, state: str) -> None:
+        """Broadcast a coarse per-session activity state on change.
+
+        States: 'thinking' | 'tool' | 'responding' | 'idle'. Sent on the global
+        notification channel so the Web UI sidebar can show a per-session
+        spinning-cog / pulsing-brain indicator without subscribing to every
+        session's event stream.
+        """
+        if self._activity_state.get(session_id) == state:
+            return
+        self._activity_state[session_id] = state
+        self._emit_notification({
+            "type": "session_activity",
+            "session_id": session_id,
+            "state": state,
+        })
 
     def _workspace_base_for(self, session_id: str) -> Path | None:
         """Resolve the workspace_base for a session's event store, or None.
@@ -260,16 +287,18 @@ class ControlServer:
                 "awaiting_input": True,
             })
 
-        subs = self._subscribers.get(session_id)
-        if not subs:
-            return
-
+        # Debounce the idle transition (and the per-session turn_end event) so
+        # rapid multi-turn sequences don't flicker the activity indicator. This
+        # runs regardless of whether a per-session subscriber is attached, so the
+        # global sidebar indicator still returns to idle.
         def _fire() -> None:
             self._turn_end_timers.pop(session_id, None)
-            self._emit(session_id, {
-                "ok": True, "type": "turn_end",
-                "awaiting_input": awaiting_input,
-            })
+            self._set_activity(session_id, "idle")
+            if self._subscribers.get(session_id):
+                self._emit(session_id, {
+                    "ok": True, "type": "turn_end",
+                    "awaiting_input": awaiting_input,
+                })
 
         loop = asyncio.get_event_loop()
         self._turn_end_timers[session_id] = loop.call_later(2.0, _fire)

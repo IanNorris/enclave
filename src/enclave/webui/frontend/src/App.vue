@@ -37,7 +37,9 @@
           >
             <button class="session-pick" @click="pickSession(s.id)">
               <span class="status-icon" :class="rowState(s)">
-                <span v-if="isAwaiting(s.id)" class="q-flash">?</span>
+                <span v-if="rowState(s) === 'pending'" class="q-flash">?</span>
+                <span v-else-if="rowState(s) === 'tool'" class="act-cog">⚙</span>
+                <span v-else-if="rowState(s) === 'thinking'" class="act-brain">🧠</span>
                 <span v-else class="dot"></span>
               </span>
               <span class="session-name">{{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}</span>
@@ -74,7 +76,9 @@
             >
               <button class="session-pick" @click="pickSession(s.id); showAllSessions = false">
                 <span class="status-icon" :class="rowState(s)">
-                  <span v-if="isAwaiting(s.id)" class="q-flash">?</span>
+                  <span v-if="rowState(s) === 'pending'" class="q-flash">?</span>
+                  <span v-else-if="rowState(s) === 'tool'" class="act-cog">⚙</span>
+                  <span v-else-if="rowState(s) === 'thinking'" class="act-brain">🧠</span>
                   <span v-else class="dot"></span>
                 </span>
                 <span class="session-name">{{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}</span>
@@ -205,7 +209,11 @@ function isAwaiting(id) {
 }
 function rowState(s) {
   if (isAwaiting(s.id)) return 'pending'
-  return s.status === 'running' ? 'running' : 'stopped'
+  if (s.status !== 'running') return 'stopped'
+  const a = activityState.value[s.id]
+  if (a === 'tool') return 'tool'
+  if (a === 'thinking' || a === 'responding') return 'thinking'
+  return 'running'
 }
 
 async function archiveSession(s) {
@@ -244,6 +252,9 @@ const pendingAsks = ref(0)
 
 // ─── Notifications (sessions needing a reply) ───
 const notifications = ref([])
+// Coarse per-session activity state (thinking/tool/responding/idle) streamed
+// from the orchestrator's global channel, used to animate the sidebar rows.
+const activityState = ref({})
 const pushEnabled = ref(localStorage.getItem('enclave_push') === '1')
 let notifWs = null
 let notifReconnect = null
@@ -320,7 +331,16 @@ function connectNotifWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   try {
     notifWs = new WebSocket(`${proto}//${location.host}/api/notifications/stream?token=${token}`)
-    notifWs.onmessage = () => { loadNotifications() }
+    notifWs.onmessage = (ev) => {
+      let msg = null
+      try { msg = JSON.parse(ev.data) } catch { /* ignore */ }
+      if (msg && msg.type === 'session_activity') {
+        // Live per-session activity for the sidebar indicators.
+        activityState.value = { ...activityState.value, [msg.session_id]: msg.state }
+        return
+      }
+      loadNotifications()
+    }
     notifWs.onclose = () => {
       notifWs = null
       if (hasToken.value && !notifReconnect) {
@@ -524,6 +544,30 @@ watch(isLoginPage, (isLogin) => {
 
 .status-icon.running .dot {
   background: #22c55e;
+}
+
+.act-cog {
+  display: inline-block;
+  font-size: 0.95em;
+  line-height: 1;
+  animation: cogSpin 2.4s linear infinite;
+}
+
+.act-brain {
+  display: inline-block;
+  font-size: 0.9em;
+  line-height: 1;
+  animation: brainPulse 1.3s ease-in-out infinite;
+}
+
+@keyframes cogSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes brainPulse {
+  0%, 100% { transform: scale(0.85); opacity: 0.6; }
+  50% { transform: scale(1.1); opacity: 1; }
 }
 
 .status-icon.pending .q-flash {

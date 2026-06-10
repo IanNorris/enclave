@@ -646,6 +646,10 @@ onUnmounted(() => {
 watch(selectedSession, (newVal) => {
   if (ws) { ws.close(); ws = null }
   clearLiveState()
+  // Reset live activity so the previous session's state doesn't leak into the
+  // newly selected one (the indicator must be session-specific).
+  setAgentState('unknown')
+  sending.value = false
   docMenuOpen.value = false
   restoreOpenDoc()
   loadDraft(newVal)
