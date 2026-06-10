@@ -1536,6 +1536,7 @@ function formatTime(ts) {
 
 .message {
   max-width: 85%;
+  min-width: 0;
   border-radius: var(--radius);
   padding: 0.75rem 1rem;
 }
@@ -1715,6 +1716,8 @@ function formatTime(ts) {
 .message-body {
   font-size: 0.9rem;
   line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .message-body :deep(p) { margin: 0 0 0.5rem; }
