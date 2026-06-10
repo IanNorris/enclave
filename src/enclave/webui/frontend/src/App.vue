@@ -4,17 +4,9 @@
   </div>
   <div v-else class="app">
     <!-- Mobile header -->
-    <div class="mobile-header">
+    <div class="mobile-header" :class="{ 'mobile-hidden': isSessionRoute }">
       <button class="hamburger" @click="sidebarOpen = !sidebarOpen">☰</button>
       <span class="mobile-title">Enclave</span>
-      <!-- Session selector surfaced in the top bar while the sidebar is collapsed -->
-      <select v-model="selectedSessionId" class="mobile-session-select" aria-label="Active session">
-        <option value="">No session</option>
-        <option v-for="s in activeSessions" :key="s.id" :value="s.id">
-          {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
-        </option>
-      </select>
-      <button class="mobile-new-session-btn" title="New session" @click="openNewSession">➕</button>
     </div>
 
     <!-- Sidebar overlay for mobile -->
@@ -31,6 +23,12 @@
           <span>Sessions</span>
         </div>
         <ul class="session-list">
+          <li class="session-row new-row">
+            <button class="session-pick" @click="openNewSession">
+              <span class="status-icon"><span class="new-glyph">＋</span></span>
+              <span class="session-name">New session…</span>
+            </button>
+          </li>
           <li
             v-for="s in recentSessions"
             :key="s.id"
@@ -52,12 +50,6 @@
             >🗄️</button>
           </li>
           <li v-if="!recentSessions.length" class="session-empty muted">No sessions</li>
-          <li class="session-row new-row">
-            <button class="session-pick" @click="openNewSession">
-              <span class="status-icon"><span class="new-glyph">＋</span></span>
-              <span class="session-name">New session…</span>
-            </button>
-          </li>
         </ul>
         <button v-if="hasMoreSessions" class="session-more" @click="showAllSessions = true">
           More… ({{ activeSessions.length }})
@@ -132,28 +124,6 @@
 
       <div class="sidebar-spacer"></div>
 
-      <!-- Notification panel: sessions awaiting a reply -->
-      <div v-if="notifications.length" class="notif-panel">
-        <div class="notif-header">
-          <span>🔔 Needs reply</span>
-          <button
-            class="notif-toggle"
-            :title="pushEnabled ? 'Disable browser notifications' : 'Enable browser notifications'"
-            @click="togglePush"
-          >{{ pushEnabled ? '🔔' : '🔕' }}</button>
-        </div>
-        <ul class="notif-list">
-          <li v-for="n in notifications" :key="n.session_id" class="notif-item">
-            <div class="notif-body" @click="openNotification(n)">
-              <div class="notif-name">{{ n.session_name }}</div>
-              <div class="notif-reason">{{ notifReason(n) }}</div>
-              <div v-if="n.question" class="notif-q">{{ n.question }}</div>
-            </div>
-            <button class="notif-dismiss" title="Dismiss" @click.stop="dismissNotification(n)">✕</button>
-          </li>
-        </ul>
-      </div>
-
       <!-- Settings: global / cross-session sections -->
       <div class="settings-footer">
         <div v-if="settingsOpen" class="settings-menu">
@@ -172,12 +142,11 @@
         <button class="settings-btn" :class="{ open: settingsOpen }" @click="settingsOpen = !settingsOpen">
           <span class="icon">⚙</span> Settings
           <span v-if="pendingAsks > 0" class="nav-badge">{{ pendingAsks }}</span>
-          <span class="settings-caret">{{ settingsOpen ? '▾' : '▸' }}</span>
         </button>
       </div>
     </nav>
     <main class="content">
-      <SessionTabBar v-if="isSessionRoute" />
+      <SessionTabBar v-if="isSessionRoute" @toggle-sidebar="sidebarOpen = !sidebarOpen" />
       <div class="content-body" :class="{ 'content-flush': isChatRoute }">
         <router-view />
       </div>
@@ -511,6 +480,7 @@ watch(isLoginPage, (isLogin) => {
   display: flex;
   align-items: center;
   border-radius: var(--radius-sm, 4px);
+  position: relative;
 }
 
 .session-row:hover {
@@ -605,18 +575,23 @@ watch(isLoginPage, (isLogin) => {
 }
 
 .session-archive {
-  background: none;
+  position: absolute;
+  right: 0.2rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-hover);
   border: none;
+  border-radius: 4px;
   cursor: pointer;
-  font-size: 0.85rem;
-  padding: 0.3rem 0.45rem;
+  font-size: 0.9rem;
+  padding: 0.25rem 0.4rem;
   opacity: 0;
   flex-shrink: 0;
   transition: opacity 0.15s;
 }
 
 .session-row:hover .session-archive {
-  opacity: 0.7;
+  opacity: 0.85;
 }
 
 .session-archive:hover {
@@ -682,10 +657,6 @@ watch(isLoginPage, (isLogin) => {
 
 .session-modal-list .session-pick {
   justify-content: space-between;
-}
-
-.session-modal-list .session-archive {
-  opacity: 0.7;
 }
 
 .archived-tag {
@@ -995,25 +966,19 @@ watch(isLoginPage, (isLogin) => {
   align-items: center;
   gap: 0.6rem;
   padding: 0.55rem 0.6rem;
-  background: var(--bg-main);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm, 4px);
-  color: var(--text-primary);
-  font-size: 0.88rem;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
   cursor: pointer;
 }
 
 .settings-btn:hover {
-  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 .settings-btn.open {
   color: var(--accent);
-}
-
-.settings-caret {
-  margin-left: auto;
-  font-size: 0.75rem;
 }
 
 /* ─── Mobile ─── */
@@ -1032,6 +997,12 @@ watch(isLoginPage, (isLogin) => {
     z-index: 60;
   }
 
+  /* On session routes the tab bar carries its own hamburger, so the
+     standalone mobile header is redundant. */
+  .mobile-header.mobile-hidden {
+    display: none;
+  }
+
   .hamburger {
     background: none;
     border: none;
@@ -1045,33 +1016,6 @@ watch(isLoginPage, (isLogin) => {
     font-size: 1.1rem;
     font-weight: 600;
     color: var(--text-primary);
-  }
-
-  .mobile-session-select {
-    margin-left: auto;
-    max-width: 55vw;
-    font-size: 0.85rem;
-    padding: 0.35rem 0.5rem;
-    background: var(--bg-main);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
-  }
-
-  .mobile-new-session-btn {
-    flex-shrink: 0;
-    width: 2rem;
-    height: 2rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.95rem;
-    line-height: 1;
-    background: var(--bg-main);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
-    cursor: pointer;
   }
 
   .sidebar {

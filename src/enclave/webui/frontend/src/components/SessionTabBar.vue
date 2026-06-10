@@ -2,6 +2,7 @@
   <div class="session-tabbar" v-if="selectedSessionId">
     <!-- Left: tabs (desktop) / dropdown (mobile) -->
     <div class="tabbar-left">
+      <button class="tabbar-hamburger" @click="$emit('toggle-sidebar')" title="Menu">☰</button>
       <nav class="tabs" role="tablist">
         <router-link
           v-for="t in tabs"
@@ -48,6 +49,8 @@ import { computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '../stores/session.js'
 import { useModels } from '../composables/useModels.js'
+
+defineEmits(['toggle-sidebar'])
 
 const route = useRoute()
 const router = useRouter()
@@ -211,7 +214,21 @@ watch(selectedSessionId, (id) => {
   cursor: default;
 }
 
+.tabbar-hamburger {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 1.3rem;
+  cursor: pointer;
+  padding: 0 0.25rem;
+  flex-shrink: 0;
+}
+
 @media (max-width: 768px) {
+  .tabbar-hamburger {
+    display: inline-flex;
+  }
   .tabs {
     display: none;
   }
@@ -219,10 +236,12 @@ watch(selectedSessionId, (id) => {
     display: block;
   }
   .ai-credits {
-    display: none;
+    display: inline;
+    font-size: 0.7rem;
+    max-width: 8rem;
   }
   .model-select {
-    max-width: 130px;
+    max-width: 110px;
   }
 }
 </style>
