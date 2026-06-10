@@ -8,8 +8,8 @@
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
 
-      <!-- Artifacts grip handle on the right edge -->
-      <div class="doc-tools">
+      <!-- Artifacts grip handle (right edge on desktop, top edge on mobile) -->
+      <div class="doc-tools" :class="{ 'mobile-portrait': isMobilePortrait }">
         <button
           v-if="docPanelOpen && !isMobilePortrait"
           class="doc-orient-btn"
@@ -1437,6 +1437,35 @@ function formatTime(ts) {
 
 .doc-grip.open .grip-dots {
   background-image: radial-gradient(var(--accent) 1px, transparent 1.2px);
+}
+
+/* Mobile portrait: the panel pulls down from the top, so the grip sits at the
+   top-center and is a larger, easier tap target with a horizontal grip glyph. */
+.doc-tools.mobile-portrait {
+  top: 0;
+  right: auto;
+  left: 50%;
+  transform: translateX(-50%);
+  flex-direction: row;
+  align-items: flex-start;
+}
+
+.doc-tools.mobile-portrait .doc-grip {
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 10px 10px;
+  padding: 0.7rem 1.4rem;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+}
+
+.doc-tools.mobile-portrait .grip-dots {
+  width: 28px;
+  height: 6px;
+  background-size: 5px 3px;
+}
+
+.doc-tools.mobile-portrait .doc-orient-btn {
+  display: none;
 }
 
 .doc-orient-btn {
