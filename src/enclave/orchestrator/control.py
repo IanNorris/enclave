@@ -206,6 +206,33 @@ class ControlServer:
         for q in list(self._notification_subscribers):
             q.put_nowait(event)
 
+    def notify_major_reply(self, session_id: str, text: str) -> None:
+        """Broadcast a "major reply" (agent response / structured update) on the
+        global notification channel.
+
+        These mirror the "major events" forwarded to Matrix, so the Android
+        client can post a per-session notification (keeping only the latest per
+        session) without subscribing to every session's event stream. The Web UI
+        ignores this event type.
+        """
+        name = session_id
+        try:
+            sess = self._router.sessions.get_session(session_id)
+            if sess and getattr(sess, "name", None):
+                name = sess.name
+        except Exception:
+            pass
+        snippet = (text or "").strip()
+        if len(snippet) > 280:
+            snippet = snippet[:279] + "\u2026"
+        self._emit_notification({
+            "type": "major_reply",
+            "session_id": session_id,
+            "session_name": name,
+            "text": snippet,
+            "ts": __import__("time").time(),
+        })
+
     def _set_activity(self, session_id: str, state: str) -> None:
         """Broadcast a coarse per-session activity state on change.
 

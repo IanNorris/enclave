@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Trust the system CAs plus the Enclave server's own CA so both the
+         WebView and the OkHttp notification socket accept the self-signed
+         server certificate. Since Android 7 the WebView honours this config. -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/enclave_ca" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

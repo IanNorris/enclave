@@ -339,6 +339,10 @@ function connectNotifWs() {
         activityState.value = { ...activityState.value, [msg.session_id]: msg.state }
         return
       }
+      if (msg && msg.type === 'major_reply') {
+        // Consumed by the Android client only; no browser-side action.
+        return
+      }
       loadNotifications()
     }
     notifWs.onclose = () => {
