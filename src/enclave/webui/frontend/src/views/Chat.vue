@@ -8,27 +8,20 @@
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
 
-      <!-- Artifacts handle on the right edge -->
+      <!-- Artifacts grip handle on the right edge -->
       <div class="doc-tools">
         <button
-          v-if="openDoc && !isMobilePortrait"
+          v-if="docPanelOpen && !isMobilePortrait"
           class="doc-orient-btn"
           :title="outerOrientation === 'horizontal' ? 'Stack vertically' : 'Place side by side'"
           @click="toggleOuterOrientation"
         >{{ outerOrientation === 'horizontal' ? '⬍' : '⬌' }}</button>
-        <div class="doc-menu-wrap">
-          <button class="doc-handle" @click="toggleDocMenu" title="Open a document beside the chat">📄</button>
-          <div v-if="docMenuOpen" class="doc-menu">
-            <div v-if="!docList.length" class="doc-menu-empty muted">No editable documents</div>
-            <button
-              v-for="d in docList"
-              :key="d.filename"
-              class="doc-menu-item"
-              :class="{ active: d.filename === openDoc }"
-              @click="openDocument(d.filename)"
-            >{{ d.title || d.filename }}</button>
-          </div>
-        </div>
+        <button
+          class="doc-grip"
+          :class="{ open: docPanelOpen }"
+          :title="docPanelOpen ? 'Close document panel' : 'Open documents'"
+          @click="toggleDocPanel"
+        ><span class="grip-dots"></span></button>
       </div>
 
       <!-- Drop overlay -->
@@ -308,13 +301,14 @@
         <button class="primary" @click="send" :disabled="(!draft.trim() && !pendingFiles.length) || sending">Send</button>
       </div>
       </div>
-      <template v-if="openDoc">
+      <template v-if="docPanelOpen">
         <div
           class="outer-divider"
           :class="outerOrientation"
           @pointerdown="startOuterDrag"
         ><div class="divider-grip"></div></div>
         <DocumentPane
+          v-if="openDoc"
           class="outer-doc"
           :style="docPaneStyle"
           :session="selectedSession"
@@ -323,6 +317,22 @@
           :refresh-tick="docRefreshTick"
           @close="closeDoc"
         />
+        <div v-else class="outer-doc doc-list-panel" :style="docPaneStyle">
+          <div class="doc-list-head">
+            <span>Documents</span>
+            <button class="doc-panel-close" title="Close" @click="closeDocPanel">✕</button>
+          </div>
+          <div v-if="!docList.length" class="doc-list-empty muted">No editable documents in this session.</div>
+          <button
+            v-for="d in docList"
+            :key="d.filename"
+            class="doc-list-item"
+            @click="openDocument(d.filename)"
+          >
+            <span class="doc-list-title">{{ d.title || d.filename }}</span>
+            <span v-if="d.title" class="doc-list-file">{{ d.filename }}</span>
+          </button>
+        </div>
       </template>
     </div>
     <div v-else class="empty-state">
@@ -403,7 +413,7 @@ const router = useRouter()
 const EDITABLE_DOC_RE = /\.(md|txt|json|yaml|yml|csv|log)$/i
 const openDoc = ref('')
 const docList = ref([])
-const docMenuOpen = ref(false)
+const docPanelOpen = ref(false)
 const outerOrientation = ref(localStorage.getItem('enclave_outer_orientation') || 'horizontal')
 const outerSize = ref(parseFloat(localStorage.getItem('enclave_outer_size')) || 58) // % for chat pane
 const isMobilePortrait = ref(false)
@@ -411,15 +421,15 @@ const docRefreshTick = ref(0) // bumped on agent activity → DocumentPane re-ch
 let _mqlPortrait = null
 
 const bodyClass = computed(() => {
-  if (isMobilePortrait.value && openDoc.value) return 'mobile-portrait'
-  return openDoc.value ? outerOrientation.value : 'no-doc'
+  if (isMobilePortrait.value && docPanelOpen.value) return 'mobile-portrait'
+  return docPanelOpen.value ? outerOrientation.value : 'no-doc'
 })
 const chatPaneStyle = computed(() => {
-  if (!openDoc.value || isMobilePortrait.value) return {}
+  if (!docPanelOpen.value || isMobilePortrait.value) return {}
   return { flexBasis: `${outerSize.value}%` }
 })
 const docPaneStyle = computed(() => {
-  if (!openDoc.value || isMobilePortrait.value) return {}
+  if (!docPanelOpen.value || isMobilePortrait.value) return {}
   return { flexBasis: `${100 - outerSize.value}%` }
 })
 
@@ -432,16 +442,23 @@ async function loadDocList() {
     docList.value = (arts || []).filter(a => EDITABLE_DOC_RE.test(a.filename))
   } catch { docList.value = [] }
 }
-function toggleDocMenu() {
-  docMenuOpen.value = !docMenuOpen.value
-  if (docMenuOpen.value) loadDocList()
+function toggleDocPanel() {
+  docPanelOpen.value = !docPanelOpen.value
+  if (docPanelOpen.value) loadDocList()
 }
 function openDocument(filename) {
   openDoc.value = filename
-  docMenuOpen.value = false
+  docPanelOpen.value = true
   if (selectedSession.value) localStorage.setItem(docStorageKey(selectedSession.value), filename)
 }
 function closeDoc() {
+  // Return to the document list within the open panel.
+  openDoc.value = ''
+  if (selectedSession.value) localStorage.removeItem(docStorageKey(selectedSession.value))
+  loadDocList()
+}
+function closeDocPanel() {
+  docPanelOpen.value = false
   openDoc.value = ''
   if (selectedSession.value) localStorage.removeItem(docStorageKey(selectedSession.value))
 }
@@ -475,12 +492,13 @@ function startOuterDrag(e) {
 function restoreOpenDoc() {
   // Deep-link (?doc=) takes priority, else the last-open doc for this session.
   const q = route.query.doc
-  if (typeof q === 'string' && q) { openDoc.value = q; return }
+  if (typeof q === 'string' && q) { openDoc.value = q; docPanelOpen.value = true; return }
   if (selectedSession.value) {
     openDoc.value = localStorage.getItem(docStorageKey(selectedSession.value)) || ''
   } else {
     openDoc.value = ''
   }
+  if (openDoc.value) docPanelOpen.value = true
 }
 
 watch(() => route.query.doc, (d) => {
@@ -650,7 +668,7 @@ watch(selectedSession, (newVal) => {
   // newly selected one (the indicator must be session-specific).
   setAgentState('unknown')
   sending.value = false
-  docMenuOpen.value = false
+  docPanelOpen.value = false
   restoreOpenDoc()
   loadDraft(newVal)
   if (newVal) { loadHistory(); loadDocList() }
@@ -1389,20 +1407,36 @@ function formatTime(ts) {
   align-items: flex-end;
 }
 
-.doc-handle {
+.doc-grip {
   background: var(--bg-sidebar);
   border: 1px solid var(--border);
   border-right: none;
   border-radius: 8px 0 0 8px;
   cursor: pointer;
-  padding: 0.6rem 0.4rem;
-  font-size: 1.1rem;
-  line-height: 1;
+  padding: 0.7rem 0.45rem;
+  line-height: 0;
   box-shadow: -1px 0 4px rgba(0,0,0,0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.doc-handle:hover {
+.doc-grip:hover {
   background: var(--bg-hover);
+}
+
+/* The grip glyph: two columns of dots, like a drag handle. */
+.grip-dots {
+  width: 6px;
+  height: 22px;
+  background-image: radial-gradient(var(--text-secondary) 1px, transparent 1.2px);
+  background-size: 3px 5px;
+  background-repeat: repeat;
+  opacity: 0.8;
+}
+
+.doc-grip.open .grip-dots {
+  background-image: radial-gradient(var(--accent) 1px, transparent 1.2px);
 }
 
 .doc-orient-btn {
@@ -1414,6 +1448,64 @@ function formatTime(ts) {
   padding: 0.5rem 0.4rem;
   font-size: 1rem;
   line-height: 1;
+}
+
+/* Document list shown inside the side panel before a doc is picked. */
+.doc-list-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card, #1e1e24);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.doc-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.doc-panel-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.doc-panel-close:hover { color: var(--text-primary); }
+
+.doc-list-empty {
+  padding: 1rem;
+  font-size: 0.85rem;
+}
+
+.doc-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  text-align: left;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: inherit;
+  cursor: pointer;
+  padding: 0.7rem 1rem;
+}
+
+.doc-list-item:hover { background: var(--bg-hover); }
+
+.doc-list-title { font-size: 0.9rem; }
+
+.doc-list-file {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
 }
 
 .chat-header {

@@ -409,7 +409,21 @@ async function pollAskCount() {
 let askPollTimer = null
 
 // Only load sessions when authenticated and not on login page
+// Keep the app height locked to the *visible* viewport so the on-screen
+// keyboard (Android) shrinks the layout instead of hiding the input bar.
+function applyViewportHeight() {
+  const vv = window.visualViewport
+  const h = vv ? vv.height : window.innerHeight
+  document.documentElement.style.setProperty('--app-height', `${Math.round(h)}px`)
+}
+
 onMounted(() => {
+  applyViewportHeight()
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', applyViewportHeight)
+    window.visualViewport.addEventListener('scroll', applyViewportHeight)
+  }
+  window.addEventListener('resize', applyViewportHeight)
   if (!isLoginPage.value && hasToken.value) {
     loadSessions()
     pollAskCount()
@@ -420,6 +434,11 @@ onMounted(() => {
   }
 })
 onUnmounted(() => {
+  if (window.visualViewport) {
+    window.visualViewport.removeEventListener('resize', applyViewportHeight)
+    window.visualViewport.removeEventListener('scroll', applyViewportHeight)
+  }
+  window.removeEventListener('resize', applyViewportHeight)
   if (askPollTimer) clearInterval(askPollTimer)
   if (notifPollTimer) clearInterval(notifPollTimer)
   if (notifReconnect) clearTimeout(notifReconnect)
@@ -441,7 +460,7 @@ watch(isLoginPage, (isLogin) => {
 <style scoped>
 .app {
   display: flex;
-  height: 100vh;
+  height: var(--app-height, 100vh);
 }
 
 .mobile-header {
