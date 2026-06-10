@@ -168,7 +168,11 @@ def persist_event(
     to debug. Pass ``swallow=False`` to propagate the exception.
     """
     event_type = event.get("type", "")
-    if event_type not in PERSIST_TYPES:
+    # Thinking blocks stream as start/delta/end; only the finalized "end" event
+    # (full content) is persisted so reloads show reasoning in history without
+    # flooding the store with per-token deltas.
+    is_thinking_end = event_type == "thinking" and event.get("phase") == "end"
+    if event_type not in PERSIST_TYPES and not is_thinking_end:
         return False
     try:
         store = get_event_store(workspace_base, session_id)

@@ -31,6 +31,8 @@ class ScheduleEntry:
     interval_seconds: int
     reason: str
     next_fire: float  # Unix timestamp
+    target: str = "session"  # "session" | "concierge" | "spawn"
+    spawn_brief: str = ""  # initial brief when target == "spawn"
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -51,6 +53,8 @@ class TimerEntry:
     session_id: str
     fire_at: float  # Unix timestamp
     reason: str
+    target: str = "session"  # "session" | "concierge" | "spawn"
+    spawn_brief: str = ""  # initial brief when target == "spawn"
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -88,6 +92,8 @@ class Scheduler:
         session_id: str,
         interval_seconds: int,
         reason: str,
+        target: str = "session",
+        spawn_brief: str = "",
     ) -> ScheduleEntry | str:
         """Register a recurring schedule. Returns entry or error string."""
         if interval_seconds < MIN_CRON_INTERVAL:
@@ -102,12 +108,14 @@ class Scheduler:
             interval_seconds=interval_seconds,
             reason=reason,
             next_fire=time.time() + interval_seconds,
+            target=target,
+            spawn_brief=spawn_brief,
         )
         self._schedules[schedule_id] = entry
         self._save()
         log.info(
-            "Schedule added: %s (session=%s, interval=%ds, reason=%s)",
-            schedule_id, session_id, interval_seconds, reason,
+            "Schedule added: %s (session=%s, target=%s, interval=%ds, reason=%s)",
+            schedule_id, session_id, target, interval_seconds, reason,
         )
         return entry
 
@@ -126,6 +134,8 @@ class Scheduler:
         session_id: str,
         fire_at: float,
         reason: str,
+        target: str = "session",
+        spawn_brief: str = "",
     ) -> TimerEntry | str:
         """Register a one-shot timer. fire_at is a Unix timestamp."""
         if fire_at <= time.time():
@@ -136,6 +146,8 @@ class Scheduler:
             session_id=session_id,
             fire_at=fire_at,
             reason=reason,
+            target=target,
+            spawn_brief=spawn_brief,
         )
         self._timers[timer_id] = entry
         self._save()

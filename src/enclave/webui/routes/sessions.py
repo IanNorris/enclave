@@ -133,6 +133,7 @@ def _discover_sessions(request: Request) -> list[dict[str, Any]]:
             "status": "running" if is_running else "stopped",
             "archived": archived,
             "workspace": str(entry),
+            "concierge": session_id == "__concierge__",
         }
 
         # Include ACP remote info if present
@@ -677,6 +678,101 @@ async def register_artifact(request: Request, session_id: str, body: ArtifactReg
     return {"registered": True, "filename": body.filename}
 
 
+class ArtifactSave(BaseModel):
+    content: str
+    base_version: int | None = None
+
+
+_EDITABLE_EXTS = (".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log")
+
+
+@router.put("/{session_id}/artifacts/{filename:path}/content")
+async def save_artifact_content(
+    request: Request, session_id: str, filename: str, body: ArtifactSave,
+):
+    """Save edited content for a registered text artifact.
+
+    Versions the previous content to ``{stem}.v{version}{ext}`` (so the prior
+    revision stays diff-able — both in the UI and by the agent, which sees these
+    backups under ``/workspace/artifacts/``), then bumps the manifest version.
+
+    Uses optimistic concurrency: pass ``base_version`` (the version the editor
+    loaded). If it no longer matches the current manifest version (e.g. the agent
+    rewrote the file meanwhile), the save is rejected with ``409`` so the client
+    can reload or force-overwrite.
+    """
+    if not filename.lower().endswith(_EDITABLE_EXTS):
+        raise HTTPException(status_code=400, detail="Artifact type is not editable")
+
+    art_dir = _artifacts_dir(request, session_id)
+    target = art_dir / filename
+
+    # Security: prevent traversal
+    try:
+        target.resolve().relative_to(art_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+
+    entries = _read_manifest(request, session_id)
+    existing = next((e for e in entries if e["filename"] == filename), None)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Artifact not registered")
+
+    version = existing.get("version", 1)
+    if body.base_version is not None and body.base_version != version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Artifact changed since it was loaded",
+                "current_version": version,
+            },
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Preserve the current on-disk content as a versioned backup before we
+    # overwrite it (mirrors register_artifact's existing-entry branch).
+    if target.exists():
+        stem = Path(filename).stem
+        ext = Path(filename).suffix
+        versioned_name = f"{stem}.v{version}{ext}"
+        versioned_path = art_dir / versioned_name
+        if not versioned_path.exists():
+            shutil.copy2(str(target), str(versioned_path))
+
+        versions = existing.get("versions", [])
+        old_size = target.stat().st_size
+        if not versions:
+            versions.append({
+                "version": 1,
+                "created": existing.get("created", now),
+                "size": existing.get("size", old_size),
+            })
+        if version > 1:
+            versions.append({
+                "version": version,
+                "created": existing.get("updated", now),
+                "size": old_size,
+            })
+        existing["versions"] = versions
+
+    # Write the new content.
+    target.write_text(body.content, encoding="utf-8")
+
+    existing.update({
+        "version": version + 1,
+        "updated": now,
+        "size": target.stat().st_size,
+    })
+    _write_manifest(request, session_id, entries)
+    return {
+        "filename": filename,
+        "version": existing["version"],
+        "size": existing["size"],
+        "updated": now,
+    }
+
+
 @router.get("/{session_id}/artifacts/{filename:path}/versions")
 async def get_artifact_versions(request: Request, session_id: str, filename: str):
     """List version history for an artifact."""
@@ -749,11 +845,17 @@ async def get_artifact(
     session_id: str,
     filename: str,
     token: str = Query(None),
+    raw: bool = Query(False),
 ):
     """Serve an artifact file.
 
     Auth via ``?token=`` query parameter so that ``<a href>`` and
     ``window.open()`` links work without JavaScript fetch.
+
+    By default text files are returned as a JSON envelope
+    (``{filename, content, encoding}``) for the in-app viewer. Pass ``?raw=1``
+    to get the file served directly with its proper content type, so opening
+    the link in a browser renders/plays the file instead of showing JSON.
     """
     if token:
         validate_token(token)
@@ -778,16 +880,27 @@ async def get_artifact(
     if not target.exists():
         raise HTTPException(status_code=404, detail="Artifact not found")
 
-    # For text files, return content as JSON
-    if filename.endswith(('.md', '.txt', '.json', '.yaml', '.yml', '.csv', '.log')):
+    # For text files, return content as JSON for the in-app viewer, unless the
+    # caller asked for the raw bytes (e.g. opening the link in a new tab).
+    if not raw and filename.endswith(('.md', '.txt', '.json', '.yaml', '.yml', '.csv', '.log')):
         try:
             content = target.read_text(encoding="utf-8")
             return {"filename": filename, "content": content, "encoding": "utf-8"}
         except UnicodeDecodeError:
             pass
 
-    # For images and binary files, serve directly
+    # Serve the file directly with an appropriate content type.
     import mimetypes
-    ct = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    _TEXT_TYPES = {
+        ".md": "text/markdown; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+        ".log": "text/plain; charset=utf-8",
+        ".csv": "text/csv; charset=utf-8",
+        ".yaml": "text/plain; charset=utf-8",
+        ".yml": "text/plain; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+    }
+    ext = Path(filename).suffix.lower()
+    ct = _TEXT_TYPES.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return FileResponse(target, media_type=ct)
 

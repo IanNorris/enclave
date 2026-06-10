@@ -179,6 +179,14 @@ class MimirConfig:
 
 
 @dataclass
+class ConciergeConfig:
+    """Configuration for the always-on concierge agent."""
+
+    enabled: bool = True
+    profile: str = ""  # container profile (empty = container.default_profile)
+
+
+@dataclass
 class EnclaveConfig:
     """Top-level Enclave configuration."""
 
@@ -186,6 +194,7 @@ class EnclaveConfig:
     container: ContainerConfig = field(default_factory=ContainerConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     mimir: MimirConfig = field(default_factory=MimirConfig)
+    concierge: "ConciergeConfig" = field(default_factory=lambda: ConciergeConfig())
     approval_timeout: float = 300.0  # 5 minute approval timeout
     users: list[UserMapping] = field(default_factory=list)
     log_level: str = "INFO"
@@ -361,6 +370,13 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
         config.data_dir = data.get("data_dir", config.data_dir)
         config.idle_timeout = data.get("idle_timeout", config.idle_timeout)
         config.approval_timeout = data.get("approval_timeout", config.approval_timeout)
+
+        if "concierge" in data:
+            cc = data["concierge"] or {}
+            config.concierge = ConciergeConfig(
+                enabled=cc.get("enabled", config.concierge.enabled),
+                profile=cc.get("profile", config.concierge.profile),
+            )
 
     _apply_env_overrides(config)
     return config

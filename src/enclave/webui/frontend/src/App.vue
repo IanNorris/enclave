@@ -11,7 +11,7 @@
       <select v-model="selectedSessionId" class="mobile-session-select" aria-label="Active session">
         <option value="">No session</option>
         <option v-for="s in activeSessions" :key="s.id" :value="s.id">
-          {{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
+          {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
         </option>
       </select>
       <button class="mobile-new-session-btn" title="New session" @click="openNewSession">➕</button>
@@ -30,7 +30,7 @@
         <select v-model="selectedSessionId" class="session-select">
           <option value="">No session</option>
           <option v-for="s in activeSessions" :key="s.id" :value="s.id">
-            {{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
+            {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
           </option>
         </select>
         <button class="new-session-btn" title="New session" @click="openNewSession">➕</button>
@@ -91,6 +91,11 @@
           </router-link>
         </li>
         <li>
+          <router-link to="/schedules" active-class="active" @click="sidebarOpen = false">
+            <span class="icon">⏰</span> Schedules
+          </router-link>
+        </li>
+        <li>
           <router-link to="/artifacts" active-class="active" @click="sidebarOpen = false">
             <span class="icon">📎</span> Artifacts
           </router-link>
@@ -107,6 +112,28 @@
           </router-link>
         </li>
       </ul>
+
+      <!-- Notification panel: sessions awaiting a reply -->
+      <div v-if="notifications.length" class="notif-panel">
+        <div class="notif-header">
+          <span>🔔 Needs reply</span>
+          <button
+            class="notif-toggle"
+            :title="pushEnabled ? 'Disable browser notifications' : 'Enable browser notifications'"
+            @click="togglePush"
+          >{{ pushEnabled ? '🔔' : '🔕' }}</button>
+        </div>
+        <ul class="notif-list">
+          <li v-for="n in notifications" :key="n.session_id" class="notif-item">
+            <div class="notif-body" @click="openNotification(n)">
+              <div class="notif-name">{{ n.session_name }}</div>
+              <div class="notif-reason">{{ notifReason(n) }}</div>
+              <div v-if="n.question" class="notif-q">{{ n.question }}</div>
+            </div>
+            <button class="notif-dismiss" title="Dismiss" @click.stop="dismissNotification(n)">✕</button>
+          </li>
+        </ul>
+      </div>
     </nav>
     <main class="content">
       <router-view />
@@ -124,10 +151,107 @@ const route = useRoute()
 const router = useRouter()
 const sidebarOpen = ref(false)
 const { sessions, selectedSessionId, loadSessions } = useSessionStore()
-const activeSessions = computed(() => sessions.value.filter(s => !s.archived))
+const activeSessions = computed(() => {
+  const list = sessions.value.filter(s => !s.archived)
+  // Pin the concierge to the top of the list.
+  return list.slice().sort((a, b) => {
+    if (a.concierge && !b.concierge) return -1
+    if (b.concierge && !a.concierge) return 1
+    return 0
+  })
+})
 const isLoginPage = computed(() => route.name === 'login')
 const hasToken = ref(!!localStorage.getItem('enclave_token'))
 const pendingAsks = ref(0)
+
+// ─── Notifications (sessions needing a reply) ───
+const notifications = ref([])
+const pushEnabled = ref(localStorage.getItem('enclave_push') === '1')
+let notifWs = null
+let notifReconnect = null
+let notifPollTimer = null
+const knownAwaiting = new Set()
+
+function notifReason(n) {
+  const r = n.reasons || []
+  if (r.includes('awaiting') && r.includes('deferred_ask')) return 'Awaiting reply + question'
+  if (r.includes('deferred_ask')) return n.ask_count > 1 ? `${n.ask_count} questions` : 'Has a question'
+  return 'Awaiting your reply'
+}
+
+async function loadNotifications() {
+  if (!hasToken.value) return
+  try {
+    const data = await api.getNotifications()
+    notifications.value = data.notifications || []
+    maybePush(notifications.value)
+  } catch { /* ignore */ }
+}
+
+function openNotification(n) {
+  selectedSessionId.value = n.session_id
+  sidebarOpen.value = false
+  router.push('/chat')
+}
+
+async function dismissNotification(n) {
+  try {
+    await api.dismissNotification(n.session_id)
+  } catch { /* ignore */ }
+  notifications.value = notifications.value.filter(x => x.session_id !== n.session_id)
+  knownAwaiting.delete(n.session_id)
+}
+
+function maybePush(list) {
+  if (!pushEnabled.value || Notification?.permission !== 'granted') return
+  for (const n of list) {
+    if (knownAwaiting.has(n.session_id)) continue
+    knownAwaiting.add(n.session_id)
+    if (document.visibilityState === 'visible') continue
+    try {
+      const note = new Notification(`${n.session_name} needs your reply`, {
+        body: n.question || notifReason(n),
+        tag: `enclave-${n.session_id}`,
+      })
+      note.onclick = () => { window.focus(); openNotification(n) }
+    } catch { /* ignore */ }
+  }
+  // Forget sessions that no longer need a reply, so they can re-notify later.
+  const ids = new Set(list.map(n => n.session_id))
+  for (const id of [...knownAwaiting]) if (!ids.has(id)) knownAwaiting.delete(id)
+}
+
+async function togglePush() {
+  if (!pushEnabled.value) {
+    if (Notification?.permission === 'default') {
+      try { await Notification.requestPermission() } catch { /* ignore */ }
+    }
+    if (Notification?.permission === 'granted') {
+      pushEnabled.value = true
+      localStorage.setItem('enclave_push', '1')
+    }
+  } else {
+    pushEnabled.value = false
+    localStorage.setItem('enclave_push', '0')
+  }
+}
+
+function connectNotifWs() {
+  if (!hasToken.value) return
+  const token = localStorage.getItem('enclave_token')
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  try {
+    notifWs = new WebSocket(`${proto}//${location.host}/api/notifications/stream?token=${token}`)
+    notifWs.onmessage = () => { loadNotifications() }
+    notifWs.onclose = () => {
+      notifWs = null
+      if (hasToken.value && !notifReconnect) {
+        notifReconnect = setTimeout(() => { notifReconnect = null; connectNotifWs() }, 3000)
+      }
+    }
+    notifWs.onerror = () => { try { notifWs.close() } catch { /* ignore */ } }
+  } catch { /* ignore */ }
+}
 
 // ─── New session ───
 const showNewSession = ref(false)
@@ -192,15 +316,25 @@ onMounted(() => {
     loadSessions()
     pollAskCount()
     askPollTimer = setInterval(pollAskCount, 30000)
+    loadNotifications()
+    connectNotifWs()
+    notifPollTimer = setInterval(loadNotifications, 30000)
   }
 })
-onUnmounted(() => { if (askPollTimer) clearInterval(askPollTimer) })
+onUnmounted(() => {
+  if (askPollTimer) clearInterval(askPollTimer)
+  if (notifPollTimer) clearInterval(notifPollTimer)
+  if (notifReconnect) clearTimeout(notifReconnect)
+  if (notifWs) { try { notifWs.close() } catch { /* ignore */ } }
+})
 watch(isLoginPage, (isLogin) => {
   if (!isLogin) {
     hasToken.value = !!localStorage.getItem('enclave_token')
     if (hasToken.value) {
       loadSessions()
       pollAskCount()
+      loadNotifications()
+      connectNotifWs()
     }
   }
 })
@@ -404,6 +538,91 @@ watch(isLoginPage, (isLogin) => {
   border-radius: 10px;
   min-width: 1.2rem;
   text-align: center;
+}
+
+.notif-panel {
+  margin-top: auto;
+  border-top: 1px solid var(--border);
+  padding: 0.5rem 0;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.notif-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.25rem 1.25rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.notif-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0;
+}
+
+.notif-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.notif-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  padding: 0.4rem 1rem 0.4rem 1.25rem;
+}
+
+.notif-item:hover {
+  background: var(--bg-hover);
+}
+
+.notif-body {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.notif-name {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notif-reason {
+  font-size: 0.7rem;
+  color: var(--accent);
+}
+
+.notif-q {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notif-dismiss {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+
+.notif-dismiss:hover {
+  color: #ef4444;
 }
 
 .content {

@@ -147,6 +147,20 @@ document, analysis, summary, or any long-form reference content.
 - Include a link in your chat response: "📎 See [Title](/artifacts)"
 - **NOT** for code files — those go through git.
 
+The user can **edit artifacts directly in the web UI** and iterate with you on a
+document side-by-side with the chat. When they save an edit, the previous
+revision is kept as a versioned backup next to the file in
+`/workspace/artifacts/`, named `<name>.v<N><ext>` (e.g. `report.v3.md`). To
+review the user's changes **on demand**, diff the latest backup against the
+current file, e.g.:
+
+```
+diff -u /workspace/artifacts/report.v3.md /workspace/artifacts/report.md
+```
+
+(The highest-numbered `.vN` backup is the revision immediately before the
+current file.)
+
 Good candidates: investigation reports, architecture docs, meeting notes,
 research summaries, troubleshooting guides, analysis results.
 

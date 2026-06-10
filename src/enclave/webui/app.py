@@ -68,7 +68,7 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     app.include_router(auth_router)
 
     # Protected API routers — require valid JWT
-    from enclave.webui.routes import asks, bugs, chat, memories, panel, sessions
+    from enclave.webui.routes import asks, bugs, chat, memories, notifications, panel, schedules, sessions
 
     app.include_router(
         sessions.router,
@@ -107,6 +107,12 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
         dependencies=[Depends(get_current_user)],
     )
     app.include_router(
+        schedules.router,
+        prefix="/api/schedules",
+        tags=["schedules"],
+        dependencies=[Depends(get_current_user)],
+    )
+    app.include_router(
         chat.router,
         prefix="/api/chat",
         tags=["chat"],
@@ -128,6 +134,17 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
         asks.router,
         prefix="/api",
         dependencies=[Depends(get_current_user)],
+    )
+    app.include_router(
+        notifications.router,
+        prefix="/api",
+        dependencies=[Depends(get_current_user)],
+    )
+    # WebSocket route handles auth via query param (OAuth2 deps don't work with WS)
+    app.include_router(
+        notifications.ws_router,
+        prefix="/api",
+        tags=["notifications"],
     )
 
     # Health check (unprotected)

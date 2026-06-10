@@ -34,6 +34,11 @@ const routes = [
     component: () => import('./views/Panel.vue'),
   },
   {
+    path: '/schedules',
+    name: 'schedules',
+    component: () => import('./views/Schedules.vue'),
+  },
+  {
     path: '/chat',
     name: 'chat',
     component: () => import('./views/Chat.vue'),
@@ -42,6 +47,11 @@ const routes = [
     path: '/artifacts',
     name: 'artifacts',
     component: () => import('./views/Artifacts.vue'),
+  },
+  {
+    path: '/preview/:session/:filename(.*)',
+    name: 'artifact-preview',
+    component: () => import('./views/ArtifactPreview.vue'),
   },
   {
     path: '/asks',

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+import re
 import signal
 import ssl
 import subprocess
@@ -22,6 +23,21 @@ from enclave.common.logging import get_logger
 
 # Re-export Session so existing imports keep working
 from enclave.orchestrator.session_manager import Session  # noqa: F401
+
+
+def _container_name(session_id: str) -> str:
+    """Return a podman-safe container name for a session id.
+
+    Podman requires names to match ``[a-zA-Z0-9][a-zA-Z0-9_.-]*`` — i.e. the
+    first character must be alphanumeric. Reserved session ids such as the
+    concierge's ``__concierge__`` start with an underscore, so we prefix them
+    with ``enclave-`` (and sanitise any stray characters defensively). The
+    session's real id is still passed to the agent via the ``SESSION_ID`` env.
+    """
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "-", session_id)
+    if not name or not re.match(r"[a-zA-Z0-9]", name[0]):
+        name = f"enclave-{name}"
+    return name
 
 log = get_logger("container")
 
@@ -69,12 +85,13 @@ class ContainerManager:
 
         # Clean up any leftover container with the same name
         log.info("[start:%s] Cleaning up old container...", session.id)
+        cname = _container_name(session.id)
         stop_result = await _run_command(
-            [self.config.runtime, "stop", "-t", "5", session.id], timeout=15.0
+            [self.config.runtime, "stop", "-t", "5", cname], timeout=15.0
         )
         log.debug("stop result: rc=%d stderr=%s", stop_result.returncode, stop_result.stderr[:100])
         rm_result = await _run_command(
-            [self.config.runtime, "rm", "-f", session.id], timeout=10.0
+            [self.config.runtime, "rm", "-f", cname], timeout=10.0
         )
         log.debug("rm result: rc=%d stderr=%s", rm_result.returncode, rm_result.stderr[:100])
         log.info("[start:%s] Cleanup done, building run command...", session.id)
@@ -99,7 +116,7 @@ class ContainerManager:
             self.config.runtime, "run",
             "--detach",
             "--rm",
-            "--name", session.id,
+            "--name", cname,
             "--userns", self.config.userns,
             "--network", network,
             # Workspace mount
@@ -109,6 +126,22 @@ class ContainerManager:
             "-e", f"SESSION_ID={session.id}",
             "-e", f"SESSION_NAME={session.name}",
         ]
+
+        # Concierge: the always-on control-room agent gets fleet-management tools.
+        if session.id == "__concierge__":
+            cmd.extend(["-e", "ENCLAVE_CONCIERGE=1"])
+
+        # Bind-mount the agent prompt files read-only so edits to the prompt
+        # markdown on the host take effect on the next session start WITHOUT
+        # rebuilding the container image. The orchestrator runs from an editable
+        # install, so this directory is the live repo source. The in-container
+        # agent prefers ENCLAVE_PROMPTS_DIR over its baked-in copy.
+        host_prompts = Path(__file__).resolve().parent.parent / "agent" / "prompts"
+        if host_prompts.is_dir():
+            cmd.extend([
+                "-v", f"{host_prompts}:/opt/enclave/prompts:ro",
+                "-e", "ENCLAVE_PROMPTS_DIR=/opt/enclave/prompts",
+            ])
 
         # Publish port mappings
         bind_addr = self.config.port_bind_address
@@ -416,6 +449,10 @@ class ContainerManager:
         env["ENCLAVE_YOLO"] = "1" if profile.yolo else "0"
         env["ENCLAVE_HOST_MODE"] = "1"
 
+        # Concierge: the always-on control-room agent gets fleet-management tools.
+        if session.id == "__concierge__":
+            env["ENCLAVE_CONCIERGE"] = "1"
+
         if self.config.github_token:
             env["GITHUB_TOKEN"] = self.config.github_token
             log.debug("[start:%s] Passing GITHUB_TOKEN to host agent", session.id)
@@ -613,7 +650,7 @@ class ContainerManager:
         elif session.container_id:
             try:
                 await _run_command(
-                    [self.config.runtime, "stop", "-t", "10", session.id]
+                    [self.config.runtime, "stop", "-t", "10", _container_name(session.id)]
                 )
             except Exception as e:
                 log.warning("Error stopping container %s: %s", session.id, e)
@@ -641,7 +678,7 @@ class ContainerManager:
             result = await _run_command([
                 self.config.runtime, "inspect",
                 "--format", "{{.State.Status}}",
-                session_id,
+                _container_name(session_id),
             ])
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -653,7 +690,7 @@ class ContainerManager:
         """Check if a container has non-trivial running processes."""
         try:
             result = await asyncio.create_subprocess_exec(
-                self.config.runtime, "top", session_id,
+                self.config.runtime, "top", _container_name(session_id),
                 "--format", "{{.Command}}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,

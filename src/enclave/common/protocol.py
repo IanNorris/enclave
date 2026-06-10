@@ -40,6 +40,7 @@ class MessageType(str, Enum):
     SCHEDULE_CANCEL = "schedule_cancel"
     TIMER_SET = "timer_set"
     TIMER_CANCEL = "timer_cancel"
+    CONCIERGE_ACTION = "concierge_action"
 
     # Orchestrator → Agent (scheduled callbacks)
     SCHEDULE_TRIGGER = "schedule_trigger"

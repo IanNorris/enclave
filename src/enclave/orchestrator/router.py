@@ -29,7 +29,11 @@ from enclave.orchestrator.commands import (
     parse_command,
 )
 from enclave.orchestrator.container import ContainerManager, Session
-from enclave.orchestrator.session_manager import SessionManager
+from enclave.orchestrator.session_manager import (
+    SessionManager,
+    CONCIERGE_SESSION_ID,
+    is_concierge,
+)
 from enclave.orchestrator.ipc import IPCServer
 from enclave.orchestrator.matrix_client import EnclaveMatrixClient
 from enclave.orchestrator.permissions import (
@@ -89,6 +93,7 @@ class MessageRouter:
         idle_timeout: int = 7200,
         memory_config: Any | None = None,
         mimir_config: Any | None = None,
+        concierge_config: Any | None = None,
     ):
         self.matrix = matrix
         self.ipc = ipc
@@ -226,6 +231,7 @@ class MessageRouter:
         self._memory_stores: dict[str, MemoryStore] = {}  # matrix_user_id → store
         self._memory_config = memory_config
         self._mimir_config = mimir_config
+        self._concierge_config = concierge_config
         self._data_dir = data_dir or os.path.expanduser("~/.local/share/enclave")
 
         # ── Mimir librarian worker ──
@@ -297,6 +303,9 @@ class MessageRouter:
 
         # Auto-restore sessions that were running before last shutdown
         await self._auto_restore_sessions()
+
+        # Ensure the always-on concierge session exists and is running
+        await self._ensure_concierge()
 
         log.info("Router started")
 
@@ -439,6 +448,87 @@ class MessageRouter:
         log.info(summary)
 
     # ------------------------------------------------------------------
+    # Concierge — always-on control-room agent
+    # ------------------------------------------------------------------
+
+    def _concierge_profile(self) -> str:
+        """Resolve the container profile for the concierge session."""
+        cfg = self._concierge_config
+        if cfg is not None and getattr(cfg, "profile", ""):
+            return cfg.profile
+        return self.containers.config.default_profile
+
+    async def _ensure_concierge(self) -> None:
+        """Ensure the concierge session exists and is running.
+
+        The concierge is a real LLM agent bound to the control room.  It is
+        created on first startup and auto-started on every subsequent startup.
+        """
+        cfg = self._concierge_config
+        if cfg is not None and not getattr(cfg, "enabled", True):
+            log.info("Concierge disabled in config — skipping")
+            return
+
+        if not self.control_room_id:
+            log.warning("No control room — cannot start concierge")
+            return
+
+        session = self.containers.get_session(CONCIERGE_SESSION_ID)
+
+        if session is None:
+            # First-time creation.
+            log.info("Creating concierge session")
+            try:
+                socket_path = await self.ipc.create_socket(CONCIERGE_SESSION_ID)
+                session = await self.containers.create_session(
+                    name="Concierge",
+                    room_id=self.control_room_id,
+                    socket_path=str(socket_path),
+                    profile=self._concierge_profile(),
+                    session_id=CONCIERGE_SESSION_ID,
+                )
+                self._seed_concierge_workspace(session)
+                started, error = await self.containers.start_session(session.id)
+                if started:
+                    log.info("Concierge created and started")
+                    await self._reply_control(
+                        "🛎️ Concierge online — your always-on assistant. "
+                        "Just talk to me here to manage sessions, spawn agents, "
+                        "or schedule tasks."
+                    )
+                else:
+                    log.warning("Concierge container failed to start: %s", error)
+            except Exception as e:
+                log.error("Failed to create concierge: %s", e)
+            return
+
+        # Already exists — make sure it's running.
+        if session.status == "running" and self.ipc.is_connected(session.id):
+            log.info("Concierge already running")
+            return
+
+        try:
+            session.status = "stopped"
+            socket_path = await self.ipc.create_socket(session.id)
+            session.socket_path = str(socket_path)
+            self._seed_concierge_workspace(session)
+            started, error = await self.containers.start_session(session.id)
+            if started:
+                log.info("Concierge restored")
+            else:
+                log.warning("Concierge failed to start: %s", error)
+        except Exception as e:
+            log.error("Failed to restore concierge: %s", e)
+
+    def _seed_concierge_workspace(self, session: Session) -> None:
+        """Seed the concierge workspace with the panel definition."""
+        try:
+            panel_doc = panel_mod.load_panel(self._data_dir)
+            panel_mod.write_workspace_panel(session.workspace_path, panel_doc)
+        except Exception as e:
+            log.warning("Failed to seed concierge panel: %s", e)
+
+    # ------------------------------------------------------------------
     # Periodic health monitoring
     # ------------------------------------------------------------------
 
@@ -521,6 +611,10 @@ class MessageRouter:
         now = time.monotonic()
         for session in self.sessions.active_sessions():
             sid = session.id
+
+            # Never auto-sleep the concierge — it is always-on.
+            if is_concierge(sid):
+                continue
 
             # Skip sessions in active turns
             if sid in self._turn_start_time:
@@ -676,6 +770,16 @@ class MessageRouter:
 
         cmd = parse_command(body)
         if cmd is None:
+            return
+
+        # Natural-language messages (anything that isn't a recognized command
+        # word) go to the concierge agent, which is bound to the control room.
+        # Recognized commands (help/sessions/kill/…) stay as fast-path commands.
+        if cmd.command == CommandType.UNKNOWN:
+            await self._handle_project_message(
+                self.control_room_id, sender, body, source, None, event_id,
+                attachments=attachments or [],
+            )
             return
 
         log.info("Command from %s (event %s): %s %s", sender, event_id, cmd.command.value, cmd.raw_args)
@@ -911,9 +1015,11 @@ class MessageRouter:
                 old_task.cancel()
         elif msg.type == MessageType.TURN_END:
             elapsed = time.monotonic() - self._turn_start_time.pop(session.id, time.monotonic())
-            log.info("Agent %s turn ended (%.1fs)", session.id, elapsed)
+            awaiting_input = bool(msg.payload.get("awaiting_input")) if msg.payload else False
+            log.info("Agent %s turn ended (%.1fs, awaiting_input=%s)",
+                     session.id, elapsed, awaiting_input)
             self._stop_typing_refresh(session.id)
-            self._control.notify_turn_end(session.id)
+            self._control.notify_turn_end(session.id, awaiting_input=awaiting_input)
             # Snapshot SDK state after every interaction
             asyncio.create_task(
                 asyncio.to_thread(self.sessions.backup_sdk_state, session)
@@ -961,6 +1067,8 @@ class MessageRouter:
             await self._handle_dream_complete(session, msg)
         elif msg.type == MessageType.SUB_AGENT_REQUEST:
             return await self._handle_sub_agent_request(session, msg)
+        elif msg.type == MessageType.CONCIERGE_ACTION:
+            return await self._handle_concierge_action(session, msg)
         elif msg.type == MessageType.USAGE_REPORT:
             self._cost.record_usage(
                 session_id=session.id,
@@ -3034,6 +3142,183 @@ class MessageRouter:
         return session.id, ""
 
     # ------------------------------------------------------------------
+    # Concierge action handler
+    # ------------------------------------------------------------------
+
+    async def _handle_concierge_action(
+        self, session: Session, msg: Message
+    ) -> Message:
+        """Handle a privileged fleet-management action from the concierge.
+
+        Only the reserved concierge session may invoke these actions.
+        """
+        def _reply(payload: dict[str, Any]) -> Message:
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload=payload,
+                reply_to=msg.id,
+            )
+
+        if not is_concierge(session.id):
+            return _reply({"error": "Permission denied: not the concierge session"})
+
+        action = msg.payload.get("action", "")
+        p = msg.payload
+
+        try:
+            if action == "list_sessions":
+                out = []
+                for s in self.containers.list_sessions():
+                    if is_concierge(s.id):
+                        continue
+                    out.append({
+                        "id": s.id,
+                        "name": s.name,
+                        "status": s.status,
+                        "profile": s.profile,
+                        "connected": self.ipc.is_connected(s.id),
+                    })
+                return _reply({"ok": True, "sessions": out})
+
+            if action == "create_session":
+                name = (p.get("name") or "").strip()
+                if not name:
+                    return _reply({"error": "name is required"})
+                profile = p.get("profile", "") or ""
+                sid, err = await self.create_project(
+                    name=name, profile=profile,
+                    sender=next(iter(self._user_mappings), ""),
+                )
+                if err:
+                    return _reply({"error": err})
+                brief = (p.get("brief") or "").strip()
+                if brief:
+                    # Deliver the initial brief once the agent is connected.
+                    await self._concierge_deliver_when_ready(sid, brief)
+                return _reply({"ok": True, "session_id": sid})
+
+            if action == "start_session":
+                sid = p.get("session_id", "")
+                target = self.containers.get_session(sid)
+                if not target:
+                    return _reply({"error": f"No such session: {sid}"})
+                if self.ipc.is_connected(sid):
+                    return _reply({"ok": True, "status": "already running"})
+                await self._restore_session(target, target.room_id)
+                return _reply({"ok": True, "status": "starting"})
+
+            if action == "stop_session":
+                sid = p.get("session_id", "")
+                if is_concierge(sid):
+                    return _reply({"error": "Cannot stop the concierge"})
+                if not self.containers.get_session(sid):
+                    return _reply({"error": f"No such session: {sid}"})
+                ok = await self.containers.stop_session(sid, reason="concierge")
+                return _reply({"ok": ok})
+
+            if action == "delete_session":
+                sid = p.get("session_id", "")
+                if is_concierge(sid):
+                    return _reply({"error": "Cannot delete the concierge"})
+                if not self.containers.get_session(sid):
+                    return _reply({"error": f"No such session: {sid}"})
+                ok = await self.containers.delete_session(sid, reason="concierge")
+                return _reply({"ok": ok})
+
+            if action == "send_to_session":
+                sid = p.get("session_id", "")
+                message = p.get("message", "")
+                if is_concierge(sid):
+                    return _reply({"error": "Cannot message the concierge"})
+                if not message.strip():
+                    return _reply({"error": "message is required"})
+                if not self.containers.get_session(sid):
+                    return _reply({"error": f"No such session: {sid}"})
+                ok = await self.inject_message(sid, message)
+                return _reply({"ok": ok})
+
+            if action == "list_schedules":
+                scheds = [
+                    {
+                        "id": e.id,
+                        "session_id": e.session_id,
+                        "interval_seconds": e.interval_seconds,
+                        "reason": e.reason,
+                        "next_fire": e.next_fire,
+                    }
+                    for e in self._scheduler.list_schedules()
+                ]
+                timers = [
+                    {
+                        "id": e.id,
+                        "session_id": e.session_id,
+                        "fire_at": e.fire_at,
+                        "reason": e.reason,
+                    }
+                    for e in self._scheduler.list_timers()
+                ]
+                return _reply({"ok": True, "schedules": scheds, "timers": timers})
+
+            if action == "schedule_task":
+                target = p.get("target", "session")
+                spawn_brief = p.get("spawn_brief", "")
+                target_session = p.get("session_id", "") or CONCIERGE_SESSION_ID
+                if target == "concierge":
+                    target_session = CONCIERGE_SESSION_ID
+                interval = int(p.get("interval_seconds", 0) or 0)
+                reason = p.get("reason", "")
+                if not reason.strip():
+                    return _reply({"error": "reason is required"})
+                if target == "session" and \
+                        target_session != CONCIERGE_SESSION_ID and \
+                        not self.containers.get_session(target_session):
+                    return _reply({"error": f"No such session: {target_session}"})
+                sched_id = p.get("id") or f"sched-{target_session}-{int(time.time())}"
+                result = self._scheduler.add_schedule(
+                    schedule_id=sched_id,
+                    session_id=target_session,
+                    interval_seconds=interval,
+                    reason=reason,
+                    target=target,
+                    spawn_brief=spawn_brief,
+                )
+                if isinstance(result, str):
+                    return _reply({"error": result})
+                return _reply({
+                    "ok": True, "id": result.id, "next_fire": result.next_fire,
+                })
+
+            if action == "cancel_schedule":
+                sid = p.get("id", "")
+                found = self._scheduler.cancel_schedule(sid) or \
+                    self._scheduler.cancel_timer(sid)
+                return _reply({"ok": found})
+
+            return _reply({"error": f"Unknown concierge action: {action}"})
+        except Exception as e:
+            log.exception("Concierge action %s failed", action)
+            return _reply({"error": f"{type(e).__name__}: {e}"})
+
+    async def _concierge_deliver_when_ready(
+        self, session_id: str, message: str, attempts: int = 30,
+    ) -> None:
+        """Deliver an initial brief to a freshly-created session.
+
+        Polls briefly for the agent IPC connection, then injects the message.
+        Runs as a background task so it never blocks the concierge.
+        """
+        async def _deliver() -> None:
+            for _ in range(attempts):
+                if self.ipc.is_connected(session_id):
+                    await self.inject_message(session_id, message)
+                    return
+                await asyncio.sleep(2)
+            log.warning(
+                "Concierge brief not delivered — %s never connected", session_id
+            )
+        asyncio.create_task(_deliver())
+
+    # ------------------------------------------------------------------
     # Scheduler IPC handlers
     # ------------------------------------------------------------------
 
@@ -3126,7 +3411,11 @@ class MessageRouter:
     async def _on_schedule_fire(
         self, session_id: str, entry: ScheduleEntry,
     ) -> None:
-        """Called when a recurring schedule fires — send message to agent."""
+        """Called when a recurring schedule fires."""
+        target = getattr(entry, "target", "session")
+        if target == "spawn":
+            await self._spawn_scheduled_worker(entry)
+            return
         if not self.ipc.is_connected(session_id):
             log.info("Schedule %s: session %s not connected, skipping", entry.id, session_id)
             return
@@ -3140,10 +3429,30 @@ class MessageRouter:
             },
         ))
 
+    async def _spawn_scheduled_worker(self, entry: Any) -> None:
+        """Create a fresh worker session to carry out a scheduled task."""
+        brief = getattr(entry, "spawn_brief", "") or entry.reason
+        name = f"task-{entry.id}"[:40]
+        log.info("Schedule %s: spawning worker session '%s'", entry.id, name)
+        try:
+            sid, err = await self.create_project(
+                name=name, sender=next(iter(self._user_mappings), ""),
+            )
+            if err:
+                log.warning("Scheduled spawn failed: %s", err)
+                return
+            if brief.strip():
+                await self._concierge_deliver_when_ready(sid, brief)
+        except Exception:
+            log.exception("Scheduled spawn failed for %s", entry.id)
+
     async def _on_timer_fire(
         self, session_id: str, entry: TimerEntry,
     ) -> None:
         """Called when a one-shot timer fires — send message to agent."""
+        if getattr(entry, "target", "session") == "spawn":
+            await self._spawn_scheduled_worker(entry)
+            return
         session = self.containers.get_session(session_id)
         if not session:
             log.info("Timer %s: session %s gone, skipping", entry.id, session_id)

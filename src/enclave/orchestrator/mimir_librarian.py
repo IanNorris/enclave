@@ -141,6 +141,19 @@ class MimirLibrarianWorker:
         ]
         env = os.environ.copy()
         env.setdefault("MIMIR_LIBRARIAN_LLM", "copilot")
+        # The librarian shells out to an LLM CLI (default `copilot`). The
+        # systemd unit's PATH can omit the user bin dirs where it's installed
+        # (e.g. ~/.npm-global/bin), causing "failed to spawn copilot: No such
+        # file or directory". Prepend the usual user bin dirs so it resolves.
+        _extra_paths = [
+            str(Path.home() / ".npm-global" / "bin"),
+            str(Path.home() / ".local" / "bin"),
+        ]
+        _existing = env.get("PATH", "")
+        _existing_parts = _existing.split(os.pathsep) if _existing else []
+        env["PATH"] = os.pathsep.join(
+            [p for p in _extra_paths if p not in _existing_parts] + _existing_parts
+        )
         log.info("Mimir librarian: running %s", shlex.join(cmd))
         try:
             proc = await asyncio.create_subprocess_exec(

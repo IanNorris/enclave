@@ -15,9 +15,31 @@
           {{ modelsRefreshing ? '⟳' : '↻' }}
         </button>
       </div>
+      <div v-if="selectedSession" class="doc-controls">
+        <button
+          v-if="openDoc && !isMobilePortrait"
+          class="doc-orient-btn"
+          :title="outerOrientation === 'horizontal' ? 'Stack vertically' : 'Place side by side'"
+          @click="toggleOuterOrientation"
+        >{{ outerOrientation === 'horizontal' ? '⬍' : '⬌' }}</button>
+        <div class="doc-menu-wrap">
+          <button class="doc-open-btn" @click="toggleDocMenu" title="Open a document beside the chat">📄</button>
+          <div v-if="docMenuOpen" class="doc-menu">
+            <div v-if="!docList.length" class="doc-menu-empty muted">No editable documents</div>
+            <button
+              v-for="d in docList"
+              :key="d.filename"
+              class="doc-menu-item"
+              :class="{ active: d.filename === openDoc }"
+              @click="openDocument(d.filename)"
+            >{{ d.title || d.filename }}</button>
+          </div>
+        </div>
+      </div>
     </div>
 
-    <div class="chat-container" v-if="selectedSession">
+    <div v-if="selectedSession" class="chat-body" :class="bodyClass">
+      <div class="chat-container" :style="chatPaneStyle">
       <!-- Drop overlay -->
       <div v-if="dragging" class="drop-overlay">
         <div class="drop-label">Drop files to attach</div>
@@ -70,7 +92,15 @@
                 <template v-for="(seg, si) in turnEvents[turn.turn_index]" :key="si">
                   <!-- Tool calls in this segment -->
                   <div v-for="(evt, ei) in seg.tools" :key="`${si}-${ei}`" class="live-event" :class="evt.type">
-                    <div v-if="evt.type === 'tool_start' || evt.type === 'tool_complete'" class="tool-block collapsed">
+                    <div v-if="evt.type === 'thinking'" class="thinking-block collapsed">
+                      <div class="event-header" @click="evt.expanded = !evt.expanded">
+                        <span class="event-icon">🤔</span>
+                        <span class="event-label">Thinking</span>
+                        <span class="expand-toggle">{{ evt.expanded ? '▼' : '▶' }}</span>
+                      </div>
+                      <div v-if="evt.expanded" class="event-content thinking-content">{{ evt.data?.content }}</div>
+                    </div>
+                    <div v-else-if="evt.type === 'tool_start' || evt.type === 'tool_complete'" class="tool-block collapsed">
                       <div class="event-header">
                         <span class="event-icon">{{ TOOL_ICONS_MAP[evt.data?.name] || '🔧' }}</span>
                         <span class="event-label">{{ evt.data?.detail || evt.data?.name || 'tool' }}</span>
@@ -286,6 +316,23 @@
         ></textarea>
         <button class="primary" @click="send" :disabled="(!draft.trim() && !pendingFiles.length) || sending">Send</button>
       </div>
+      </div>
+      <template v-if="openDoc">
+        <div
+          class="outer-divider"
+          :class="outerOrientation"
+          @pointerdown="startOuterDrag"
+        ><div class="divider-grip"></div></div>
+        <DocumentPane
+          class="outer-doc"
+          :style="docPaneStyle"
+          :session="selectedSession"
+          :filename="openDoc"
+          :mobile="isMobilePortrait"
+          :refresh-tick="docRefreshTick"
+          @close="closeDoc"
+        />
+      </template>
     </div>
     <div v-else class="empty-state">
       <p class="muted">Select a session to start chatting.</p>
@@ -310,8 +357,10 @@
 
 <script setup>
 import { ref, reactive, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api.js'
 import { useSessionStore } from '../stores/session.js'
+import DocumentPane from '../components/DocumentPane.vue'
 import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
@@ -355,6 +404,97 @@ const TOOL_ICONS = {
 
 const { selectedSessionId } = useSessionStore()
 const selectedSession = computed(() => selectedSessionId.value)
+const route = useRoute()
+const router = useRouter()
+
+// ─── Document workspace (side-by-side artifact editing) ───
+const EDITABLE_DOC_RE = /\.(md|txt|json|yaml|yml|csv|log)$/i
+const openDoc = ref('')
+const docList = ref([])
+const docMenuOpen = ref(false)
+const outerOrientation = ref(localStorage.getItem('enclave_outer_orientation') || 'horizontal')
+const outerSize = ref(parseFloat(localStorage.getItem('enclave_outer_size')) || 58) // % for chat pane
+const isMobilePortrait = ref(false)
+const docRefreshTick = ref(0) // bumped on agent activity → DocumentPane re-checks for external changes
+let _mqlPortrait = null
+
+const bodyClass = computed(() => {
+  if (isMobilePortrait.value && openDoc.value) return 'mobile-portrait'
+  return openDoc.value ? outerOrientation.value : 'no-doc'
+})
+const chatPaneStyle = computed(() => {
+  if (!openDoc.value || isMobilePortrait.value) return {}
+  return { flexBasis: `${outerSize.value}%` }
+})
+const docPaneStyle = computed(() => {
+  if (!openDoc.value || isMobilePortrait.value) return {}
+  return { flexBasis: `${100 - outerSize.value}%` }
+})
+
+function docStorageKey(id) { return `enclave_open_doc_${id}` }
+
+async function loadDocList() {
+  if (!selectedSession.value) { docList.value = []; return }
+  try {
+    const arts = await api.getArtifacts(selectedSession.value)
+    docList.value = (arts || []).filter(a => EDITABLE_DOC_RE.test(a.filename))
+  } catch { docList.value = [] }
+}
+function toggleDocMenu() {
+  docMenuOpen.value = !docMenuOpen.value
+  if (docMenuOpen.value) loadDocList()
+}
+function openDocument(filename) {
+  openDoc.value = filename
+  docMenuOpen.value = false
+  if (selectedSession.value) localStorage.setItem(docStorageKey(selectedSession.value), filename)
+}
+function closeDoc() {
+  openDoc.value = ''
+  if (selectedSession.value) localStorage.removeItem(docStorageKey(selectedSession.value))
+}
+function toggleOuterOrientation() {
+  outerOrientation.value = outerOrientation.value === 'horizontal' ? 'vertical' : 'horizontal'
+  localStorage.setItem('enclave_outer_orientation', outerOrientation.value)
+}
+
+function startOuterDrag(e) {
+  const body = e.currentTarget.parentElement
+  if (!body) return
+  const rect = body.getBoundingClientRect()
+  const horizontal = outerOrientation.value === 'horizontal'
+  function move(ev) {
+    let pct = horizontal
+      ? ((ev.clientX - rect.left) / rect.width) * 100
+      : ((ev.clientY - rect.top) / rect.height) * 100
+    outerSize.value = Math.min(85, Math.max(15, pct))
+  }
+  function up() {
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+    document.body.style.userSelect = ''
+    localStorage.setItem('enclave_outer_size', String(outerSize.value))
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+  document.body.style.userSelect = 'none'
+}
+
+function restoreOpenDoc() {
+  // Deep-link (?doc=) takes priority, else the last-open doc for this session.
+  const q = route.query.doc
+  if (typeof q === 'string' && q) { openDoc.value = q; return }
+  if (selectedSession.value) {
+    openDoc.value = localStorage.getItem(docStorageKey(selectedSession.value)) || ''
+  } else {
+    openDoc.value = ''
+  }
+}
+
+watch(() => route.query.doc, (d) => {
+  if (typeof d === 'string' && d) openDocument(d)
+})
+
 const turns = ref([])
 const hasMore = ref(false)
 const loadingMore = ref(false)
@@ -446,6 +586,11 @@ const AGENT_PROGRESS_EVENTS = new Set([
   'structured_response', 'turn', 'turn_end',
 ])
 
+// Events after which an open artifact may have changed on disk.
+const DOC_REFRESH_EVENTS = new Set([
+  'tool_complete', 'response', 'structured_response', 'turn_end', 'file_send',
+])
+
 function countSegmentEvents(segments) {
   if (!segments) return 0
   return segments.reduce((sum, seg) => sum + seg.tools.length + (seg.response ? 1 : 0), 0)
@@ -455,8 +600,17 @@ let ws = null
 let dragCounter = 0
 
 onMounted(async () => {
+  // Track mobile-portrait to force the doc-on-top stacked layout with tabs.
+  _mqlPortrait = window.matchMedia('(max-width: 820px) and (orientation: portrait)')
+  const applyPortrait = (e) => { isMobilePortrait.value = e.matches }
+  applyPortrait(_mqlPortrait)
+  _mqlPortrait.addEventListener('change', applyPortrait)
+  _mqlPortrait._handler = applyPortrait
+
+  restoreOpenDoc()
   if (selectedSession.value) {
     loadHistory()
+    loadDocList()
   }
   window.addEventListener('keydown', onLightboxKey)
 })
@@ -479,12 +633,18 @@ onUnmounted(() => {
   if (_mermaidTimer) clearTimeout(_mermaidTimer)
   pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
   window.removeEventListener('keydown', onLightboxKey)
+  if (_mqlPortrait && _mqlPortrait._handler) {
+    _mqlPortrait.removeEventListener('change', _mqlPortrait._handler)
+    _mqlPortrait = null
+  }
 })
 
 watch(selectedSession, (newVal) => {
   if (ws) { ws.close(); ws = null }
   clearLiveState()
-  if (newVal) loadHistory()
+  docMenuOpen.value = false
+  restoreOpenDoc()
+  if (newVal) { loadHistory(); loadDocList() }
 })
 
 function clearLiveState() {
@@ -534,7 +694,7 @@ async function loadEvents() {
     // duplicate (responses) or double-map (cards) them.
     const grouped = {}
     for (const evt of events) {
-      if (!['tool_start', 'tool_complete', 'file_send'].includes(evt.type)) continue
+      if (!['tool_start', 'tool_complete', 'file_send', 'thinking'].includes(evt.type)) continue
       // Find the best matching turn (latest turn that started before this event)
       let bestTurn = null
       for (const t of turns.value) {
@@ -713,6 +873,13 @@ function handleStreamEvent(msg) {
   if (askUserPrompt.value && AGENT_PROGRESS_EVENTS.has(type)) {
     askUserPrompt.value = null
     askUserAnswer.value = ''
+  }
+
+  // After the agent does work it may have rewritten an open artifact (via
+  // publish_artifact or a direct file edit). Nudge the document pane to re-check
+  // for external changes on these completion-ish events.
+  if (openDoc.value && DOC_REFRESH_EVENTS.has(type)) {
+    docRefreshTick.value++
   }
 
   if (type === 'credits') {
@@ -1746,6 +1913,95 @@ function formatTime(ts) {
   position: relative;
   overflow: hidden;
 }
+
+/* ─── Document workspace (chat ↔ artifact split) ─── */
+.chat-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.chat-body.no-doc { flex-direction: column; }
+.chat-body.horizontal { flex-direction: row; }
+.chat-body.vertical { flex-direction: column; }
+.chat-body.mobile-portrait { flex-direction: column-reverse; }
+
+.chat-body > .chat-container { flex: 1 1 auto; min-width: 0; min-height: 0; }
+.chat-body.no-doc > .chat-container { flex-basis: auto; }
+
+.outer-doc {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.outer-divider {
+  flex: 0 0 auto;
+  background: var(--border, #333);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+}
+.outer-divider.horizontal { width: 6px; cursor: col-resize; }
+.outer-divider.vertical { height: 6px; cursor: row-resize; }
+.outer-divider:hover { background: var(--accent, #6c8cff); }
+.outer-divider .divider-grip { background: var(--bg-card, #2a2a32); border-radius: 3px; }
+.outer-divider.horizontal .divider-grip { width: 2px; height: 28px; }
+.outer-divider.vertical .divider-grip { height: 2px; width: 28px; }
+
+/* On mobile portrait the split is a fixed doc-on-top stack (no drag handle). */
+.chat-body.mobile-portrait > .chat-container { flex: 1 1 55%; }
+.chat-body.mobile-portrait > .outer-doc { flex: 1 1 45%; }
+.chat-body.mobile-portrait > .outer-divider { display: none; }
+
+/* Header document controls */
+.doc-controls { display: flex; align-items: center; gap: 0.3rem; position: relative; }
+.doc-open-btn, .doc-orient-btn {
+  background: var(--bg-card, #1e1e24);
+  border: 1px solid var(--border, #333);
+  color: inherit;
+  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+.doc-open-btn:hover, .doc-orient-btn:hover { border-color: var(--accent, #6c8cff); }
+.doc-menu-wrap { position: relative; }
+.doc-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  min-width: 220px;
+  max-width: 320px;
+  max-height: 50vh;
+  overflow: auto;
+  background: var(--bg-card, #1e1e24);
+  border: 1px solid var(--border, #333);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+  z-index: 50;
+  padding: 0.25rem;
+}
+.doc-menu-empty { padding: 0.5rem 0.6rem; font-size: 0.85rem; }
+.doc-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0.4rem 0.6rem;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.doc-menu-item:hover { background: var(--bg, #121216); }
+.doc-menu-item.active { color: var(--accent, #6c8cff); }
 
 .empty-state {
   flex: 1;

@@ -26,6 +26,19 @@ if TYPE_CHECKING:
     from copilot.session import CopilotSession as _CopilotSession
 
 
+def _workspace_root() -> Path:
+    """Return the agent's workspace root.
+
+    In containerized sessions the workspace is bind-mounted at /workspace and
+    ENCLAVE_WORKSPACE is unset, so this resolves to /workspace. Host-mode
+    sessions run directly on the host with no /workspace mount; the orchestrator
+    sets ENCLAVE_WORKSPACE to the real workspace path, which we honour here so
+    workspace-relative paths (inbox, attachments) don't try to write under the
+    host filesystem root.
+    """
+    return Path(os.environ.get("ENCLAVE_WORKSPACE", "/workspace"))
+
+
 class AgentState:
     """Mutable container for agent runtime state.
 
@@ -607,9 +620,18 @@ def setup_session_listener(
         elif etype == SessionEventType.ASSISTANT_TURN_END:
             _set_phase("idle")
             turn_id = getattr(data, "turn_id", None) or getattr(data, "turnId", "")
+            awaiting_input = bool(
+                agent_state
+                and agent_state.asked_user
+                and not agent_state.task_done
+            )
             _fire_and_forget(ipc.send(Message(
                 type=MessageType.TURN_END,
-                payload={"turn_id": str(turn_id), "in_reply_to": reply_to},
+                payload={
+                    "turn_id": str(turn_id),
+                    "in_reply_to": reply_to,
+                    "awaiting_input": awaiting_input,
+                },
                 reply_to=reply_to,
             )))
 
@@ -765,7 +787,7 @@ def setup_session_listener(
                     agent_state.asked_user = False
 
                     # Check file-based inbox for notifications from in-container services
-                    inbox_dir = Path("/workspace/.enclave/inbox")
+                    inbox_dir = _workspace_root() / ".enclave" / "inbox"
                     if inbox_dir.is_dir():
                         inbox_files = sorted(inbox_dir.glob("*.json"))
                         for inbox_file in inbox_files:
@@ -853,7 +875,7 @@ async def _download_attachments(
     import base64
 
     sdk_attachments: list[dict] = []
-    attach_dir = Path("/workspace/.attachments")
+    attach_dir = _workspace_root() / ".attachments"
 
     for att in attachments:
         url = att.get("url", "")
@@ -1352,7 +1374,7 @@ async def _configure_model(
             "available": sorted(_AVAILABLE_MODEL_IDS) if _AVAILABLE_MODEL_IDS else [target],
             "preferences": list(_MODEL_PREFERENCES),
         }
-        models_path = Path(os.environ.get("WORKSPACE_DIR", "/workspace")) / ".enclave-models.json"
+        models_path = _workspace_root() / ".enclave-models.json"
         models_path.write_text(_json.dumps(models_info, indent=2))
         print(f"[agent] Wrote models info to {models_path}", file=sys.stderr)
     except Exception as e:
@@ -1566,15 +1588,27 @@ async def try_init_copilot(
             return PermissionRequestResult(kind="approve-once")
 
         prompt_dir = Path(__file__).parent / "prompts"
+        # An optional host-mounted override dir (see container.py) lets prompt
+        # edits take effect on the next session start without an image rebuild.
+        override_env = os.environ.get("ENCLAVE_PROMPTS_DIR", "").strip()
+        override_dir = Path(override_env) if override_env else None
         prompt_parts = []
-        for filename in ("base.md", "guidelines.md", f"{profile_name}.md"):
-            prompt_file = prompt_dir / filename
-            if prompt_file.exists():
+        prompt_files = ["base.md", "guidelines.md", f"{profile_name}.md"]
+        # The concierge gets an extra role prompt describing fleet management.
+        if os.environ.get("ENCLAVE_CONCIERGE") == "1":
+            prompt_files.append("concierge.md")
+        for filename in prompt_files:
+            prompt_file = None
+            if override_dir is not None and (override_dir / filename).exists():
+                prompt_file = override_dir / filename
+            elif (prompt_dir / filename).exists():
+                prompt_file = prompt_dir / filename
+            if prompt_file is not None:
                 text = prompt_file.read_text()
                 prompt_parts.append(text)
-                print(f"[agent] Loaded prompt: {filename} ({len(text)} bytes)", file=sys.stderr)
+                print(f"[agent] Loaded prompt: {filename} ({len(text)} bytes) from {prompt_file.parent}", file=sys.stderr)
             else:
-                print(f"[agent] Warning: prompt file not found: {prompt_file}", file=sys.stderr)
+                print(f"[agent] Warning: prompt file not found: {filename}", file=sys.stderr)
 
         # Inject user identity into prompt if available
         user_name = os.environ.get("ENCLAVE_USER_NAME", "")
@@ -2451,6 +2485,270 @@ async def try_init_copilot(
             },
         )
         custom_tools.append(spawn_sub_agent_tool)
+
+        # ------------------------------------------------------------------
+        # Concierge tools — only registered for the always-on control-room
+        # agent (ENCLAVE_CONCIERGE=1).  These let the concierge manage the
+        # fleet of sessions and scheduled tasks.
+        # ------------------------------------------------------------------
+        if os.environ.get("ENCLAVE_CONCIERGE") == "1":
+            async def _concierge_request(action: str, **kwargs: object) -> dict:
+                if not ipc or not ipc.is_connected:
+                    return {"error": "not connected to orchestrator"}
+                try:
+                    response = await ipc.request(
+                        Message(
+                            type=MessageType.CONCIERGE_ACTION,
+                            payload={"action": action, **kwargs},
+                        ),
+                        timeout=120.0,
+                    )
+                    return response.payload or {}
+                except asyncio.TimeoutError:
+                    return {"error": f"concierge action '{action}' timed out"}
+
+            def _ok_or_error(rp: dict, success_text: str) -> ToolResult:
+                if rp.get("error"):
+                    return ToolResult(
+                        text_result_for_llm=f"Error: {rp['error']}",
+                        result_type="error",
+                    )
+                return ToolResult(text_result_for_llm=success_text)
+
+            async def _list_sessions_handler(invocation: object) -> ToolResult:
+                rp = await _concierge_request("list_sessions")
+                if rp.get("error"):
+                    return _ok_or_error(rp, "")
+                sessions = rp.get("sessions", [])
+                if not sessions:
+                    return ToolResult(text_result_for_llm="No active sessions.")
+                lines = []
+                for s in sessions:
+                    conn = "connected" if s.get("connected") else "disconnected"
+                    lines.append(
+                        f"- {s['name']} (id=`{s['id']}`) — {s['status']}, "
+                        f"{conn}, profile={s.get('profile', '?')}"
+                    )
+                return ToolResult(
+                    text_result_for_llm="Sessions:\n" + "\n".join(lines)
+                )
+
+            custom_tools.append(Tool(
+                name="list_sessions",
+                description="List all agent sessions and their status (concierge only).",
+                handler=_list_sessions_handler,
+                parameters={"type": "object", "properties": {}},
+            ))
+
+            async def _create_session_handler(invocation: object) -> ToolResult:
+                args = getattr(invocation, "arguments", {}) or {}
+                name = args.get("name", "")
+                if not name:
+                    return ToolResult(
+                        text_result_for_llm="Error: name is required",
+                        result_type="error",
+                    )
+                rp = await _concierge_request(
+                    "create_session",
+                    name=name,
+                    profile=args.get("profile", ""),
+                    brief=args.get("brief", ""),
+                )
+                return _ok_or_error(
+                    rp,
+                    f"Created session '{name}' (id=`{rp.get('session_id')}`)."
+                    + (" Initial brief is being delivered."
+                       if args.get("brief") else ""),
+                )
+
+            custom_tools.append(Tool(
+                name="create_session",
+                description=(
+                    "Create a new agent session/project (concierge only). "
+                    "Optionally provide a 'brief' that is sent as the session's "
+                    "first instruction."
+                ),
+                handler=_create_session_handler,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Project/session name"},
+                        "profile": {"type": "string", "description": "Container profile (optional)"},
+                        "brief": {"type": "string", "description": "Initial task/instruction to send (optional)"},
+                    },
+                    "required": ["name"],
+                },
+            ))
+
+            async def _start_session_handler(invocation: object) -> ToolResult:
+                args = getattr(invocation, "arguments", {}) or {}
+                sid = args.get("session_id", "")
+                rp = await _concierge_request("start_session", session_id=sid)
+                return _ok_or_error(rp, f"Session `{sid}`: {rp.get('status', 'started')}.")
+
+            custom_tools.append(Tool(
+                name="start_session",
+                description="Start/restore a stopped session (concierge only).",
+                handler=_start_session_handler,
+                parameters={
+                    "type": "object",
+                    "properties": {"session_id": {"type": "string"}},
+                    "required": ["session_id"],
+                },
+            ))
+
+            async def _stop_session_handler(invocation: object) -> ToolResult:
+                args = getattr(invocation, "arguments", {}) or {}
+                sid = args.get("session_id", "")
+                rp = await _concierge_request("stop_session", session_id=sid)
+                return _ok_or_error(rp, f"Stopped session `{sid}`.")
+
+            custom_tools.append(Tool(
+                name="stop_session",
+                description="Stop a running session (concierge only).",
+                handler=_stop_session_handler,
+                parameters={
+                    "type": "object",
+                    "properties": {"session_id": {"type": "string"}},
+                    "required": ["session_id"],
+                },
+            ))
+
+            async def _delete_session_handler(invocation: object) -> ToolResult:
+                args = getattr(invocation, "arguments", {}) or {}
+                sid = args.get("session_id", "")
+                rp = await _concierge_request("delete_session", session_id=sid)
+                return _ok_or_error(rp, f"Deleted session `{sid}`.")
+
+            custom_tools.append(Tool(
+                name="delete_session",
+                description=(
+                    "Permanently delete a session, its workspace and room "
+                    "(concierge only). Irreversible — confirm with the user first."
+                ),
+                handler=_delete_session_handler,
+                parameters={
+                    "type": "object",
+                    "properties": {"session_id": {"type": "string"}},
+                    "required": ["session_id"],
+                },
+            ))
+
+            async def _send_to_session_handler(invocation: object) -> ToolResult:
+                args = getattr(invocation, "arguments", {}) or {}
+                sid = args.get("session_id", "")
+                message = args.get("message", "")
+                rp = await _concierge_request(
+                    "send_to_session", session_id=sid, message=message
+                )
+                return _ok_or_error(rp, f"Message delivered to session `{sid}`.")
+
+            custom_tools.append(Tool(
+                name="send_to_session",
+                description=(
+                    "Send a message/instruction to another session's agent "
+                    "(concierge only). Restores the session if it is asleep."
+                ),
+                handler=_send_to_session_handler,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["session_id", "message"],
+                },
+            ))
+
+            async def _list_concierge_schedules_handler(invocation: object) -> ToolResult:
+                rp = await _concierge_request("list_schedules")
+                if rp.get("error"):
+                    return _ok_or_error(rp, "")
+                scheds = rp.get("schedules", [])
+                timers = rp.get("timers", [])
+                if not scheds and not timers:
+                    return ToolResult(text_result_for_llm="No schedules or timers.")
+                lines = []
+                for s in scheds:
+                    hrs = s["interval_seconds"] / 3600
+                    lines.append(
+                        f"- [recurring] `{s['id']}` every {hrs:.1f}h → "
+                        f"session `{s['session_id']}`: {s['reason']}"
+                    )
+                for t in timers:
+                    lines.append(
+                        f"- [one-shot] `{t['id']}` → session "
+                        f"`{t['session_id']}`: {t['reason']}"
+                    )
+                return ToolResult(text_result_for_llm="Schedules:\n" + "\n".join(lines))
+
+            custom_tools.append(Tool(
+                name="list_all_schedules",
+                description="List all recurring schedules and timers across sessions (concierge only).",
+                handler=_list_concierge_schedules_handler,
+                parameters={"type": "object", "properties": {}},
+            ))
+
+            async def _schedule_task_handler(invocation: object) -> ToolResult:
+                args = getattr(invocation, "arguments", {}) or {}
+                interval = int(args.get("interval_seconds", 0) or 0)
+                reason = args.get("reason", "")
+                rp = await _concierge_request(
+                    "schedule_task",
+                    session_id=args.get("session_id", ""),
+                    target=args.get("target", "session"),
+                    spawn_brief=args.get("spawn_brief", ""),
+                    interval_seconds=interval,
+                    reason=reason,
+                )
+                return _ok_or_error(
+                    rp,
+                    f"Scheduled task `{rp.get('id')}` (every {interval / 3600:.1f}h)."
+                )
+
+            custom_tools.append(Tool(
+                name="schedule_task",
+                description=(
+                    "Schedule a recurring task (concierge only). Minimum interval is "
+                    "1 hour (3600s). The 'target' controls what happens when it fires: "
+                    "'session' messages a specific session (session_id), 'concierge' "
+                    "runs it on you, and 'spawn' creates a fresh worker session each "
+                    "time using 'spawn_brief' as its initial instruction."
+                ),
+                handler=_schedule_task_handler,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "enum": ["session", "concierge", "spawn"],
+                            "description": "Where the task runs (default: session)",
+                        },
+                        "session_id": {"type": "string", "description": "Target session when target=session"},
+                        "spawn_brief": {"type": "string", "description": "Initial instruction for the spawned worker when target=spawn"},
+                        "interval_seconds": {"type": "integer", "description": "Interval in seconds (min 3600)"},
+                        "reason": {"type": "string", "description": "What to do when the task fires"},
+                    },
+                    "required": ["interval_seconds", "reason"],
+                },
+            ))
+
+            async def _cancel_schedule_handler(invocation: object) -> ToolResult:
+                args = getattr(invocation, "arguments", {}) or {}
+                rp = await _concierge_request("cancel_schedule", id=args.get("id", ""))
+                return _ok_or_error(rp, f"Cancelled schedule `{args.get('id')}`.")
+
+            custom_tools.append(Tool(
+                name="cancel_schedule",
+                description="Cancel a recurring schedule or timer by id (concierge only).",
+                handler=_cancel_schedule_handler,
+                parameters={
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                },
+            ))
+
 
         # ------------------------------------------------------------------
         # Git workstream tools — for local dev collaboration
@@ -4582,7 +4880,7 @@ async def main() -> None:
 
     # Create inbox directory for in-container service notifications
     # Clear stale files from previous runs to avoid re-delivering old notifications
-    inbox_dir = Path("/workspace/.enclave/inbox")
+    inbox_dir = _workspace_root() / ".enclave" / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
     for stale in inbox_dir.glob("*.json"):
         try:

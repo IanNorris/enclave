@@ -150,6 +150,7 @@ async def run() -> None:
         idle_timeout=config.idle_timeout,
         memory_config=config.memory,
         mimir_config=config.mimir,
+        concierge_config=config.concierge,
     )
     await router.start()
 

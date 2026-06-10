@@ -27,7 +27,12 @@ async function request(path, options = {}) {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || res.statusText)
+    const detail = err.detail
+    const msg = typeof detail === 'string' ? detail : (detail?.message || res.statusText)
+    const error = new Error(msg)
+    error.status = res.status
+    error.detail = detail
+    throw error
   }
   return res.json()
 }
@@ -107,7 +112,13 @@ export const api = {
   getArtifactContent: (id, filename) => request(`/sessions/${id}/artifacts/${filename}`),
   getArtifactDiff: (id, filename, v1, v2) => request(`/sessions/${id}/artifacts/${filename}/diff?v1=${v1}&v2=${v2}`),
   getArtifactVersions: (id, filename) => request(`/sessions/${id}/artifacts/${filename}/versions`),
+  saveArtifactContent: (id, filename, content, baseVersion = null) =>
+    request(`/sessions/${id}/artifacts/${filename}/content`, {
+      method: 'PUT',
+      body: JSON.stringify({ content, base_version: baseVersion }),
+    }),
   artifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}`,
+  rawArtifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}?raw=1`,
 
   // Deferred Asks
   getAsks: (sessionId, status = 'pending') => {
@@ -137,4 +148,21 @@ export const api = {
     body: JSON.stringify({ members }),
   }),
   getPanelModels: () => request('/panel/models'),
+
+  // Scheduling
+  getSchedules: () => request('/schedules'),
+  createSchedule: (payload) => request('/schedules', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+  cancelSchedule: (id) => request(`/schedules/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  }),
+
+  // Notifications (sessions needing a reply)
+  getNotifications: () => request('/notifications'),
+  getNotificationCount: () => request('/notifications/count'),
+  dismissNotification: (sessionId) => request(`/notifications/${encodeURIComponent(sessionId)}/dismiss`, {
+    method: 'POST',
+  }),
 }

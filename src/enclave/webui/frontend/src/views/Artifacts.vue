@@ -43,7 +43,18 @@
           <div class="header-actions">
             <button v-if="selectedArtifact.version > 1 && !showingDiff" class="btn-sm" @click="showVersionHistory">⏱ History</button>
             <button v-if="showingDiff" class="btn-sm" @click="closeDiff">✕ Close diff</button>
-            <a :href="authArtifactUrl(selectedArtifact.filename)" target="_blank" class="secondary open-link">Open ↗</a>
+            <router-link
+              v-if="isTextArtifact(selectedArtifact.filename)"
+              :to="{ name: 'chat', query: { doc: selectedArtifact.filename } }"
+              class="secondary open-link"
+            >✎ Edit in chat</router-link>
+            <router-link
+              v-if="isTextArtifact(selectedArtifact.filename)"
+              :to="{ name: 'artifact-preview', params: { session: selectedSession, filename: selectedArtifact.filename } }"
+              target="_blank"
+              class="secondary open-link"
+            >Open ↗</router-link>
+            <a v-else :href="authArtifactUrl(selectedArtifact.filename)" target="_blank" class="secondary open-link">Open ↗</a>
           </div>
         </div>
 
@@ -139,6 +150,10 @@ function authArtifactUrl(filename) {
   const token = localStorage.getItem('enclave_token')
   const base = api.artifactUrl(selectedSession.value, filename)
   return `${base}?token=${encodeURIComponent(token)}`
+}
+
+function isTextArtifact(filename) {
+  return /\.(md|txt|json|yaml|yml|csv|log)$/i.test(filename || '')
 }
 
 function toggleFileList() {

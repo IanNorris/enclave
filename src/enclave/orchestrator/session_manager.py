@@ -32,6 +32,17 @@ if TYPE_CHECKING:
 log = get_logger("sessions")
 
 
+# Reserved id for the always-on concierge session.  The concierge is a real
+# LLM agent bound to the Matrix control room that can spawn and manage other
+# sessions.  Its id is fixed (never slug+uuid) so it can be looked up reliably.
+CONCIERGE_SESSION_ID = "__concierge__"
+
+
+def is_concierge(session_id: str) -> bool:
+    """Return True if *session_id* is the reserved concierge session."""
+    return session_id == CONCIERGE_SESSION_ID
+
+
 # ── Session data ──────────────────────────────────────────────────────
 
 
@@ -250,9 +261,19 @@ class SessionManager:
         profile: str = "",
         user_display_name: str = "",
         user_pronouns: str = "",
+        session_id: str | None = None,
     ) -> Session:
-        """Create a new session (workspace, session dir, persistence)."""
-        session_id = f"{_slugify(name)}-{uuid.uuid4().hex[:8]}"
+        """Create a new session (workspace, session dir, persistence).
+
+        If *session_id* is provided it is used verbatim (after validation) —
+        used for the reserved concierge session.  Otherwise an id is derived
+        from the name plus a random suffix.
+        """
+        if session_id:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+                raise ValueError(f"Invalid explicit session_id: {session_id!r}")
+        else:
+            session_id = f"{_slugify(name)}-{uuid.uuid4().hex[:8]}"
 
         resolved_profile = profile or self.config.default_profile
         profile_obj = self.config.get_profile(resolved_profile)

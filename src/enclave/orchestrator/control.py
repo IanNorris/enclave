@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from enclave.webui.event_store import PERSIST_TYPES, persist_event
 from enclave.common import panel as panel_mod
+from enclave.orchestrator.session_manager import is_concierge
 
 if TYPE_CHECKING:
     from .router import MessageRouter
@@ -54,6 +55,11 @@ class ControlServer:
         self._subscribers: dict[str, set[asyncio.Queue[dict]]] = {}
         # Debounce timers for turn_end (cancel if turn_start follows)
         self._turn_end_timers: dict[str, asyncio.TimerHandle] = {}
+        # session_id → True if the agent's last turn ended awaiting user input
+        self._awaiting_input: dict[str, bool] = {}
+        # Global subscribers receiving cross-session notification events
+        # (awaiting_input / deferred_ask) for the Web UI notification panel.
+        self._notification_subscribers: set[asyncio.Queue[dict]] = set()
 
     async def start(self) -> None:
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,10 +149,38 @@ class ControlServer:
         for sid in list(self._subscribers.keys()):
             if sid != session_id:
                 self._emit(sid, {"ok": True, "type": "deferred_ask_badge", "session_id": session_id})
+        # Push to the global notification stream (panel + browser push)
+        self._emit_notification({
+            "type": "notification",
+            "reason": "deferred_ask",
+            "session_id": session_id,
+            "question": ask.get("question", ""),
+            "choices": ask.get("choices", []) or [],
+        })
 
     def notify_turn_start(self, session_id: str) -> None:
         """Called by the router when an agent turn begins."""
+        # A new turn means any previous "awaiting input" state is resolved.
+        self._awaiting_input.pop(session_id, None)
         self._emit(session_id, {"ok": True, "type": "turn_start"})
+
+    def is_awaiting_input(self, session_id: str) -> bool:
+        """Whether the session's last turn ended with the agent awaiting input."""
+        return self._awaiting_input.get(session_id, False)
+
+    def clear_awaiting_input(self, session_id: str) -> None:
+        """Clear the awaiting-input flag (e.g. after the user dismisses it)."""
+        self._awaiting_input.pop(session_id, None)
+        self._emit(session_id, {
+            "ok": True, "type": "awaiting_input",
+            "session_id": session_id, "awaiting_input": False,
+        })
+        self._emit_notification({
+            "type": "notification",
+            "reason": "cleared",
+            "session_id": session_id,
+            "awaiting_input": False,
+        })
 
     def notify_credits(self, session_id: str, payload: dict) -> None:
         """Called by the router with the latest account "AI Credits" snapshot.
@@ -156,6 +190,11 @@ class ControlServer:
         header refreshes without a reload.
         """
         self._emit(session_id, {"ok": True, "type": "credits", **payload})
+
+    def _emit_notification(self, event: dict) -> None:
+        """Push a cross-session notification event to all global subscribers."""
+        for q in list(self._notification_subscribers):
+            q.put_nowait(event)
 
     def _workspace_base_for(self, session_id: str) -> Path | None:
         """Resolve the workspace_base for a session's event store, or None.
@@ -183,23 +222,43 @@ class ControlServer:
         attached (new session, orchestrator restart, reconnect window) was
         silently dropped from events.db even though it streamed live.
         """
-        if event.get("type") in PERSIST_TYPES:
+        if event.get("type") in PERSIST_TYPES or (
+            event.get("type") == "thinking" and event.get("phase") == "end"
+        ):
             base = self._workspace_base_for(session_id)
             if base is not None:
                 persist_event(base, session_id, event)
         for q in self._subscribers.get(session_id, set()):
             q.put_nowait(event)
 
-    def notify_turn_end(self, session_id: str) -> None:
+    def notify_turn_end(self, session_id: str, awaiting_input: bool = False) -> None:
         """Called by the router when an agent's turn ends.
 
         Debounced: waits 2s before notifying subscribers, cancelled if a new
-        turn starts (agents do multiple turns per interaction).
+        turn starts (agents do multiple turns per interaction). When
+        ``awaiting_input`` is true the agent ended its turn asking the user a
+        question; we record it and broadcast an ``awaiting_input`` badge to all
+        subscribers so the notification panel can update live.
         """
         # Cancel any pending debounce
         timer = self._turn_end_timers.pop(session_id, None)
         if timer:
             timer.cancel()
+
+        self._awaiting_input[session_id] = awaiting_input
+        if awaiting_input:
+            for sid in list(self._subscribers.keys()):
+                if sid != session_id:
+                    self._emit(sid, {
+                        "ok": True, "type": "awaiting_input",
+                        "session_id": session_id, "awaiting_input": True,
+                    })
+            self._emit_notification({
+                "type": "notification",
+                "reason": "awaiting",
+                "session_id": session_id,
+                "awaiting_input": True,
+            })
 
         subs = self._subscribers.get(session_id)
         if not subs:
@@ -207,7 +266,10 @@ class ControlServer:
 
         def _fire() -> None:
             self._turn_end_timers.pop(session_id, None)
-            self._emit(session_id, {"ok": True, "type": "turn_end"})
+            self._emit(session_id, {
+                "ok": True, "type": "turn_end",
+                "awaiting_input": awaiting_input,
+            })
 
         loop = asyncio.get_event_loop()
         self._turn_end_timers[session_id] = loop.call_later(2.0, _fire)
@@ -236,6 +298,8 @@ class ControlServer:
                 await self._handle_send(req, writer, reader)
             elif action == "subscribe":
                 await self._handle_subscribe(req, writer, reader)
+            elif action == "subscribe_notifications":
+                await self._handle_subscribe_notifications(writer)
             elif action == "stop":
                 await self._handle_stop(req, writer)
             elif action == "start":
@@ -254,6 +318,14 @@ class ControlServer:
                 await self._handle_panel_set(req, writer)
             elif action == "create":
                 await self._handle_create(req, writer)
+            elif action == "schedule_list":
+                await self._handle_schedule_list(writer)
+            elif action == "schedule_add":
+                await self._handle_schedule_add(req, writer)
+            elif action == "schedule_cancel":
+                await self._handle_schedule_cancel(req, writer)
+            elif action == "clear_awaiting":
+                await self._handle_clear_awaiting(req, writer)
             else:
                 await self._write(writer, {"ok": False, "error": f"Unknown action: {action}"})
         except asyncio.TimeoutError:
@@ -281,6 +353,8 @@ class ControlServer:
                 "name": session.name,
                 "status": session.status,
                 "room_id": session.room_id,
+                "concierge": is_concierge(session.id),
+                "awaiting_input": self._awaiting_input.get(session.id, False),
             })
         await self._write(writer, {"ok": True, "type": "sessions", "sessions": sessions})
 
@@ -383,10 +457,11 @@ class ControlServer:
 
         try:
             runtime = self._router.sessions.config.runtime
+            from enclave.orchestrator.container import _container_name
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    [runtime, "exec", session_id, "python3", "-c", script],
+                    [runtime, "exec", _container_name(session_id), "python3", "-c", script],
                     capture_output=True, text=True, timeout=20,
                 ),
             )
@@ -529,6 +604,129 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": error})
             return
         await self._write(writer, {"ok": True, "type": "created", "session": session_id})
+
+    async def _handle_schedule_list(self, writer: asyncio.StreamWriter) -> None:
+        """List all recurring schedules and one-shot timers."""
+        sched = self._router._scheduler
+        sessions = {s.id: s.name for s in self._router.containers.list_sessions()}
+
+        def _name(sid: str) -> str:
+            if is_concierge(sid):
+                return "Concierge"
+            return sessions.get(sid, sid)
+
+        schedules = [
+            {
+                "id": e.id,
+                "session_id": e.session_id,
+                "session_name": _name(e.session_id),
+                "interval_seconds": e.interval_seconds,
+                "reason": e.reason,
+                "next_fire": e.next_fire,
+                "target": getattr(e, "target", "session"),
+                "spawn_brief": getattr(e, "spawn_brief", ""),
+                "kind": "recurring",
+            }
+            for e in sched.list_schedules()
+        ]
+        timers = [
+            {
+                "id": e.id,
+                "session_id": e.session_id,
+                "session_name": _name(e.session_id),
+                "fire_at": e.fire_at,
+                "reason": e.reason,
+                "target": getattr(e, "target", "session"),
+                "spawn_brief": getattr(e, "spawn_brief", ""),
+                "kind": "timer",
+            }
+            for e in sched.list_timers()
+        ]
+        await self._write(
+            writer,
+            {"ok": True, "type": "schedules", "schedules": schedules, "timers": timers},
+        )
+
+    async def _handle_schedule_add(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Add a recurring schedule via the web UI."""
+        target = req.get("target", "session")
+        reason = (req.get("reason") or "").strip()
+        interval = int(req.get("interval_seconds", 0) or 0)
+        spawn_brief = req.get("spawn_brief", "")
+        session_id = req.get("session_id", "")
+
+        if not reason:
+            await self._write(writer, {"ok": False, "error": "reason is required"})
+            return
+        if target == "concierge":
+            session_id = "__concierge__"
+        elif target == "session":
+            if not session_id:
+                await self._write(writer, {"ok": False, "error": "session_id is required"})
+                return
+            if not is_concierge(session_id) and \
+                    not self._router.containers.get_session(session_id):
+                await self._write(writer, {"ok": False, "error": f"No such session: {session_id}"})
+                return
+        else:  # spawn
+            session_id = session_id or "__concierge__"
+
+        import time as _time
+        sched_id = req.get("id") or f"sched-{session_id}-{int(_time.time())}"
+        result = self._router._scheduler.add_schedule(
+            schedule_id=sched_id,
+            session_id=session_id,
+            interval_seconds=interval,
+            reason=reason,
+            target=target,
+            spawn_brief=spawn_brief,
+        )
+        if isinstance(result, str):
+            await self._write(writer, {"ok": False, "error": result})
+            return
+        await self._write(
+            writer,
+            {"ok": True, "type": "scheduled", "id": result.id, "next_fire": result.next_fire},
+        )
+
+    async def _handle_schedule_cancel(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Cancel a recurring schedule or timer."""
+        sched_id = req.get("id", "")
+        if not sched_id:
+            await self._write(writer, {"ok": False, "error": "id is required"})
+            return
+        found = self._router._scheduler.cancel_schedule(sched_id) or \
+            self._router._scheduler.cancel_timer(sched_id)
+        await self._write(writer, {"ok": found, "type": "cancelled", "id": sched_id})
+
+    async def _handle_clear_awaiting(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Clear a session's awaiting-input flag (notification dismiss)."""
+        session_id = req.get("session", "")
+        if not session_id:
+            await self._write(writer, {"ok": False, "error": "Missing session"})
+            return
+        self.clear_awaiting_input(session_id)
+        await self._write(writer, {"ok": True, "type": "awaiting_cleared", "session": session_id})
+
+    async def _handle_subscribe_notifications(self, writer: asyncio.StreamWriter) -> None:
+        """Subscribe to the global cross-session notification stream."""
+        q: asyncio.Queue[dict] = asyncio.Queue()
+        self._notification_subscribers.add(q)
+        try:
+            await self._write(writer, {"ok": True, "type": "subscribed_notifications"})
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=600.0)
+                    await self._write(writer, msg)
+                except asyncio.TimeoutError:
+                    try:
+                        await self._write(writer, {"ok": True, "type": "ping"})
+                    except (ConnectionError, OSError):
+                        break
+                except (ConnectionError, OSError):
+                    break
+        finally:
+            self._notification_subscribers.discard(q)
 
     async def _handle_subscribe(
         self,
