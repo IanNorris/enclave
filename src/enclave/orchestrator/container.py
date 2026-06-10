@@ -266,6 +266,29 @@ class ContainerManager:
                     "on host — skipping", session.id,
                 )
 
+        # Smartcard: bind-mount the host pcscd socket so the container's PC/SC
+        # stack (opensc, GlobalPlatformPro) talks to the host pcscd that owns the
+        # USB CCID reader. This is a unix-socket bridge (no USB passthrough), so
+        # it works with network=none and grants full APDU access — read, write
+        # and applet install/delete (card reprogramming).
+        if profile.smartcard:
+            pcscd_dir = Path("/run/pcscd")
+            pcscd_sock = pcscd_dir / "pcscd.comm"
+            if pcscd_sock.exists():
+                cmd.extend([
+                    "-v", f"{pcscd_dir}:/run/pcscd:rw",
+                    "-e", "PCSCLITE_CSOCK_NAME=/run/pcscd/pcscd.comm",
+                ])
+                log.info(
+                    "[start:%s] Smartcard enabled (pcscd socket bridged)",
+                    session.id,
+                )
+            else:
+                log.warning(
+                    "[start:%s] Profile requests smartcard but %s missing on "
+                    "host — is pcscd running? Skipping", session.id, pcscd_sock,
+                )
+
         # GUI passthrough: mount Wayland socket + GPU for direct rendering
         if profile.gui:
             xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")

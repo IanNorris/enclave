@@ -45,6 +45,7 @@ class ContainerProfile:
     gui: bool = False
     yolo: bool = False
     fuse: bool = False  # expose /dev/fuse + SYS_ADMIN for user-space mounts
+    smartcard: bool = False  # bind-mount the host pcscd socket for PC/SC card access
     description: str = ""
 
 
@@ -90,6 +91,14 @@ class ContainerConfig:
             nix_store=False,
             host_mounts=False,
             description="🖥️ Host (no container)",
+        ),
+        "smartcard": ContainerProfile(
+            image="enclave-agent:latest",
+            nix_store=True,
+            host_mounts=False,
+            fuse=True,
+            smartcard=True,
+            description="💳 Smartcard (PC/SC reader access)",
         ),
     })
     default_profile: str = "dev"
@@ -316,6 +325,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                         gui=pdata.get("gui", False),
                         yolo=pdata.get("yolo", False),
                         fuse=pdata.get("fuse", False),
+                        smartcard=pdata.get("smartcard", False),
                         description=pdata.get("description", ""),
                     )
 

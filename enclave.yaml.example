@@ -54,6 +54,15 @@ container:
       gui: false                            # Host agents use display directly
       yolo: false
       description: "🖥️ Host (no container)"
+    smartcard:                              # Like dev, plus host pcscd socket bridge
+      image: "enclave-agent:latest"
+      nix_store: true
+      host_mounts: true
+      gui: true
+      yolo: false
+      fuse: true
+      smartcard: true                       # Bind-mount /run/pcscd for PC/SC reader access
+      description: "💳 Smartcard (PC/SC reader access)"
 
   # Read-only host paths bind-mounted into containers as /host/<path>.
   # Only used when a profile has host_mounts: true.
