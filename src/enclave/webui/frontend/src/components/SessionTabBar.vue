@@ -1,6 +1,6 @@
 <template>
   <div class="session-tabbar" v-if="selectedSessionId">
-    <!-- Left: tabs (desktop) / dropdown (mobile) + AI credits -->
+    <!-- Left: tabs (desktop) / dropdown (mobile) -->
     <div class="tabbar-left">
       <nav class="tabs" role="tablist">
         <router-link
@@ -23,21 +23,22 @@
           </option>
         </select>
       </div>
-
-      <span v-if="creditsLabel" class="ai-credits" :title="creditsTitle">{{ creditsLabel }}</span>
     </div>
 
-    <!-- Right: model picker -->
-    <div class="model-picker" v-if="models.available.length">
-      <select v-model="currentModel" @change="changeModel(selectedSessionId)" class="model-select">
-        <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
-      </select>
-      <button
-        class="model-refresh"
-        @click="refreshModels(selectedSessionId)"
-        :disabled="modelsRefreshing"
-        title="Refresh model list"
-      >{{ modelsRefreshing ? '⟳' : '↻' }}</button>
+    <!-- Right: AI credits + model picker -->
+    <div class="tabbar-right">
+      <span v-if="creditsLabel" class="ai-credits" :title="creditsTitle">{{ creditsLabel }}</span>
+      <div class="model-picker" v-if="models.available.length">
+        <select v-model="currentModel" @change="changeModel(selectedSessionId)" class="model-select">
+          <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <button
+          class="model-refresh"
+          @click="refreshModels(selectedSessionId)"
+          :disabled="modelsRefreshing"
+          title="Refresh model list"
+        >{{ modelsRefreshing ? '⟳' : '↻' }}</button>
+      </div>
     </div>
   </div>
 </template>
@@ -129,11 +130,20 @@ watch(selectedSessionId, (id) => {
 .tab.active {
   background: var(--bg-active);
   color: var(--accent);
-  font-weight: 500;
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .tab-icon {
   font-size: 1rem;
+}
+
+.tabbar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 .tabs-mobile {
@@ -182,7 +192,12 @@ watch(selectedSessionId, (id) => {
   cursor: pointer;
   width: 2rem;
   height: 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-size: 0.9rem;
+  line-height: 1;
+  padding: 0;
   flex-shrink: 0;
 }
 

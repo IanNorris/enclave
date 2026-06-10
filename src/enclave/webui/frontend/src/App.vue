@@ -29,19 +29,20 @@
       <div class="session-list-section">
         <div class="session-list-header">
           <span>Sessions</span>
-          <button class="new-session-btn" title="New session" @click="openNewSession">➕</button>
         </div>
         <ul class="session-list">
           <li
             v-for="s in recentSessions"
             :key="s.id"
             class="session-row"
-            :class="{ active: s.id === selectedSessionId }"
+            :class="{ active: s.id === selectedSessionId, pending: isAwaiting(s.id) }"
           >
             <button class="session-pick" @click="pickSession(s.id)">
-              <span class="session-name">
-                {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}<span v-if="s.status === 'running'" class="run-dot">●</span>
+              <span class="status-icon" :class="rowState(s)">
+                <span v-if="isAwaiting(s.id)" class="q-flash">?</span>
+                <span v-else class="dot"></span>
               </span>
+              <span class="session-name">{{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}</span>
             </button>
             <button
               v-if="!s.concierge"
@@ -51,6 +52,12 @@
             >🗄️</button>
           </li>
           <li v-if="!recentSessions.length" class="session-empty muted">No sessions</li>
+          <li class="session-row new-row">
+            <button class="session-pick" @click="openNewSession">
+              <span class="status-icon"><span class="new-glyph">＋</span></span>
+              <span class="session-name">New session…</span>
+            </button>
+          </li>
         </ul>
         <button v-if="hasMoreSessions" class="session-more" @click="showAllSessions = true">
           More… ({{ activeSessions.length }})
@@ -71,12 +78,14 @@
               v-for="s in allSessionsSorted"
               :key="s.id"
               class="session-row"
-              :class="{ active: s.id === selectedSessionId }"
+              :class="{ active: s.id === selectedSessionId, pending: isAwaiting(s.id) }"
             >
               <button class="session-pick" @click="pickSession(s.id); showAllSessions = false">
-                <span class="session-name">
-                  {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}<span v-if="s.status === 'running'" class="run-dot">●</span>
+                <span class="status-icon" :class="rowState(s)">
+                  <span v-if="isAwaiting(s.id)" class="q-flash">?</span>
+                  <span v-else class="dot"></span>
                 </span>
+                <span class="session-name">{{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}</span>
                 <span v-if="s.archived" class="archived-tag">archived</span>
               </button>
               <button
@@ -169,7 +178,7 @@
     </nav>
     <main class="content">
       <SessionTabBar v-if="isSessionRoute" />
-      <div class="content-body">
+      <div class="content-body" :class="{ 'content-flush': isChatRoute }">
         <router-view />
       </div>
     </main>
@@ -219,6 +228,17 @@ function pickSession(id) {
   if (!isSessionRoute.value) router.push('/chat')
 }
 
+// Sessions currently awaiting a reply / with a pending question (from the
+// notifications feed) so their row can pulse and flash a "?".
+const awaitingIds = computed(() => new Set(notifications.value.map(n => n.session_id)))
+function isAwaiting(id) {
+  return awaitingIds.value.has(id)
+}
+function rowState(s) {
+  if (isAwaiting(s.id)) return 'pending'
+  return s.status === 'running' ? 'running' : 'stopped'
+}
+
 async function archiveSession(s) {
   try {
     await api.archiveSession(s.id)
@@ -247,6 +267,7 @@ const SESSION_ROUTE_NAMES = new Set([
   'chat', 'bugs', 'bug-detail', 'artifacts', 'artifact-preview', 'timeline', 'session-settings',
 ])
 const isSessionRoute = computed(() => SESSION_ROUTE_NAMES.has(route.name))
+const isChatRoute = computed(() => route.name === 'chat')
 
 const isLoginPage = computed(() => route.name === 'login')
 const hasToken = ref(!!localStorage.getItem('enclave_token'))
@@ -448,7 +469,7 @@ watch(isLoginPage, (isLogin) => {
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: 1rem 0;
+  padding: 1rem 0 0;
   flex-shrink: 0;
 }
 
@@ -505,14 +526,63 @@ watch(isLoginPage, (isLogin) => {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.5rem;
   background: none;
   border: none;
   text-align: left;
   cursor: pointer;
-  padding: 0.45rem 0.5rem;
+  padding: 0.5rem 0.5rem;
   color: var(--text-secondary);
-  font-size: 0.85rem;
+  font-size: 1.1rem;
+}
+
+.status-icon {
+  width: 1.2em;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.95em;
+}
+
+.status-icon .dot {
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 50%;
+  background: #6b7280;
+}
+
+.status-icon.running .dot {
+  background: #22c55e;
+}
+
+.status-icon.pending .q-flash {
+  color: var(--accent);
+  font-weight: 700;
+  animation: qFlash 1s steps(1, end) infinite;
+}
+
+.new-glyph {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.new-row .session-pick {
+  color: var(--accent);
+}
+
+.session-row.pending {
+  animation: rowPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes qFlash {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.15; }
+}
+
+@keyframes rowPulse {
+  0%, 100% { background: transparent; }
+  50% { background: var(--bg-active); }
 }
 
 .session-row.active .session-pick {
@@ -875,6 +945,14 @@ watch(isLoginPage, (isLogin) => {
   overflow-y: auto;
   padding: 2rem;
   min-height: 0;
+}
+
+/* Full-height app views (chat) manage their own scrolling and padding. */
+.content-body.content-flush {
+  overflow: hidden;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 /* ─── Settings footer ─── */

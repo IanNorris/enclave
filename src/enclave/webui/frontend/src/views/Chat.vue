@@ -1,12 +1,15 @@
 <template>
   <div class="chat-view" @dragover.prevent="onDragOver" @dragleave="onDragLeave" @drop.prevent="onDrop">
-    <div class="chat-header">
-      <h2>Chat</h2>
-      <div v-if="selectedSession && agentState !== 'unknown'" class="agent-status" :class="agentStateClass">
+    <div v-if="selectedSession" class="chat-body" :class="bodyClass">
+      <div class="chat-container" :style="chatPaneStyle">
+      <!-- Floating agent status (non-scrolling) -->
+      <div v-if="agentState !== 'unknown'" class="agent-status-float" :class="agentStateClass">
         <span class="status-indicator"></span>
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
-      <div v-if="selectedSession" class="doc-controls">
+
+      <!-- Artifacts handle on the right edge -->
+      <div class="doc-tools">
         <button
           v-if="openDoc && !isMobilePortrait"
           class="doc-orient-btn"
@@ -14,7 +17,7 @@
           @click="toggleOuterOrientation"
         >{{ outerOrientation === 'horizontal' ? '⬍' : '⬌' }}</button>
         <div class="doc-menu-wrap">
-          <button class="doc-open-btn" @click="toggleDocMenu" title="Open a document beside the chat">📄</button>
+          <button class="doc-handle" @click="toggleDocMenu" title="Open a document beside the chat">📄</button>
           <div v-if="docMenuOpen" class="doc-menu">
             <div v-if="!docList.length" class="doc-menu-empty muted">No editable documents</div>
             <button
@@ -27,10 +30,7 @@
           </div>
         </div>
       </div>
-    </div>
 
-    <div v-if="selectedSession" class="chat-body" :class="bodyClass">
-      <div class="chat-container" :style="chatPaneStyle">
       <!-- Drop overlay -->
       <div v-if="dragging" class="drop-overlay">
         <div class="drop-label">Drop files to attach</div>
@@ -496,6 +496,20 @@ const sending = ref(false)
 const messagesEl = ref(null)
 const inputEl = ref(null)
 
+// ─── Per-session draft persistence ───
+// Keep an unsent message around if the user navigates away and returns.
+const DRAFT_PREFIX = 'enclave_chat_draft_'
+function draftKey(id) { return DRAFT_PREFIX + id }
+function loadDraft(id) {
+  draft.value = id ? (localStorage.getItem(draftKey(id)) || '') : ''
+}
+watch(draft, (v) => {
+  const id = selectedSession.value
+  if (!id) return
+  if (v) localStorage.setItem(draftKey(id), v)
+  else localStorage.removeItem(draftKey(id))
+})
+
 // ─── Mermaid diagram rendering ───
 let _mermaidObserver = null
 let _mermaidTimer = null
@@ -601,6 +615,7 @@ onMounted(async () => {
     loadHistory()
     loadDocList()
   }
+  loadDraft(selectedSession.value)
   window.addEventListener('keydown', onLightboxKey)
 })
 
@@ -633,6 +648,7 @@ watch(selectedSession, (newVal) => {
   clearLiveState()
   docMenuOpen.value = false
   restoreOpenDoc()
+  loadDraft(newVal)
   if (newVal) { loadHistory(); loadDocList() }
 })
 
@@ -1325,8 +1341,75 @@ function formatTime(ts) {
 .chat-view {
   display: flex;
   flex-direction: column;
-  height: calc(100dvh - 4rem);
+  height: 100%;
+  min-height: 0;
   overflow-x: hidden;
+}
+
+/* Floating agent status pill (sits above the messages, does not scroll). */
+.agent-status-float {
+  position: absolute;
+  top: 0.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: #999;
+  padding: 0.2rem 0.7rem;
+  border-radius: 12px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+
+.agent-status-float .status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #666;
+}
+
+/* Artifacts handle on the right edge of the chat pane. */
+.doc-tools {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: flex-end;
+}
+
+.doc-handle {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+  cursor: pointer;
+  padding: 0.6rem 0.4rem;
+  font-size: 1.1rem;
+  line-height: 1;
+  box-shadow: -1px 0 4px rgba(0,0,0,0.15);
+}
+
+.doc-handle:hover {
+  background: var(--bg-hover);
+}
+
+.doc-orient-btn {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+  cursor: pointer;
+  padding: 0.5rem 0.4rem;
+  font-size: 1rem;
+  line-height: 1;
 }
 
 .chat-header {
@@ -1439,7 +1522,7 @@ function formatTime(ts) {
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 1rem 0;
+  padding: 1.5rem 1.5rem 1rem;
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -1688,8 +1771,8 @@ function formatTime(ts) {
 .input-bar {
   display: flex;
   gap: 0.75rem;
-  padding: 1rem 0 0;
-  padding-bottom: env(safe-area-inset-bottom, 0);
+  padding: 1rem 1.5rem;
+  padding-bottom: max(1rem, env(safe-area-inset-bottom, 0));
   border-top: 1px solid var(--border);
   align-items: flex-end;
   max-width: 100%;
