@@ -62,6 +62,7 @@ container:
       yolo: false
       fuse: true
       smartcard: true                       # Bind-mount /run/pcscd for PC/SC reader access
+      persist_home: true                    # Persist $HOME (build caches) across restarts in <workspace>/.home
       description: "💳 Smartcard (PC/SC reader access)"
 
   # Read-only host paths bind-mounted into containers as /host/<path>.

@@ -131,6 +131,24 @@ class ContainerManager:
         if session.id == "__concierge__":
             cmd.extend(["-e", "ENCLAVE_CONCIERGE=1"])
 
+        # Persistent HOME: bind-mount a workspace-backed directory over the
+        # container's $HOME so dotfile caches (.m2, .gradle, .cargo, .cache, …)
+        # survive restarts. The container is started with --rm, so $HOME
+        # normally lives in the throwaway overlay and is wiped each start;
+        # /workspace persists, so <workspace>/.home does too. Safe because the
+        # nix PATH/NIX_PATH come from the container env (not .bashrc) and the
+        # copilot session lives in /workspace/.copilot-state, not $HOME — an
+        # empty first-run .home still works and simply starts caching.
+        if getattr(profile, "persist_home", False):
+            persist_home = Path(session.workspace_path) / ".home"
+            try:
+                persist_home.mkdir(parents=True, exist_ok=True)
+                cmd.extend(["-v", f"{persist_home}:/home/agent"])
+                log.info("[start:%s] Persistent HOME: %s -> /home/agent", session.id, persist_home)
+            except OSError as e:
+                log.warning("[start:%s] Could not create persistent HOME %s: %s",
+                            session.id, persist_home, e)
+
         # Bind-mount the agent prompt files read-only so edits to the prompt
         # markdown on the host take effect on the next session start WITHOUT
         # rebuilding the container image. The orchestrator runs from an editable
