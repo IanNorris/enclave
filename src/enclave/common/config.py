@@ -45,6 +45,8 @@ class ContainerProfile:
     gui: bool = False
     yolo: bool = False
     fuse: bool = False  # expose /dev/fuse + SYS_ADMIN for user-space mounts
+    smartcard: bool = False  # bind-mount the host pcscd socket for PC/SC card access
+    persist_home: bool = False  # bind-mount <workspace>/.home over $HOME so caches persist
     description: str = ""
 
 
@@ -77,12 +79,14 @@ class ContainerConfig:
             nix_store=True,
             host_mounts=False,
             fuse=True,
+            persist_home=True,
             description="🛠️ Native App Development",
         ),
         "light": ContainerProfile(
             image="enclave-light:latest",
             nix_store=False,
             host_mounts=False,
+            persist_home=True,
             description="💬 General",
         ),
         "host": ContainerProfile(
@@ -90,6 +94,15 @@ class ContainerConfig:
             nix_store=False,
             host_mounts=False,
             description="🖥️ Host (no container)",
+        ),
+        "smartcard": ContainerProfile(
+            image="enclave-agent:latest",
+            nix_store=True,
+            host_mounts=False,
+            fuse=True,
+            smartcard=True,
+            persist_home=True,
+            description="💳 Smartcard (PC/SC reader access)",
         ),
     })
     default_profile: str = "dev"
@@ -316,6 +329,8 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                         gui=pdata.get("gui", False),
                         yolo=pdata.get("yolo", False),
                         fuse=pdata.get("fuse", False),
+                        smartcard=pdata.get("smartcard", False),
+                        persist_home=pdata.get("persist_home", False),
                         description=pdata.get("description", ""),
                     )
 

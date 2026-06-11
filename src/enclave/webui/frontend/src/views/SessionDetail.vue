@@ -1,7 +1,7 @@
 <template>
   <div class="session-detail" v-if="session">
     <div class="header">
-      <button class="secondary" @click="$router.push('/sessions')">← Back</button>
+      <button v-if="!tabMode" class="secondary" @click="$router.push('/sessions')">← Back</button>
       <h2>{{ session.name }}</h2>
       <span class="badge" :class="session.status">{{ session.status }}</span>
     </div>
@@ -134,15 +134,23 @@
       </div>
     </div>
   </div>
+  <div v-else-if="tabMode" class="empty card">
+    <p>Select a session from the sidebar to view its settings.</p>
+  </div>
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api.js'
+import { useSessionStore } from '../stores/session.js'
 
 const route = useRoute()
-const id = route.params.id
+const { selectedSessionId } = useSessionStore()
+// In "tab mode" (reached via the session tab bar) there's no :id route param,
+// so we bind to the globally selected session instead.
+const tabMode = computed(() => !route.params.id)
+const id = computed(() => route.params.id || selectedSessionId.value)
 
 const session = ref(null)
 const tabs = ['Logs', 'State', 'Snapshots', 'Prompt']
@@ -168,16 +176,27 @@ const analyzing = ref(false)
 const analysisSent = ref(false)
 const analysisResult = ref('')
 
-onMounted(async () => {
+async function loadSession() {
+  if (!id.value) { session.value = null; return }
   const sessions = await api.getSessions()
-  session.value = sessions.find(s => s.id === id) || { id, name: id, status: 'unknown' }
+  session.value = sessions.find(s => s.id === id.value) || { id: id.value, name: id.value, status: 'unknown' }
+  // Reset per-session view state and reload.
+  stateFiles.value = []
+  selectedFile.value = null
+  fileContent.value = null
+  sessionPrompt.value = ''
+  basePrompts.value = {}
   loadLogs()
   loadSnapshots()
-})
+}
+
+onMounted(loadSession)
+// Reload when the selected session changes while staying on this view (tab mode).
+watch(id, loadSession)
 
 async function loadLogs() {
   try {
-    const data = await api.getLogs(id, 500)
+    const data = await api.getLogs(id.value, 500)
     logs.value = data.lines?.join('\n') || data.output || ''
     await nextTick()
     if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
@@ -188,7 +207,7 @@ async function loadLogs() {
 
 async function loadState() {
   try {
-    const data = await api.getState(id)
+    const data = await api.getState(id.value)
     stateFiles.value = data.files || []
   } catch (e) {
     stateFiles.value = []
@@ -198,7 +217,7 @@ async function loadState() {
 async function viewFile(path) {
   selectedFile.value = path
   try {
-    const data = await api.getStateFile(id, path)
+    const data = await api.getStateFile(id.value, path)
     fileContent.value = data.content || '(empty)'
   } catch (e) {
     fileContent.value = `Error: ${e.message}`
@@ -207,23 +226,23 @@ async function viewFile(path) {
 
 async function loadSnapshots() {
   try {
-    snapshots.value = await api.getSnapshots(id)
+    snapshots.value = await api.getSnapshots(id.value)
   } catch { snapshots.value = [] }
 }
 
 async function stop() {
-  await api.stopSession(id)
+  await api.stopSession(id.value)
   session.value.status = 'stopped'
 }
 
 async function restart() {
-  await api.restartSession(id)
+  await api.restartSession(id.value)
   session.value.status = 'running'
 }
 
 async function clearState() {
   if (!confirm('Clear all session state? This cannot be undone.')) return
-  await api.clearState(id)
+  await api.clearState(id.value)
   stateFiles.value = []
   fileContent.value = null
 }
@@ -232,7 +251,7 @@ async function createSnapshot() {
   if (!snapshotName.value.trim()) return
   snapshotCreating.value = true
   try {
-    await api.createSnapshot(id, snapshotName.value.trim())
+    await api.createSnapshot(id.value, snapshotName.value.trim())
     showSnapshot.value = false
     snapshotName.value = ''
     activeTab.value = 'Snapshots'
@@ -243,12 +262,12 @@ async function createSnapshot() {
 }
 
 function downloadSnapshot(filename) {
-  window.open(`/api/sessions/${id}/snapshots/${filename}/download`, '_blank')
+  window.open(`/api/sessions/${id.value}/snapshots/${filename}/download`, '_blank')
 }
 
 async function deleteSnapshot(filename) {
   if (!confirm('Delete this snapshot?')) return
-  await api.deleteSnapshot(id, filename)
+  await api.deleteSnapshot(id.value, filename)
   loadSnapshots()
 }
 
@@ -259,7 +278,6 @@ function formatSize(bytes) {
 }
 
 // Load state when tab switches
-import { watch } from 'vue'
 watch(activeTab, (tab) => {
   if (tab === 'State' && !stateFiles.value.length) loadState()
   if (tab === 'Prompt' && !sessionPrompt.value && !Object.keys(basePrompts.value).length) loadPrompt()
@@ -267,7 +285,7 @@ watch(activeTab, (tab) => {
 
 async function loadPrompt() {
   try {
-    const data = await api.getSessionPrompt(id)
+    const data = await api.getSessionPrompt(id.value)
     sessionPrompt.value = data.session_prompt || ''
     basePrompts.value = data.base_prompts || {}
   } catch (e) {
@@ -279,7 +297,7 @@ async function savePrompt() {
   promptSaving.value = true
   promptSaved.value = false
   try {
-    await api.updateSessionPrompt(id, sessionPrompt.value)
+    await api.updateSessionPrompt(id.value, sessionPrompt.value)
     promptSaved.value = true
     setTimeout(() => { promptSaved.value = false }, 3000)
   } catch (e) {
@@ -295,7 +313,7 @@ async function analyzeContext() {
   analysisResult.value = ''
   try {
     const message = `/analyze-context Analyze your current session context. Produce a concise summary of:\n1. Key information you have about this session that is NOT in your system prompt documents\n2. Important facts, patterns, or decisions that emerged during conversation\n3. Anything that would be valuable to add to the session prompt for future reference\n\nBe specific and actionable.`
-    await api.sendChatMessage(id, message)
+    await api.sendChatMessage(id.value, message)
     analysisSent.value = true
   } catch (e) {
     console.error('Failed to send context analysis request:', e)

@@ -14,6 +14,11 @@ const routes = [
     component: () => import('./views/SessionDetail.vue'),
   },
   {
+    path: '/session/settings',
+    name: 'session-settings',
+    component: () => import('./views/SessionDetail.vue'),
+  },
+  {
     path: '/bugs',
     name: 'bugs',
     component: () => import('./views/Bugs.vue'),

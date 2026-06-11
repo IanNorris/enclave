@@ -4,17 +4,9 @@
   </div>
   <div v-else class="app">
     <!-- Mobile header -->
-    <div class="mobile-header">
+    <div class="mobile-header" :class="{ 'mobile-hidden': isSessionRoute }">
       <button class="hamburger" @click="sidebarOpen = !sidebarOpen">☰</button>
       <span class="mobile-title">Enclave</span>
-      <!-- Session selector surfaced in the top bar while the sidebar is collapsed -->
-      <select v-model="selectedSessionId" class="mobile-session-select" aria-label="Active session">
-        <option value="">No session</option>
-        <option v-for="s in activeSessions" :key="s.id" :value="s.id">
-          {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
-        </option>
-      </select>
-      <button class="mobile-new-session-btn" title="New session" @click="openNewSession">➕</button>
     </div>
 
     <!-- Sidebar overlay for mobile -->
@@ -25,15 +17,85 @@
         <h1>Enclave</h1>
       </div>
 
-      <!-- Global session selector -->
-      <div class="session-selector">
-        <select v-model="selectedSessionId" class="session-select">
-          <option value="">No session</option>
-          <option v-for="s in activeSessions" :key="s.id" :value="s.id">
-            {{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}{{ s.status === 'running' ? ' ●' : '' }}
-          </option>
-        </select>
-        <button class="new-session-btn" title="New session" @click="openNewSession">➕</button>
+      <!-- Recency-sorted session switcher -->
+      <div class="session-list-section">
+        <div class="session-list-header">
+          <span>Sessions</span>
+        </div>
+        <ul class="session-list">
+          <li class="session-row new-row">
+            <button class="session-pick" @click="openNewSession">
+              <span class="status-icon"><span class="new-glyph">＋</span></span>
+              <span class="session-name">New session…</span>
+            </button>
+          </li>
+          <li
+            v-for="s in recentSessions"
+            :key="s.id"
+            class="session-row"
+            :class="{ active: s.id === selectedSessionId, pending: isAwaiting(s.id) }"
+          >
+            <button class="session-pick" @click="pickSession(s.id)">
+              <span class="status-icon" :class="rowState(s)">
+                <span v-if="rowState(s) === 'pending'" class="q-flash">?</span>
+                <span v-else-if="rowState(s) === 'tool'" class="act-cog">⚙</span>
+                <span v-else-if="rowState(s) === 'thinking'" class="act-brain">🧠</span>
+                <span v-else class="dot"></span>
+              </span>
+              <span class="session-name">{{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}</span>
+            </button>
+            <button
+              v-if="!s.concierge"
+              class="session-archive"
+              title="Archive (hide from list)"
+              @click.stop="archiveSession(s)"
+            >🗄️</button>
+          </li>
+          <li v-if="!recentSessions.length" class="session-empty muted">No sessions</li>
+        </ul>
+        <button v-if="hasMoreSessions" class="session-more" @click="showAllSessions = true">
+          More… ({{ activeSessions.length }})
+        </button>
+      </div>
+
+      <!-- All-sessions popup -->
+      <div v-if="showAllSessions" class="modal-overlay" @click.self="showAllSessions = false">
+        <div class="modal session-modal">
+          <div class="session-modal-head">
+            <h3>All sessions</h3>
+            <label class="show-archived">
+              <input type="checkbox" v-model="showArchived" /> Show archived
+            </label>
+          </div>
+          <ul class="session-modal-list">
+            <li
+              v-for="s in allSessionsSorted"
+              :key="s.id"
+              class="session-row"
+              :class="{ active: s.id === selectedSessionId, pending: isAwaiting(s.id) }"
+            >
+              <button class="session-pick" @click="pickSession(s.id); showAllSessions = false">
+                <span class="status-icon" :class="rowState(s)">
+                  <span v-if="rowState(s) === 'pending'" class="q-flash">?</span>
+                  <span v-else-if="rowState(s) === 'tool'" class="act-cog">⚙</span>
+                  <span v-else-if="rowState(s) === 'thinking'" class="act-brain">🧠</span>
+                  <span v-else class="dot"></span>
+                </span>
+                <span class="session-name">{{ s.concierge ? '🛎️ ' : '' }}{{ s.name }}</span>
+                <span v-if="s.archived" class="archived-tag">archived</span>
+              </button>
+              <button
+                v-if="!s.concierge"
+                class="session-archive"
+                :title="s.archived ? 'Unarchive' : 'Archive'"
+                @click.stop="archiveSession(s)"
+              >{{ s.archived ? '↩️' : '🗄️' }}</button>
+            </li>
+          </ul>
+          <div class="modal-actions">
+            <button class="secondary" @click="showAllSessions = false">Close</button>
+          </div>
+        </div>
       </div>
 
       <!-- New session modal -->
@@ -64,79 +126,34 @@
         </div>
       </div>
 
-      <ul class="nav-links">
-        <li>
-          <router-link to="/sessions" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">⚙</span> Sessions
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/chat" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">💬</span> Chat
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/bugs" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">🐛</span> Bugs
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/memories" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">🧠</span> Memories
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/panel" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">🎛️</span> Panel
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/schedules" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">⏰</span> Schedules
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/artifacts" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">📎</span> Artifacts
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/asks" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">❓</span> Asks
-            <span v-if="pendingAsks > 0" class="nav-badge">{{ pendingAsks }}</span>
-          </router-link>
-        </li>
-        <li>
-          <router-link to="/timeline" active-class="active" @click="sidebarOpen = false">
-            <span class="icon">📅</span> Timeline
-          </router-link>
-        </li>
-      </ul>
+      <div class="sidebar-spacer"></div>
 
-      <!-- Notification panel: sessions awaiting a reply -->
-      <div v-if="notifications.length" class="notif-panel">
-        <div class="notif-header">
-          <span>🔔 Needs reply</span>
-          <button
-            class="notif-toggle"
-            :title="pushEnabled ? 'Disable browser notifications' : 'Enable browser notifications'"
-            @click="togglePush"
-          >{{ pushEnabled ? '🔔' : '🔕' }}</button>
+      <!-- Settings: global / cross-session sections -->
+      <div class="settings-footer">
+        <div v-if="settingsOpen" class="settings-menu">
+          <router-link
+            v-for="item in settingsItems"
+            :key="item.to"
+            :to="item.to"
+            class="settings-item"
+            active-class="active"
+            @click="onSettingsNav"
+          >
+            <span class="icon">{{ item.icon }}</span> {{ item.label }}
+            <span v-if="item.badge" class="nav-badge">{{ item.badge }}</span>
+          </router-link>
         </div>
-        <ul class="notif-list">
-          <li v-for="n in notifications" :key="n.session_id" class="notif-item">
-            <div class="notif-body" @click="openNotification(n)">
-              <div class="notif-name">{{ n.session_name }}</div>
-              <div class="notif-reason">{{ notifReason(n) }}</div>
-              <div v-if="n.question" class="notif-q">{{ n.question }}</div>
-            </div>
-            <button class="notif-dismiss" title="Dismiss" @click.stop="dismissNotification(n)">✕</button>
-          </li>
-        </ul>
+        <button class="settings-btn" :class="{ open: settingsOpen }" @click="settingsOpen = !settingsOpen">
+          <span class="icon">⚙</span> Settings
+          <span v-if="pendingAsks > 0" class="nav-badge">{{ pendingAsks }}</span>
+        </button>
       </div>
     </nav>
     <main class="content">
-      <router-view />
+      <SessionTabBar v-if="isSessionRoute" @toggle-sidebar="sidebarOpen = !sidebarOpen" />
+      <div class="content-body" :class="{ 'content-flush': isChatRoute }">
+        <router-view />
+      </div>
     </main>
   </div>
 </template>
@@ -146,26 +163,98 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from './stores/session.js'
 import { api } from './api.js'
+import SessionTabBar from './components/SessionTabBar.vue'
 
 const route = useRoute()
 const router = useRouter()
 const sidebarOpen = ref(false)
 const { sessions, selectedSessionId, loadSessions } = useSessionStore()
-const activeSessions = computed(() => {
-  const list = sessions.value.filter(s => !s.archived)
-  // Pin the concierge to the top of the list.
+
+// Sort helper: concierge pinned to the top, then most-recently-active first.
+function byRecency(list) {
   return list.slice().sort((a, b) => {
     if (a.concierge && !b.concierge) return -1
     if (b.concierge && !a.concierge) return 1
-    return 0
+    return (b.last_active || 0) - (a.last_active || 0)
   })
+}
+
+const activeSessions = computed(() => byRecency(sessions.value.filter(s => !s.archived)))
+
+// How many sessions to show in the sidebar before "More…" (configurable).
+const SESSION_LIST_LIMIT = Number(localStorage.getItem('enclave_session_list_limit')) || 10
+const recentSessions = computed(() => activeSessions.value.slice(0, SESSION_LIST_LIMIT))
+const hasMoreSessions = computed(() => activeSessions.value.length > SESSION_LIST_LIMIT)
+
+// All-sessions popup
+const showAllSessions = ref(false)
+const showArchived = ref(false)
+const allSessionsSorted = computed(() => {
+  const list = showArchived.value ? sessions.value : sessions.value.filter(s => !s.archived)
+  return byRecency(list)
 })
+
+function pickSession(id) {
+  selectedSessionId.value = id
+  sidebarOpen.value = false
+  // If we're on a global/settings page, jump into the session's chat.
+  if (!isSessionRoute.value) router.push('/chat')
+}
+
+// Sessions currently awaiting a reply / with a pending question (from the
+// notifications feed) so their row can pulse and flash a "?".
+const awaitingIds = computed(() => new Set(notifications.value.map(n => n.session_id)))
+function isAwaiting(id) {
+  return awaitingIds.value.has(id)
+}
+function rowState(s) {
+  if (isAwaiting(s.id)) return 'pending'
+  if (s.status !== 'running') return 'stopped'
+  const a = activityState.value[s.id]
+  if (a === 'tool') return 'tool'
+  if (a === 'thinking' || a === 'responding') return 'thinking'
+  return 'running'
+}
+
+async function archiveSession(s) {
+  try {
+    await api.archiveSession(s.id)
+    await loadSessions()
+  } catch (e) {
+    console.error('Failed to archive session:', e)
+  }
+}
+
+// ─── Settings menu (global / cross-session sections) ───
+const settingsOpen = ref(false)
+const settingsItems = computed(() => [
+  { to: '/sessions', icon: '🗂️', label: 'Sessions' },
+  { to: '/memories', icon: '🧠', label: 'Memories' },
+  { to: '/panel', icon: '🎛️', label: 'Panel' },
+  { to: '/schedules', icon: '⏰', label: 'Schedules' },
+  { to: '/asks', icon: '❓', label: 'Asks', badge: pendingAsks.value || 0 },
+])
+function onSettingsNav() {
+  settingsOpen.value = false
+  sidebarOpen.value = false
+}
+
+// Routes that operate on the selected session (show the session tab bar).
+const SESSION_ROUTE_NAMES = new Set([
+  'chat', 'bugs', 'bug-detail', 'artifacts', 'artifact-preview', 'timeline', 'session-settings',
+])
+const isSessionRoute = computed(() => SESSION_ROUTE_NAMES.has(route.name))
+const isChatRoute = computed(() => route.name === 'chat')
+
 const isLoginPage = computed(() => route.name === 'login')
 const hasToken = ref(!!localStorage.getItem('enclave_token'))
 const pendingAsks = ref(0)
 
 // ─── Notifications (sessions needing a reply) ───
 const notifications = ref([])
+// Coarse per-session activity state (thinking/tool/responding/idle) streamed
+// from the orchestrator's global channel, used to animate the sidebar rows.
+const activityState = ref({})
 const pushEnabled = ref(localStorage.getItem('enclave_push') === '1')
 let notifWs = null
 let notifReconnect = null
@@ -242,7 +331,20 @@ function connectNotifWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   try {
     notifWs = new WebSocket(`${proto}//${location.host}/api/notifications/stream?token=${token}`)
-    notifWs.onmessage = () => { loadNotifications() }
+    notifWs.onmessage = (ev) => {
+      let msg = null
+      try { msg = JSON.parse(ev.data) } catch { /* ignore */ }
+      if (msg && msg.type === 'session_activity') {
+        // Live per-session activity for the sidebar indicators.
+        activityState.value = { ...activityState.value, [msg.session_id]: msg.state }
+        return
+      }
+      if (msg && msg.type === 'major_reply') {
+        // Consumed by the Android client only; no browser-side action.
+        return
+      }
+      loadNotifications()
+    }
     notifWs.onclose = () => {
       notifWs = null
       if (hasToken.value && !notifReconnect) {
@@ -311,7 +413,21 @@ async function pollAskCount() {
 let askPollTimer = null
 
 // Only load sessions when authenticated and not on login page
+// Keep the app height locked to the *visible* viewport so the on-screen
+// keyboard (Android) shrinks the layout instead of hiding the input bar.
+function applyViewportHeight() {
+  const vv = window.visualViewport
+  const h = vv ? vv.height : window.innerHeight
+  document.documentElement.style.setProperty('--app-height', `${Math.round(h)}px`)
+}
+
 onMounted(() => {
+  applyViewportHeight()
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', applyViewportHeight)
+    window.visualViewport.addEventListener('scroll', applyViewportHeight)
+  }
+  window.addEventListener('resize', applyViewportHeight)
   if (!isLoginPage.value && hasToken.value) {
     loadSessions()
     pollAskCount()
@@ -322,6 +438,11 @@ onMounted(() => {
   }
 })
 onUnmounted(() => {
+  if (window.visualViewport) {
+    window.visualViewport.removeEventListener('resize', applyViewportHeight)
+    window.visualViewport.removeEventListener('scroll', applyViewportHeight)
+  }
+  window.removeEventListener('resize', applyViewportHeight)
   if (askPollTimer) clearInterval(askPollTimer)
   if (notifPollTimer) clearInterval(notifPollTimer)
   if (notifReconnect) clearTimeout(notifReconnect)
@@ -343,7 +464,7 @@ watch(isLoginPage, (isLogin) => {
 <style scoped>
 .app {
   display: flex;
-  height: 100vh;
+  height: var(--app-height, 100vh);
 }
 
 .mobile-header {
@@ -360,7 +481,7 @@ watch(isLoginPage, (isLogin) => {
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: 1rem 0;
+  padding: 1rem 0 0;
   flex-shrink: 0;
 }
 
@@ -376,22 +497,246 @@ watch(isLoginPage, (isLogin) => {
   margin: 0;
 }
 
-.session-selector {
-  padding: 0.5rem 1rem;
+.session-list-section {
+  padding: 0.5rem 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 0.4rem;
-  align-items: center;
 }
 
-.session-select {
-  width: 100%;
-  font-size: 0.85rem;
-  padding: 0.4rem 0.5rem;
-  background: var(--bg-main);
-  color: var(--text-primary);
-  border: 1px solid var(--border);
+.session-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.session-list {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
   border-radius: var(--radius-sm, 4px);
+  position: relative;
+}
+
+.session-row:hover {
+  background: var(--bg-hover);
+}
+
+.session-row.active {
+  background: var(--bg-active);
+}
+
+.session-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  padding: 0.5rem 0.5rem;
+  color: var(--text-secondary);
+  font-size: 1.1rem;
+}
+
+.status-icon {
+  width: 1.2em;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.95em;
+}
+
+.status-icon .dot {
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 50%;
+  background: #6b7280;
+}
+
+.status-icon.running .dot {
+  background: #22c55e;
+}
+
+.act-cog {
+  display: inline-block;
+  font-size: 0.95em;
+  line-height: 1;
+  animation: cogSpin 2.4s linear infinite;
+}
+
+.act-brain {
+  display: inline-block;
+  font-size: 0.9em;
+  line-height: 1;
+  animation: brainPulse 1.3s ease-in-out infinite;
+}
+
+@keyframes cogSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes brainPulse {
+  0%, 100% { transform: scale(0.85); opacity: 0.6; }
+  50% { transform: scale(1.1); opacity: 1; }
+}
+
+.status-icon.pending .q-flash {
+  color: var(--accent);
+  font-weight: 700;
+  animation: qFlash 1s steps(1, end) infinite;
+}
+
+.new-glyph {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.new-row .session-pick {
+  color: var(--accent);
+}
+
+.session-row.pending {
+  animation: rowPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes qFlash {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.15; }
+}
+
+@keyframes rowPulse {
+  0%, 100% { background: transparent; }
+  50% { background: var(--bg-active); }
+}
+
+.session-row.active .session-pick {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.session-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.run-dot {
+  color: #22c55e;
+  font-size: 0.6rem;
+}
+
+.session-archive {
+  position: absolute;
+  right: 0.2rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-hover);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0.25rem 0.4rem;
+  opacity: 0;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+
+.session-row:hover .session-archive {
+  opacity: 0.85;
+}
+
+.session-archive:hover {
+  opacity: 1;
+}
+
+.session-empty {
+  padding: 0.45rem 0.5rem;
+  font-size: 0.82rem;
+}
+
+.session-more {
+  width: 100%;
+  margin-top: 0.35rem;
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.session-more:hover {
+  text-decoration: underline;
+}
+
+.session-modal {
+  width: 420px;
+  max-width: 92vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.session-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.session-modal-head h3 {
+  margin: 0;
+}
+
+.show-archived {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+}
+
+.session-modal-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.session-modal-list .session-pick {
+  justify-content: space-between;
+}
+
+.archived-tag {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 0.35rem;
+  margin-left: 0.4rem;
+}
+
+.sidebar-spacer {
+  flex: 1;
 }
 
 .new-session-btn {
@@ -541,7 +886,6 @@ watch(isLoginPage, (isLogin) => {
 }
 
 .notif-panel {
-  margin-top: auto;
   border-top: 1px solid var(--border);
   padding: 0.5rem 0;
   max-height: 40vh;
@@ -627,10 +971,81 @@ watch(isLoginPage, (isLogin) => {
 
 .content {
   flex: 1;
-  overflow-y: auto;
-  padding: 2rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--bg-main);
   min-width: 0;
+}
+
+.content-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 2rem;
+  min-height: 0;
+}
+
+/* Full-height app views (chat) manage their own scrolling and padding. */
+.content-body.content-flush {
+  overflow: hidden;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ─── Settings footer ─── */
+.settings-footer {
+  border-top: 1px solid var(--border);
+  padding: 0.5rem;
+}
+
+.settings-menu {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0.35rem;
+}
+
+.settings-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.85rem;
+  border-radius: var(--radius-sm, 4px);
+}
+
+.settings-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.settings-item.active {
+  background: var(--bg-active);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.settings-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.6rem;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.settings-btn:hover {
+  color: var(--text-primary);
+}
+
+.settings-btn.open {
+  color: var(--accent);
 }
 
 /* ─── Mobile ─── */
@@ -649,6 +1064,12 @@ watch(isLoginPage, (isLogin) => {
     z-index: 60;
   }
 
+  /* On session routes the tab bar carries its own hamburger, so the
+     standalone mobile header is redundant. */
+  .mobile-header.mobile-hidden {
+    display: none;
+  }
+
   .hamburger {
     background: none;
     border: none;
@@ -662,33 +1083,6 @@ watch(isLoginPage, (isLogin) => {
     font-size: 1.1rem;
     font-weight: 600;
     color: var(--text-primary);
-  }
-
-  .mobile-session-select {
-    margin-left: auto;
-    max-width: 55vw;
-    font-size: 0.85rem;
-    padding: 0.35rem 0.5rem;
-    background: var(--bg-main);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
-  }
-
-  .mobile-new-session-btn {
-    flex-shrink: 0;
-    width: 2rem;
-    height: 2rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.95rem;
-    line-height: 1;
-    background: var(--bg-main);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm, 4px);
-    cursor: pointer;
   }
 
   .sidebar {
@@ -720,9 +1114,12 @@ watch(isLoginPage, (isLogin) => {
   }
 
   .content {
-    padding: 1rem;
     flex: 1;
-    overflow-y: auto;
+    overflow: hidden;
+  }
+
+  .content-body {
+    padding: 1rem;
   }
 }
 </style>

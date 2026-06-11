@@ -1,45 +1,29 @@
 <template>
   <div class="chat-view" @dragover.prevent="onDragOver" @dragleave="onDragLeave" @drop.prevent="onDrop">
-    <div class="chat-header">
-      <h2>Chat</h2>
-      <div v-if="selectedSession && agentState !== 'unknown'" class="agent-status" :class="agentStateClass">
+    <div v-if="selectedSession" class="chat-body" :class="bodyClass">
+      <div class="chat-container" :style="chatPaneStyle">
+      <!-- Floating agent status (non-scrolling) -->
+      <div v-if="agentState !== 'unknown'" class="agent-status-float" :class="agentStateClass">
         <span class="status-indicator"></span>
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
-      <div class="model-picker" v-if="selectedSession">
-        <span v-if="creditsLabel" class="ai-credits" :title="creditsTitle">{{ creditsLabel }}</span>
-        <select v-if="models.available.length" v-model="currentModel" @change="changeModel" class="model-select">
-          <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
-        </select>
-        <button class="model-refresh" @click="refreshModels" :disabled="modelsRefreshing" title="Refresh model list">
-          {{ modelsRefreshing ? '⟳' : '↻' }}
-        </button>
-      </div>
-      <div v-if="selectedSession" class="doc-controls">
+
+      <!-- Artifacts grip handle (right edge on desktop, top edge on mobile) -->
+      <div class="doc-tools" :class="{ 'mobile-portrait': isMobilePortrait }">
         <button
-          v-if="openDoc && !isMobilePortrait"
+          v-if="docPanelOpen && !isMobilePortrait"
           class="doc-orient-btn"
           :title="outerOrientation === 'horizontal' ? 'Stack vertically' : 'Place side by side'"
           @click="toggleOuterOrientation"
         >{{ outerOrientation === 'horizontal' ? '⬍' : '⬌' }}</button>
-        <div class="doc-menu-wrap">
-          <button class="doc-open-btn" @click="toggleDocMenu" title="Open a document beside the chat">📄</button>
-          <div v-if="docMenuOpen" class="doc-menu">
-            <div v-if="!docList.length" class="doc-menu-empty muted">No editable documents</div>
-            <button
-              v-for="d in docList"
-              :key="d.filename"
-              class="doc-menu-item"
-              :class="{ active: d.filename === openDoc }"
-              @click="openDocument(d.filename)"
-            >{{ d.title || d.filename }}</button>
-          </div>
-        </div>
+        <button
+          class="doc-grip"
+          :class="{ open: docPanelOpen }"
+          :title="docPanelOpen ? 'Close document panel' : 'Open documents'"
+          @click="toggleDocPanel"
+        ><span class="grip-dots"></span></button>
       </div>
-    </div>
 
-    <div v-if="selectedSession" class="chat-body" :class="bodyClass">
-      <div class="chat-container" :style="chatPaneStyle">
       <!-- Drop overlay -->
       <div v-if="dragging" class="drop-overlay">
         <div class="drop-label">Drop files to attach</div>
@@ -317,13 +301,14 @@
         <button class="primary" @click="send" :disabled="(!draft.trim() && !pendingFiles.length) || sending">Send</button>
       </div>
       </div>
-      <template v-if="openDoc">
+      <template v-if="docPanelOpen">
         <div
           class="outer-divider"
           :class="outerOrientation"
           @pointerdown="startOuterDrag"
         ><div class="divider-grip"></div></div>
         <DocumentPane
+          v-if="openDoc"
           class="outer-doc"
           :style="docPaneStyle"
           :session="selectedSession"
@@ -332,6 +317,22 @@
           :refresh-tick="docRefreshTick"
           @close="closeDoc"
         />
+        <div v-else class="outer-doc doc-list-panel" :style="docPaneStyle">
+          <div class="doc-list-head">
+            <span>Documents</span>
+            <button class="doc-panel-close" title="Close" @click="closeDocPanel">✕</button>
+          </div>
+          <div v-if="!docList.length" class="doc-list-empty muted">No editable documents in this session.</div>
+          <button
+            v-for="d in docList"
+            :key="d.filename"
+            class="doc-list-item"
+            @click="openDocument(d.filename)"
+          >
+            <span class="doc-list-title">{{ d.title || d.filename }}</span>
+            <span v-if="d.title" class="doc-list-file">{{ d.filename }}</span>
+          </button>
+        </div>
       </template>
     </div>
     <div v-else class="empty-state">
@@ -360,6 +361,7 @@ import { ref, reactive, onMounted, onUnmounted, nextTick, watch, computed } from
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api.js'
 import { useSessionStore } from '../stores/session.js'
+import { useModels } from '../composables/useModels.js'
 import DocumentPane from '../components/DocumentPane.vue'
 import MarkdownIt from 'markdown-it'
 
@@ -411,7 +413,7 @@ const router = useRouter()
 const EDITABLE_DOC_RE = /\.(md|txt|json|yaml|yml|csv|log)$/i
 const openDoc = ref('')
 const docList = ref([])
-const docMenuOpen = ref(false)
+const docPanelOpen = ref(false)
 const outerOrientation = ref(localStorage.getItem('enclave_outer_orientation') || 'horizontal')
 const outerSize = ref(parseFloat(localStorage.getItem('enclave_outer_size')) || 58) // % for chat pane
 const isMobilePortrait = ref(false)
@@ -419,15 +421,15 @@ const docRefreshTick = ref(0) // bumped on agent activity → DocumentPane re-ch
 let _mqlPortrait = null
 
 const bodyClass = computed(() => {
-  if (isMobilePortrait.value && openDoc.value) return 'mobile-portrait'
-  return openDoc.value ? outerOrientation.value : 'no-doc'
+  if (isMobilePortrait.value && docPanelOpen.value) return 'mobile-portrait'
+  return docPanelOpen.value ? outerOrientation.value : 'no-doc'
 })
 const chatPaneStyle = computed(() => {
-  if (!openDoc.value || isMobilePortrait.value) return {}
+  if (!docPanelOpen.value || isMobilePortrait.value) return {}
   return { flexBasis: `${outerSize.value}%` }
 })
 const docPaneStyle = computed(() => {
-  if (!openDoc.value || isMobilePortrait.value) return {}
+  if (!docPanelOpen.value || isMobilePortrait.value) return {}
   return { flexBasis: `${100 - outerSize.value}%` }
 })
 
@@ -440,16 +442,23 @@ async function loadDocList() {
     docList.value = (arts || []).filter(a => EDITABLE_DOC_RE.test(a.filename))
   } catch { docList.value = [] }
 }
-function toggleDocMenu() {
-  docMenuOpen.value = !docMenuOpen.value
-  if (docMenuOpen.value) loadDocList()
+function toggleDocPanel() {
+  docPanelOpen.value = !docPanelOpen.value
+  if (docPanelOpen.value) loadDocList()
 }
 function openDocument(filename) {
   openDoc.value = filename
-  docMenuOpen.value = false
+  docPanelOpen.value = true
   if (selectedSession.value) localStorage.setItem(docStorageKey(selectedSession.value), filename)
 }
 function closeDoc() {
+  // Return to the document list within the open panel.
+  openDoc.value = ''
+  if (selectedSession.value) localStorage.removeItem(docStorageKey(selectedSession.value))
+  loadDocList()
+}
+function closeDocPanel() {
+  docPanelOpen.value = false
   openDoc.value = ''
   if (selectedSession.value) localStorage.removeItem(docStorageKey(selectedSession.value))
 }
@@ -483,12 +492,13 @@ function startOuterDrag(e) {
 function restoreOpenDoc() {
   // Deep-link (?doc=) takes priority, else the last-open doc for this session.
   const q = route.query.doc
-  if (typeof q === 'string' && q) { openDoc.value = q; return }
+  if (typeof q === 'string' && q) { openDoc.value = q; docPanelOpen.value = true; return }
   if (selectedSession.value) {
     openDoc.value = localStorage.getItem(docStorageKey(selectedSession.value)) || ''
   } else {
     openDoc.value = ''
   }
+  if (openDoc.value) docPanelOpen.value = true
 }
 
 watch(() => route.query.doc, (d) => {
@@ -503,6 +513,20 @@ const draft = ref('')
 const sending = ref(false)
 const messagesEl = ref(null)
 const inputEl = ref(null)
+
+// ─── Per-session draft persistence ───
+// Keep an unsent message around if the user navigates away and returns.
+const DRAFT_PREFIX = 'enclave_chat_draft_'
+function draftKey(id) { return DRAFT_PREFIX + id }
+function loadDraft(id) {
+  draft.value = id ? (localStorage.getItem(draftKey(id)) || '') : ''
+}
+watch(draft, (v) => {
+  const id = selectedSession.value
+  if (!id) return
+  if (v) localStorage.setItem(draftKey(id), v)
+  else localStorage.removeItem(draftKey(id))
+})
 
 // ─── Mermaid diagram rendering ───
 let _mermaidObserver = null
@@ -525,10 +549,7 @@ function scheduleMermaid() {
 
 const pendingFiles = ref([])
 const dragging = ref(false)
-const models = ref({ current: null, available: [], preferences: [] })
-const currentModel = ref('')
-const modelsRefreshing = ref(false)
-const aiCredits = ref(null)
+const { loadModels, loadCredits, applyCreditsUpdate } = useModels()
 
 // Live streaming state
 const liveEvents = ref([])
@@ -612,6 +633,7 @@ onMounted(async () => {
     loadHistory()
     loadDocList()
   }
+  loadDraft(selectedSession.value)
   window.addEventListener('keydown', onLightboxKey)
 })
 
@@ -642,8 +664,13 @@ onUnmounted(() => {
 watch(selectedSession, (newVal) => {
   if (ws) { ws.close(); ws = null }
   clearLiveState()
-  docMenuOpen.value = false
+  // Reset live activity so the previous session's state doesn't leak into the
+  // newly selected one (the indicator must be session-specific).
+  setAgentState('unknown')
+  sending.value = false
+  docPanelOpen.value = false
   restoreOpenDoc()
+  loadDraft(newVal)
   if (newVal) { loadHistory(); loadDocList() }
 })
 
@@ -670,8 +697,8 @@ async function loadHistory() {
     await nextTick()
     scrollToBottom(true)
     connectWebSocket()
-    loadModels()
-    loadCredits()
+    loadModels(selectedSession.value)
+    loadCredits(selectedSession.value)
   } catch (e) {
     console.error('Failed to load history:', e)
   }
@@ -738,111 +765,6 @@ async function loadEarlier() {
   }
 }
 
-async function loadModels() {
-  try {
-    const data = await api.getModels(selectedSession.value)
-    models.value = data
-    currentModel.value = data.current || ''
-  } catch (e) {
-    console.error('Failed to load models:', e)
-  }
-}
-
-// Pick the account "AI Credits" snapshot (premium request quota) from the
-// SDK's quota snapshots, tolerating naming differences across SDK versions.
-function pickCreditsSnapshot(snapshots) {
-  if (!snapshots) return null
-  const keys = Object.keys(snapshots)
-  if (!keys.length) return null
-  const preferred = keys.find(k => /premium/i.test(k))
-    || keys.find(k => /credit/i.test(k))
-    || keys.find(k => /interaction/i.test(k))
-    || keys[0]
-  return { key: preferred, ...snapshots[preferred] }
-}
-
-const creditsLabel = computed(() => {
-  const c = aiCredits.value
-  // Consumed AI Units ("AI Credits") for this session — the primary figure,
-  // mirroring the Copilot CLI's "AI Credits" indicator.
-  const aiu = Number(c?.session?.aiu)
-  if (Number.isFinite(aiu) && aiu > 0) {
-    const shown = aiu >= 100 ? Math.round(aiu) : Math.round(aiu * 10) / 10
-    return `AI Credits: ${shown.toLocaleString()}`
-  }
-  // Fall back to the account entitlement snapshot (e.g. "Unlimited") until the
-  // session has consumed anything.
-  const snap = pickCreditsSnapshot(c?.snapshots)
-  if (!snap) return ''
-  if (snap.is_unlimited) return 'AI Credits: Unlimited'
-  const ent = Number(snap.entitlement)
-  const used = Number(snap.used)
-  if (Number.isFinite(ent) && Number.isFinite(used)) {
-    const remaining = Math.max(ent - used, 0)
-    const rounded = Math.round(remaining * 10) / 10
-    return `AI Credits: ${rounded}/${ent}`
-  }
-  if (Number.isFinite(Number(snap.remaining_percentage))) {
-    return `AI Credits: ${Math.round(Number(snap.remaining_percentage))}%`
-  }
-  return ''
-})
-
-const creditsTitle = computed(() => {
-  const c = aiCredits.value
-  const parts = []
-  const sess = c?.session
-  if (sess && Number.isFinite(Number(sess.aiu))) {
-    parts.push(`${Number(sess.aiu).toLocaleString()} AI Units consumed this session`)
-    if (sess.requests) parts.push(`${sess.requests} requests`)
-  }
-  const snap = pickCreditsSnapshot(c?.snapshots)
-  if (snap) {
-    if (snap.is_unlimited) parts.push('Entitlement: Unlimited')
-    if (snap.reset_date) parts.push(`Resets: ${new Date(snap.reset_date).toLocaleString()}`)
-  }
-  if (c?.model) parts.push(`Last model: ${c.model}`)
-  if (c?.ts) parts.push(`Updated: ${new Date(c.ts).toLocaleString()}`)
-  return parts.join(' · ')
-})
-
-async function loadCredits() {
-  if (!selectedSession.value) return
-  try {
-    const data = await api.getCredits(selectedSession.value)
-    const hasSnapshots = data && data.snapshots && Object.keys(data.snapshots).length
-    const hasSession = data && data.session && Object.keys(data.session).length
-    if (hasSnapshots || hasSession) {
-      aiCredits.value = data
-    }
-  } catch (e) {
-    console.error('Failed to load AI credits:', e)
-  }
-}
-
-async function refreshModels() {
-  if (!selectedSession.value) return
-  modelsRefreshing.value = true
-  try {
-    const data = await api.getModels(selectedSession.value, true)
-    models.value = data
-    currentModel.value = data.current || currentModel.value || ''
-  } catch (e) {
-    console.error('Failed to refresh models:', e)
-  } finally {
-    modelsRefreshing.value = false
-  }
-}
-
-async function changeModel() {
-  if (!currentModel.value || !selectedSession.value) return
-  try {
-    await api.setModel(selectedSession.value, currentModel.value)
-  } catch (e) {
-    console.error('Failed to change model:', e)
-  }
-}
-
 function connectWebSocket() {
   if (ws) ws.close()
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -884,17 +806,9 @@ function handleStreamEvent(msg) {
 
   if (type === 'credits') {
     // Live "AI Credits" update from the orchestrator: account entitlement
-    // snapshot + per-session consumed AI Units.
-    if ((msg.snapshots && Object.keys(msg.snapshots).length) ||
-        (msg.session && Object.keys(msg.session).length)) {
-      aiCredits.value = {
-        snapshots: msg.snapshots || aiCredits.value?.snapshots || {},
-        session: msg.session || aiCredits.value?.session || {},
-        ts: msg.ts || new Date().toISOString(),
-        last_cost: msg.last_cost || 0,
-        model: msg.model || '',
-      }
-    }
+    // snapshot + per-session consumed AI Units. Routed through the shared
+    // composable so the global tab bar reflects it too.
+    applyCreditsUpdate(msg)
     return
   }
 
@@ -1449,8 +1363,178 @@ function formatTime(ts) {
 .chat-view {
   display: flex;
   flex-direction: column;
-  height: calc(100dvh - 4rem);
+  height: 100%;
+  min-height: 0;
   overflow-x: hidden;
+}
+
+/* Floating agent status pill (sits above the messages, does not scroll). */
+.agent-status-float {
+  position: absolute;
+  top: 0.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: #999;
+  padding: 0.2rem 0.7rem;
+  border-radius: 12px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+
+.agent-status-float .status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #666;
+}
+
+/* Artifacts handle on the right edge of the chat pane. */
+.doc-tools {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: flex-end;
+}
+
+.doc-grip {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+  cursor: pointer;
+  padding: 0.7rem 0.45rem;
+  line-height: 0;
+  box-shadow: -1px 0 4px rgba(0,0,0,0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.doc-grip:hover {
+  background: var(--bg-hover);
+}
+
+/* The grip glyph: two columns of dots, like a drag handle. */
+.grip-dots {
+  width: 6px;
+  height: 22px;
+  background-image: radial-gradient(var(--text-secondary) 1px, transparent 1.2px);
+  background-size: 3px 5px;
+  background-repeat: repeat;
+  opacity: 0.8;
+}
+
+.doc-grip.open .grip-dots {
+  background-image: radial-gradient(var(--accent) 1px, transparent 1.2px);
+}
+
+/* Mobile portrait: the panel pulls down from the top, so the grip sits at the
+   top-center and is a larger, easier tap target with a horizontal grip glyph. */
+.doc-tools.mobile-portrait {
+  top: 0;
+  right: auto;
+  left: 50%;
+  transform: translateX(-50%);
+  flex-direction: row;
+  align-items: flex-start;
+}
+
+.doc-tools.mobile-portrait .doc-grip {
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 10px 10px;
+  padding: 0.7rem 1.4rem;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+}
+
+.doc-tools.mobile-portrait .grip-dots {
+  width: 28px;
+  height: 6px;
+  background-size: 5px 3px;
+}
+
+.doc-tools.mobile-portrait .doc-orient-btn {
+  display: none;
+}
+
+.doc-orient-btn {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+  cursor: pointer;
+  padding: 0.5rem 0.4rem;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+/* Document list shown inside the side panel before a doc is picked. */
+.doc-list-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card, #1e1e24);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.doc-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.doc-panel-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.doc-panel-close:hover { color: var(--text-primary); }
+
+.doc-list-empty {
+  padding: 1rem;
+  font-size: 0.85rem;
+}
+
+.doc-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  text-align: left;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: inherit;
+  cursor: pointer;
+  padding: 0.7rem 1rem;
+}
+
+.doc-list-item:hover { background: var(--bg-hover); }
+
+.doc-list-title { font-size: 0.9rem; }
+
+.doc-list-file {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
 }
 
 .chat-header {
@@ -1563,7 +1647,7 @@ function formatTime(ts) {
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 1rem 0;
+  padding: 1.5rem 1.5rem 1rem;
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -1577,6 +1661,7 @@ function formatTime(ts) {
 
 .message {
   max-width: 85%;
+  min-width: 0;
   border-radius: var(--radius);
   padding: 0.75rem 1rem;
 }
@@ -1756,6 +1841,8 @@ function formatTime(ts) {
 .message-body {
   font-size: 0.9rem;
   line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .message-body :deep(p) { margin: 0 0 0.5rem; }
@@ -1812,8 +1899,8 @@ function formatTime(ts) {
 .input-bar {
   display: flex;
   gap: 0.75rem;
-  padding: 1rem 0 0;
-  padding-bottom: env(safe-area-inset-bottom, 0);
+  padding: 1rem 1.5rem;
+  padding-bottom: max(1rem, env(safe-area-inset-bottom, 0));
   border-top: 1px solid var(--border);
   align-items: flex-end;
   max-width: 100%;

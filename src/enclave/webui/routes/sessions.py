@@ -57,6 +57,29 @@ def _control_socket(request: Request) -> Path:
     return Path(_get_config(request).data_dir) / "control.sock"
 
 
+def _session_last_active(workspace: Path) -> float:
+    """Best-effort last-activity timestamp (epoch seconds) for a session.
+
+    Uses the newest mtime among the session's Copilot event logs
+    (``.copilot-state/session-state/*/events.jsonl``), since those are appended
+    on every agent/user turn. Falls back to the workspace directory mtime.
+    """
+    newest = 0.0
+    state_dir = workspace / ".copilot-state" / "session-state"
+    if state_dir.is_dir():
+        for events in state_dir.glob("*/events.jsonl"):
+            try:
+                newest = max(newest, events.stat().st_mtime)
+            except OSError:
+                continue
+    if newest <= 0.0:
+        try:
+            newest = workspace.stat().st_mtime
+        except OSError:
+            newest = 0.0
+    return newest
+
+
 async def _control_request(
     request: Request, payload: dict[str, Any], timeout: float = 10.0
 ) -> dict[str, Any]:
@@ -106,6 +129,10 @@ def _discover_sessions(request: Request) -> list[dict[str, Any]]:
     for entry in sorted(ws_base.iterdir()):
         if not entry.is_dir():
             continue
+        # Skip dot-directories (e.g. .enclave holds app data like deferred_asks.db,
+        # not a session workspace) so they don't surface as phantom sessions.
+        if entry.name.startswith("."):
+            continue
         session_id = entry.name
         # Check if agent socket exists (indicates running)
         socket_path = _socket_dir(request) / f"{session_id}.sock"
@@ -134,6 +161,7 @@ def _discover_sessions(request: Request) -> list[dict[str, Any]]:
             "archived": archived,
             "workspace": str(entry),
             "concierge": session_id == "__concierge__",
+            "last_active": _session_last_active(entry),
         }
 
         # Include ACP remote info if present

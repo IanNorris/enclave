@@ -1747,6 +1747,10 @@ class MessageRouter:
             thread_event_id=thread_id,
         )
 
+        # Mirror to the Android client as a per-session "major reply" notification.
+        if self._control:
+            self._control.notify_major_reply(session_id, content)
+
         # Complete the emoji flow: remove 🤔, add ✅
         user_event_id = self._thread_events.pop(
             f"{session_id}:event_id", None
@@ -1811,6 +1815,12 @@ class MessageRouter:
         await self.matrix.send_message(
             session.room_id, matrix_text, thread_event_id=thread_id,
         )
+
+        # Mirror to the Android client as a per-session "major reply".
+        if self._control:
+            self._control.notify_major_reply(
+                session.id, f"{title}\n{summary}".strip() if title else summary
+            )
 
     async def _handle_ask_deferred(
         self, session: Session, msg: Message

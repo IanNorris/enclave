@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Enclave</string>
+    <string name="connect_title">Connect to Enclave</string>
+    <string name="server_url_hint">Server URL (e.g. https://khione:8430)</string>
+    <string name="username_hint">Username</string>
+    <string name="password_hint">Password</string>
+    <string name="connect_button">Connect</string>
+    <string name="notif_channel_replies">Replies</string>
+    <string name="notif_channel_status">Status</string>
+</resources>
