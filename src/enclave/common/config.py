@@ -79,12 +79,14 @@ class ContainerConfig:
             nix_store=True,
             host_mounts=False,
             fuse=True,
+            persist_home=True,
             description="🛠️ Native App Development",
         ),
         "light": ContainerProfile(
             image="enclave-light:latest",
             nix_store=False,
             host_mounts=False,
+            persist_home=True,
             description="💬 General",
         ),
         "host": ContainerProfile(

@@ -39,6 +39,7 @@ container:
       host_mounts: true                     # Bind-mount host paths (read-only)
       gui: true                             # Mount Wayland socket + GPU for GUI apps
       yolo: false                           # YOLO mode — skip confirmations
+      persist_home: true                    # Persist $HOME (build caches) across restarts in <workspace>/.home
       description: "🛠️ Native App Development"
     light:
       image: "enclave-light:latest"         # Minimal image (~200MB)
@@ -46,6 +47,7 @@ container:
       host_mounts: false
       gui: false
       yolo: false
+      persist_home: true                    # Persist $HOME across restarts in <workspace>/.home
       description: "💬 General"
     host:
       image: ""                             # Empty = run directly on host (no container)
