@@ -22,6 +22,12 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooserCode = 1001
+    // Skip the first onResume (it fires right after onCreate's initial load).
+    private var didInitialLoad = false
+    // A session to select on the next page (re)load, e.g. from a notification tap.
+    private var pendingSession: String? = null
+    // Set when onNewIntent already navigated, so the following onResume doesn't reload over it.
+    private var skipNextResumeReload = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,8 +58,11 @@ class MainActivity : Activity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                // Inject the token before app scripts read localStorage.
+                // Inject the token (and a pending session selection) before app
+                // scripts read localStorage — the web UI store initialises its
+                // selected session from localStorage at load time only.
                 injectToken(token)
+                injectPendingSession()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -93,16 +102,30 @@ class MainActivity : Activity() {
 
         // Handle a notification tap that targets a specific session.
         val targetSession = intent?.getStringExtra(EXTRA_SESSION)
-        val start = if (targetSession != null) {
-            "$baseUrl/chat?session=${Uri.encode(targetSession)}"
-        } else {
-            "$baseUrl/"
-        }
         if (targetSession != null) {
-            // Persist selection for the web UI store, then load chat.
-            webView.loadUrl(start)
+            pendingSession = targetSession
+            webView.loadUrl("$baseUrl/chat")
         } else {
-            webView.loadUrl(start)
+            webView.loadUrl("$baseUrl/")
+        }
+        didInitialLoad = true
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Returning from background: the in-page WebSocket may have dropped and
+        // the active session can be stale, so force a reload to reconnect and
+        // re-sync. Skip the first resume (onCreate already did the initial load)
+        // and the resume that immediately follows a notification-tap onNewIntent
+        // (which already navigated).
+        if (skipNextResumeReload) {
+            skipNextResumeReload = false
+            return
+        }
+        if (didInitialLoad && this::webView.isInitialized) {
+            // Make sure the (possibly restarted) notification service is up.
+            if (Prefs.isConfigured(this)) NotificationService.start(this)
+            webView.reload()
         }
     }
 
@@ -110,15 +133,25 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         val session = intent?.getStringExtra(EXTRA_SESSION) ?: return
         val baseUrl = Prefs.serverUrl(this) ?: return
-        // Set the selected session in the web UI store and navigate to chat.
-        webView.evaluateJavascript(
-            "localStorage.setItem('enclave_selected_session', ${JSONObject.quote(session)});", null
-        )
+        // Select the session on the next load (injected in onPageStarted before
+        // the web UI reads localStorage), then navigate to chat. The onResume
+        // that follows this intent must not reload over it.
+        pendingSession = session
+        skipNextResumeReload = true
         webView.loadUrl("$baseUrl/chat")
     }
 
     private fun injectToken(token: String) {
         val js = "try{localStorage.setItem('enclave_token', ${JSONObject.quote(token)});}catch(e){}"
+        webView.evaluateJavascript(js, null)
+    }
+
+    /** If a session is pending (from a notification tap), write it to localStorage
+     *  before the web UI store reads it, then clear the pending marker. */
+    private fun injectPendingSession() {
+        val s = pendingSession ?: return
+        pendingSession = null
+        val js = "try{localStorage.setItem('enclave_selected_session', ${JSONObject.quote(s)});}catch(e){}"
         webView.evaluateJavascript(js, null)
     }
 
