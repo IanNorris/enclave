@@ -176,6 +176,83 @@ browser or other tools.
 - Bind your service to `0.0.0.0` inside the container, not `127.0.0.1`.
 - Mappings are permanent and persist across restarts.
 
+## Plugins (persistent background services & custom tools)
+
+Your container runs with `--rm`, so any process you start dies when the
+session stops or idles out, and a fresh container starts on wake. To make a
+background service (e.g. a dev/relay server) **survive restarts**, add a
+**plugin**: a Python file in `/workspace/.enclave/plugins/` that the agent
+auto-imports on every container boot.
+
+Two uses:
+1. **Auto-start a persistent service** — put idempotent module-level code in the
+   plugin that (re)launches your server detached if it isn't already running.
+2. **Custom tools** — decorate a function with `@plugin_tool(...)` to expose a
+   new tool to yourself.
+
+**Auto-start pattern** (`/workspace/.enclave/plugins/devserver_autostart.py`):
+
+```python
+"""Auto-start the dev server on every container boot (idempotent, detached)."""
+import subprocess
+from pathlib import Path
+
+def _running(needle: str) -> bool:
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if needle in (proc / "cmdline").read_bytes().decode("utf-8", "replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+def _start() -> None:
+    if _running("my-dev-server-marker"):   # something unique to your server's cmdline
+        return
+    logf = open("/workspace/devserver.log", "ab")
+    subprocess.Popen(
+        ["<your server command>", "<args>"],
+        cwd="/workspace/<project>",
+        stdout=logf, stderr=logf,
+        start_new_session=True,            # detach so it outlives this import
+    )
+
+try:
+    _start()
+except Exception:
+    pass   # never let a start failure break plugin discovery
+```
+
+Key points:
+- The loader imports every non-`_` `*.py` in the plugins dir at startup, so
+  **module-level code runs on each boot**. Keep it **idempotent** (check
+  `_running` first) so re-imports/manual launches don't spawn duplicates.
+- Use `start_new_session=True` so the process detaches from the short-lived
+  import and survives.
+- Wrap everything in `try/except` — a throwing plugin is caught, but don't mask
+  discovery.
+- `/workspace` persists across restarts; `$HOME` may not. Put logs/state under
+  `/workspace`.
+- To expose the service externally, combine with `request_port` (bind `0.0.0.0`).
+
+**Custom tool pattern:**
+
+```python
+from enclave.agent.plugins import plugin_tool
+
+@plugin_tool(
+    name="my_tool",
+    description="What it does",
+    parameters={"type": "object", "properties": {
+        "arg": {"type": "string", "description": "..."}
+    }, "required": ["arg"]},
+)
+async def my_tool(params: dict) -> str:
+    return f"result for {params['arg']}"
+```
+
+Plugins are also discovered from the user-level `~/.config/enclave/plugins/`.
+
 ## Message Routing (Major vs Minor)
 
 Your messages are split into two tiers:
