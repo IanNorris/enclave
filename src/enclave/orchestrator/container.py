@@ -312,13 +312,18 @@ class ContainerManager:
             xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
             wayland = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
             wayland_sock = Path(xdg) / wayland
-            if wayland_sock.exists():
+            # host_wayland=False keeps the GPU/KVM/driver passthrough but skips the
+            # host compositor socket, so the session can only render into its own
+            # nested compositor — never the user's (lockable) host session.
+            if profile.host_wayland and wayland_sock.exists():
                 cmd.extend([
                     "-v", f"{wayland_sock}:/run/user/1000/{wayland}:rw",
                     "-e", f"WAYLAND_DISPLAY={wayland}",
                     "-e", f"XDG_RUNTIME_DIR=/run/user/1000",
                 ])
                 log.info("[start:%s] Wayland socket mounted: %s", session.id, wayland)
+            elif not profile.host_wayland:
+                log.info("[start:%s] host_wayland disabled — running nested only", session.id)
             # GPU device for hardware-accelerated rendering
             dri = Path("/dev/dri")
             if dri.exists():

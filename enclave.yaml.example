@@ -66,6 +66,16 @@ container:
       smartcard: true                       # Bind-mount /run/pcscd for PC/SC reader access
       persist_home: true                    # Persist $HOME (build caches) across restarts in <workspace>/.home
       description: "💳 Smartcard (PC/SC reader access)"
+    dev-nested:                             # Like dev, but no host Wayland socket — render nested only
+      image: "enclave-agent:latest"
+      nix_store: true
+      host_mounts: true
+      gui: true                             # Keeps GPU/KVM/driver passthrough
+      yolo: false
+      fuse: true
+      persist_home: true
+      host_wayland: false                   # Don't mount the host compositor socket (lock-proof nested rendering)
+      description: "🖥️ Dev (nested display: GPU/KVM, no host Wayland)"
 
   # Read-only host paths bind-mounted into containers as /host/<path>.
   # Only used when a profile has host_mounts: true.
