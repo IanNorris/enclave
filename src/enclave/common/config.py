@@ -47,6 +47,7 @@ class ContainerProfile:
     fuse: bool = False  # expose /dev/fuse + SYS_ADMIN for user-space mounts
     smartcard: bool = False  # bind-mount the host pcscd socket for PC/SC card access
     persist_home: bool = False  # bind-mount <workspace>/.home over $HOME so caches persist
+    host_wayland: bool = True  # with gui: mount the host Wayland socket (off = GPU/KVM only, run nested)
     description: str = ""
 
 
@@ -103,6 +104,16 @@ class ContainerConfig:
             smartcard=True,
             persist_home=True,
             description="💳 Smartcard (PC/SC reader access)",
+        ),
+        "dev-nested": ContainerProfile(
+            image="enclave-agent:latest",
+            nix_store=True,
+            host_mounts=False,
+            gui=True,
+            fuse=True,
+            persist_home=True,
+            host_wayland=False,
+            description="🖥️ Dev (nested display: GPU/KVM, no host Wayland)",
         ),
     })
     default_profile: str = "dev"
@@ -331,6 +342,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                         fuse=pdata.get("fuse", False),
                         smartcard=pdata.get("smartcard", False),
                         persist_home=pdata.get("persist_home", False),
+                        host_wayland=pdata.get("host_wayland", True),
                         description=pdata.get("description", ""),
                     )
 
