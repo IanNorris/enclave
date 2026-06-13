@@ -72,10 +72,26 @@ class CostTracker:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS complexity_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                tier TEXT DEFAULT 'base',
+                used_fusion INTEGER DEFAULT 0,
+                preset TEXT DEFAULT '',
+                reason TEXT DEFAULT '',
+                task TEXT DEFAULT ''
+            );
+
             CREATE INDEX IF NOT EXISTS idx_usage_session
                 ON usage_events(session_id);
             CREATE INDEX IF NOT EXISTS idx_usage_ts
                 ON usage_events(ts);
+            CREATE INDEX IF NOT EXISTS idx_complexity_session
+                ON complexity_scores(session_id);
+            CREATE INDEX IF NOT EXISTS idx_complexity_ts
+                ON complexity_scores(ts);
         """)
         self._conn.commit()
 
@@ -122,6 +138,75 @@ class CostTracker:
             "model": model,
             "event_type": event_type,
         }
+
+    def record_complexity(
+        self,
+        session_id: str,
+        score: int,
+        tier: str = "base",
+        used_fusion: bool = False,
+        preset: str = "",
+        reason: str = "",
+        task: str = "",
+    ) -> dict[str, Any]:
+        """Record a task-complexity grade (Auto Fusion).
+
+        Args:
+            session_id: Session the grade belongs to.
+            score: Complexity 0-100.
+            tier: 'base' or 'fusion' (the recommended/chosen tier).
+            used_fusion: Whether Fusion was actually used for this task.
+            preset: Fusion preset id used (if any).
+            reason: One-line rationale from the grader.
+            task: Short task summary (truncated).
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            score = max(0, min(100, int(score)))
+        except (TypeError, ValueError):
+            score = 0
+        self._conn.execute(
+            """INSERT INTO complexity_scores
+               (session_id, ts, score, tier, used_fusion, preset, reason, task)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, ts, score, tier, 1 if used_fusion else 0,
+             preset, reason[:500], task[:1000]),
+        )
+        self._conn.commit()
+        return {
+            "session_id": session_id, "ts": ts, "score": score, "tier": tier,
+            "used_fusion": used_fusion, "preset": preset, "reason": reason,
+        }
+
+    def complexity_scores(
+        self, session_id: str | None = None, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return recent complexity grades, newest first.
+
+        If session_id is None, returns grades across all sessions (for the
+        global graph).
+        """
+        if session_id:
+            rows = self._conn.execute(
+                """SELECT session_id, ts, score, tier, used_fusion, preset, reason, task
+                   FROM complexity_scores WHERE session_id = ?
+                   ORDER BY ts DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT session_id, ts, score, tier, used_fusion, preset, reason, task
+                   FROM complexity_scores ORDER BY ts DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "session_id": r["session_id"], "ts": r["ts"], "score": r["score"],
+                "tier": r["tier"], "used_fusion": bool(r["used_fusion"]),
+                "preset": r["preset"], "reason": r["reason"], "task": r["task"],
+            }
+            for r in rows
+        ]
 
     def session_stats(self, session_id: str) -> dict[str, Any]:
         """Get aggregate token usage for a session.
