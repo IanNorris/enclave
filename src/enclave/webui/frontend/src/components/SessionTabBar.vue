@@ -26,9 +26,18 @@
       </div>
     </div>
 
-    <!-- Right: AI credits + model picker -->
+    <!-- Right: AI credits + complexity + current models + model picker -->
     <div class="tabbar-right">
       <span v-if="creditsLabel" class="ai-credits" :title="creditsTitle">{{ creditsLabel }}</span>
+      <ComplexityBadge
+        v-if="liveComplexity && liveComplexity.score"
+        :score="liveComplexity.score"
+        :tier="liveComplexity.tier"
+        :reason="liveComplexity.reason"
+      />
+      <span v-if="liveModels" class="live-models" :title="'Models in use: ' + liveModels">
+        <span class="live-models-icon">⚡</span>{{ liveModels }}
+      </span>
       <div class="model-picker" v-if="models.available.length">
         <select v-model="currentModel" @change="changeModel(selectedSessionId)" class="model-select"
                 :class="{ 'is-fusion': isFusionSelected }">
@@ -55,6 +64,8 @@ import { computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '../stores/session.js'
 import { useModels } from '../composables/useModels.js'
+import { useFusion } from '../composables/useFusion.js'
+import ComplexityBadge from './ComplexityBadge.vue'
 
 defineEmits(['toggle-sidebar'])
 
@@ -66,6 +77,7 @@ const {
   creditsLabel, creditsTitle,
   loadModels, loadCredits, refreshModels, changeModel,
 } = useModels()
+const { liveComplexity, liveModels } = useFusion()
 
 // Fusion pseudo-models are surfaced by the backend in `fusion_models`; split
 // them from real models so the picker can group them under a "Fusion" header.
@@ -192,6 +204,19 @@ watch(selectedSessionId, (id) => {
   text-overflow: ellipsis;
 }
 
+.live-models {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: 220px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.live-models-icon { color: var(--accent); }
+
 .model-picker {
   display: flex;
   align-items: center;
@@ -267,6 +292,9 @@ watch(selectedSessionId, (id) => {
     display: inline;
     font-size: 0.7rem;
     max-width: 8rem;
+  }
+  .live-models {
+    display: none;
   }
   .model-select {
     max-width: 110px;

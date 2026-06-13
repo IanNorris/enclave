@@ -8,21 +8,6 @@
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
 
-      <!-- Auto Fusion: live complexity indicator (1-5) -->
-      <div
-        v-if="complexity"
-        class="complexity-float"
-        :class="'cx-' + complexity.score + (complexity.tier === 'fusion' ? ' cx-fusion' : '')"
-        :title="complexity.reason"
-      >
-        <span class="cx-label">Complexity</span>
-        <span class="cx-dots">
-          <span v-for="n in 5" :key="n" class="cx-dot" :class="{ on: n <= complexity.score }"></span>
-        </span>
-        <span class="cx-num">{{ complexity.score }}/5</span>
-        <span v-if="complexity.tier === 'fusion'" class="cx-tier">⚡ Fusion</span>
-      </div>
-
       <!-- Artifacts grip handle (right edge on desktop, top edge on mobile) -->
       <div class="doc-tools" :class="{ 'mobile-portrait': isMobilePortrait }">
         <button
@@ -149,6 +134,13 @@
             <div class="message-meta">
               <span class="sender">Agent</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
+              <ComplexityBadge
+                v-if="turnMeta[turn.turn_index]?.complexity"
+                class="meta-cx"
+                :score="turnMeta[turn.turn_index].complexity.score"
+                :tier="turnMeta[turn.turn_index].complexity.tier"
+                :reason="turnMeta[turn.turn_index].complexity.reason"
+              />
             </div>
           </div>
 
@@ -157,8 +149,43 @@
             <div class="message-meta">
               <span class="sender">Agent</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
+              <ComplexityBadge
+                v-if="turnMeta[turn.turn_index]?.complexity"
+                class="meta-cx"
+                :score="turnMeta[turn.turn_index].complexity.score"
+                :tier="turnMeta[turn.turn_index].complexity.tier"
+                :reason="turnMeta[turn.turn_index].complexity.reason"
+              />
             </div>
             <div class="message-body" v-html="renderMarkdown(turn.assistant_response)"></div>
+          </div>
+
+          <!-- Auto Fusion model traces for this turn: tap to see each model's
+               outcome + the judge's decision that produced the answer. -->
+          <div
+            v-for="(run, ri) in (turnMeta[turn.turn_index]?.fusions || [])"
+            :key="'fz-' + ri"
+            class="fusion-block card-fusion"
+          >
+            <div class="event-header" @click="toggleCardFusion(turn.turn_index, ri)">
+              <span class="event-icon">⚡</span>
+              <span class="event-label">Fusion · {{ run.preset }}</span>
+              <span class="fusion-models">{{ (run.models || []).join(' + ') }}</span>
+              <span class="expand-toggle">{{ isCardFusionOpen(turn.turn_index, ri) ? '▼' : '▶' }}</span>
+            </div>
+            <div v-if="isCardFusionOpen(turn.turn_index, ri)" class="fusion-trace">
+              <div class="fusion-trace-meta">
+                judge: {{ run.judge_model }} · synthesizer: {{ run.synthesizer_model }}
+              </div>
+              <details class="fusion-section" open>
+                <summary>Judge analysis &amp; decision</summary>
+                <div class="fusion-content" v-html="renderMarkdown(run.judge_analysis)"></div>
+              </details>
+              <details v-for="(p, pi) in run.participants" :key="pi" class="fusion-section">
+                <summary>{{ p.model }}</summary>
+                <div class="fusion-content" v-html="renderMarkdown(p.response)"></div>
+              </details>
+            </div>
           </div>
         </div>
 
@@ -400,7 +427,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api.js'
 import { useSessionStore } from '../stores/session.js'
 import { useModels } from '../composables/useModels.js'
+import { useFusion } from '../composables/useFusion.js'
 import DocumentPane from '../components/DocumentPane.vue'
+import ComplexityBadge from '../components/ComplexityBadge.vue'
 import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
@@ -597,6 +626,15 @@ const askUserPrompt = ref(null)
 const askUserAnswer = ref('')
 // Auto Fusion: latest complexity grade (1-5) + recommended tier, shown live.
 const complexity = ref(null)
+const { applyComplexity, applyFusion, resetFusion } = useFusion()
+// Per-turn Auto Fusion metadata (turn_index → { complexity, fusions: [] }), so
+// each message card can show its complexity badge + tappable fusion trace.
+const turnMeta = ref({})
+const expandedFusion = ref({})
+// Accumulates the complexity grade + fusion runs for the in-progress turn until
+// it finalizes, at which point they're attached to turnMeta[turn_index].
+let pendingComplexity = null
+let pendingFusions = []
 let currentThinkingIdx = -1
 const liveEventsExpanded = ref(false)
 const LIVE_EVENTS_VISIBLE = 5
@@ -704,6 +742,13 @@ onUnmounted(() => {
 watch(selectedSession, (newVal) => {
   if (ws) { ws.close(); ws = null }
   clearLiveState()
+  // Per-turn Auto Fusion metadata is session-specific; reset it (and the shared
+  // tab-bar indicator) on switch so it doesn't leak across sessions.
+  turnMeta.value = {}
+  expandedFusion.value = {}
+  pendingComplexity = null
+  pendingFusions = []
+  resetFusion()
   // Reset live activity so the previous session's state doesn't leak into the
   // newly selected one (the indicator must be session-specific).
   setAgentState('unknown')
@@ -761,7 +806,33 @@ async function loadEvents() {
     // structured cards on dedicated turns, so grouping them here would
     // duplicate (responses) or double-map (cards) them.
     const grouped = {}
+    const meta = {}
     for (const evt of events) {
+      // Auto Fusion grades + fusion runs bind to their turn for the per-message
+      // complexity badge and the tappable model-outcome trace.
+      if (evt.type === 'complexity' || evt.type === 'fusion') {
+        let bestTurn = null
+        for (const t of turns.value) {
+          if (t.turn_index == null) continue
+          if (t.timestamp && t.timestamp <= evt.timestamp) bestTurn = t.turn_index
+        }
+        if (bestTurn == null) continue
+        if (!meta[bestTurn]) meta[bestTurn] = { complexity: null, fusions: [] }
+        if (evt.type === 'complexity') {
+          meta[bestTurn].complexity = { score: evt.score, tier: evt.tier, reason: evt.reason || '' }
+        } else {
+          meta[bestTurn].fusions.push({
+            preset: evt.preset_name || evt.preset || 'fusion',
+            models: evt.models || [],
+            judge_model: evt.judge_model || '',
+            synthesizer_model: evt.synthesizer_model || '',
+            participants: evt.participants || [],
+            judge_analysis: evt.judge_analysis || '',
+            final: evt.final || '',
+          })
+        }
+        continue
+      }
       if (!['tool_start', 'tool_complete', 'file_send', 'thinking'].includes(evt.type)) continue
       // Find the best matching turn (latest turn that started before this event)
       let bestTurn = null
@@ -777,6 +848,8 @@ async function loadEvents() {
       grouped[bestTurn][0].tools.push(evt)
     }
     turnEvents.value = grouped
+    // Merge (don't clobber) so live-attached meta from the current turn survives.
+    turnMeta.value = { ...meta, ...turnMeta.value }
   } catch (e) {
     console.error('Failed to load events:', e)
   }
@@ -856,12 +929,14 @@ function handleStreamEvent(msg) {
   if (type === 'complexity') {
     // Auto Fusion: live task-complexity grade (1-5) + recommended tier.
     complexity.value = { score: msg.score, tier: msg.tier, reason: msg.reason || '' }
+    applyComplexity(msg)
+    pendingComplexity = { score: msg.score, tier: msg.tier, reason: msg.reason || '' }
     return
   }
 
   if (type === 'fusion') {
     // A completed fusion run — render it as a tappable card in the live turn.
-    liveEvents.value.push({
+    const run = {
       type: 'fusion',
       preset: msg.preset_name || msg.preset || 'fusion',
       models: msg.models || [],
@@ -871,7 +946,10 @@ function handleStreamEvent(msg) {
       judge_analysis: msg.judge_analysis || '',
       final: msg.final || '',
       expanded: false,
-    })
+    }
+    liveEvents.value.push(run)
+    applyFusion(msg)
+    pendingFusions.push(run)
     return
   }
 
@@ -915,6 +993,16 @@ function handleStreamEvent(msg) {
       }
       turns.value.push(msg)
     }
+    // Attach any Auto Fusion metadata accumulated during this turn so the
+    // message card can show its complexity badge + tappable fusion trace.
+    if (msg.turn_index != null && (pendingComplexity || pendingFusions.length)) {
+      turnMeta.value[msg.turn_index] = {
+        complexity: pendingComplexity,
+        fusions: pendingFusions,
+      }
+    }
+    pendingComplexity = null
+    pendingFusions = []
     // Only clear live state if this turn has an assistant response
     if (msg.assistant_response) {
       clearLiveState()
@@ -928,6 +1016,10 @@ function handleStreamEvent(msg) {
     streamingText.value = ''
     activityText.value = ''
     currentThinkingIdx = -1
+    // Drop any Auto Fusion meta left over from an incomplete previous turn so it
+    // doesn't get misattributed to this one.
+    pendingComplexity = null
+    pendingFusions = []
     setAgentState('thinking')
     return
   }
@@ -1420,6 +1512,15 @@ function formatTime(ts) {
   const d = new Date(ts)
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
+
+// Per-turn fusion trace expand state, keyed "<turn_index>:<run_index>".
+function isCardFusionOpen(ti, ri) {
+  return !!expandedFusion.value[`${ti}:${ri}`]
+}
+function toggleCardFusion(ti, ri) {
+  const k = `${ti}:${ri}`
+  expandedFusion.value[k] = !expandedFusion.value[k]
+}
 </script>
 
 <style scoped>
@@ -1450,40 +1551,12 @@ function formatTime(ts) {
   pointer-events: none;
 }
 
-/* Auto Fusion complexity indicator (top-right, non-scrolling). */
-.complexity-float {
-  position: absolute;
-  top: 0.5rem;
-  right: 0.75rem;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  padding: 0.2rem 0.6rem;
-  border-radius: 12px;
-  background: var(--bg-sidebar);
-  border: 1px solid var(--border);
-}
+/* Per-message Auto Fusion complexity badge: pushed to the far right of the
+   timestamp row. The badge itself is styled in ComplexityBadge.vue. */
+.meta-cx { margin-left: auto; }
 
-.complexity-float.cx-fusion {
-  border-color: var(--accent);
-  color: var(--text-primary);
-}
-
-.cx-label { text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.65rem; }
-.cx-dots { display: inline-flex; gap: 2px; }
-.cx-dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--border);
-}
-.cx-dot.on { background: var(--accent); }
-.cx-1 .cx-dot.on, .cx-2 .cx-dot.on { background: #4caf7a; }
-.cx-3 .cx-dot.on { background: #e8a838; }
-.cx-4 .cx-dot.on, .cx-5 .cx-dot.on { background: #e05555; }
-.cx-num { font-variant-numeric: tabular-nums; }
-.cx-tier { color: var(--accent); font-weight: 600; }
+/* Fusion trace attached to a message card (model combo + tappable outcomes). */
+.fusion-block.card-fusion { margin: 0.15rem 0 0.5rem; }
 
 /* Fusion run card (model combo + tappable trace). */
 .fusion-block {

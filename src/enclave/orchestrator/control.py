@@ -206,8 +206,9 @@ class ControlServer:
         """Called by the router on Auto Fusion grade + fusion events.
 
         - kind="grade": live complexity update (1-5) + recommended tier. Pushed
-          to the chat stream so the UI shows current complexity; also broadcast
-          on the global channel so the sidebar can show it. Not persisted.
+          to the chat stream so the UI shows current complexity, and broadcast
+          on the global channel for the sidebar. Persisted (in PERSIST_TYPES)
+          so the per-message complexity badge survives reloads.
         - kind="fusion": a completed fusion run with the model combo + trace
           (participant outcomes + judge analysis). Persisted (in PERSIST_TYPES)
           so the tappable trace survives reloads.
