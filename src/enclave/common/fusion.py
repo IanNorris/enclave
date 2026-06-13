@@ -258,6 +258,59 @@ def enabled_presets(fusion: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+# ─── Per-session fusion mode (pickable as a "model") ────────────────────────
+
+#: Workspace file recording the session's selected fusion mode, set when the
+#: user picks a fusion/auto-fusion entry in the model picker. Read per-turn by
+#: the agent so the choice takes effect at runtime (no restart).
+WORKSPACE_FUSION_MODE_FILE = ".enclave-fusion-mode"
+
+#: Pseudo-model id for Auto Fusion (self-grade + escalate) in the picker.
+AUTO_FUSION_MODEL_ID = "auto-fusion"
+#: Prefix for "always use this preset" pseudo-models, e.g. "fusion:frontier".
+FUSION_MODEL_PREFIX = "fusion:"
+
+
+def read_fusion_mode(workspace: str | Path) -> str:
+    """Return the session's fusion mode id, or "" if none.
+
+    Values: "auto-fusion", "fusion:<presetid>", or "".
+    """
+    path = Path(workspace) / WORKSPACE_FUSION_MODE_FILE
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            return str(data.get("mode", "") or "")
+        except (OSError, ValueError):
+            return ""
+    return ""
+
+
+def write_fusion_mode(workspace: str | Path, mode: str) -> None:
+    """Persist the session's fusion mode (empty clears it)."""
+    path = Path(workspace) / WORKSPACE_FUSION_MODE_FILE
+    if not mode:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    path.write_text(json.dumps({"mode": mode}))
+
+
+def is_fusion_model(model_id: str) -> bool:
+    """Whether a model-picker id refers to a fusion mode (not a real model)."""
+    return model_id == AUTO_FUSION_MODEL_ID or model_id.startswith(FUSION_MODEL_PREFIX)
+
+
+def fusion_model_ids(fusion: dict[str, Any]) -> list[str]:
+    """Pseudo-model ids to surface in the picker: auto-fusion + each preset."""
+    ids = [AUTO_FUSION_MODEL_ID]
+    for p in enabled_presets(fusion):
+        ids.append(f"{FUSION_MODEL_PREFIX}{p['id']}")
+    return ids
+
+
 def get_preset(fusion: dict[str, Any], preset_id: str) -> dict[str, Any] | None:
     """Find a preset by id (or name slug). Returns None if not found/enabled."""
     wanted = _slugify(preset_id)

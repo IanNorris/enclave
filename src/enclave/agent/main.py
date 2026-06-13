@@ -973,6 +973,33 @@ async def handle_user_message(
     if timestamp:
         content = f"<current_datetime>{timestamp}</current_datetime>\n\n{content}"
 
+    # Per-turn Fusion routing: when the user has picked a fusion mode from the
+    # model list, inject a one-line directive so the choice takes effect at
+    # runtime (no session restart). Read fresh each turn so toggling is live.
+    try:
+        fusion_mode = _fusion_mod.read_fusion_mode(_workspace_root())
+    except Exception:
+        fusion_mode = ""
+    if fusion_mode and content.strip():
+        if fusion_mode == _fusion_mod.AUTO_FUSION_MODEL_ID:
+            content = (
+                "<auto_fusion>For this message, if it is a substantive unit of "
+                "work (planning, design, a tricky algorithm, an architectural or "
+                "high-risk change), FIRST call `grade_complexity`; on tier "
+                "**fusion** (4-5) call the `fusion` tool and base your answer on "
+                "its synthesized result. Skip grading for trivial chatter or "
+                "obvious one-liners.</auto_fusion>\n\n"
+            ) + content
+        elif fusion_mode.startswith(_fusion_mod.FUSION_MODEL_PREFIX):
+            preset_id = fusion_mode[len(_fusion_mod.FUSION_MODEL_PREFIX):]
+            content = (
+                f"<fusion_mode>For this message, answer by calling the `fusion` "
+                f"tool with preset \"{preset_id}\" (pass the user's full request "
+                f"as the prompt), then base your final answer on its synthesized "
+                f"result. Skip only if the request is trivial chatter or a simple "
+                f"one-liner.</fusion_mode>\n\n"
+            ) + content
+
     if state.sdk_session is None:
         await state.ipc.send(Message(
             type=MessageType.AGENT_RESPONSE,
