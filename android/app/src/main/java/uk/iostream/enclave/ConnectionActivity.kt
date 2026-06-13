@@ -91,7 +91,7 @@ class ConnectionActivity : Activity() {
                 runOnUiThread {
                     button.isEnabled = true
                     if (res.token != null) {
-                        Prefs.save(this, url, res.token, user)
+                        Prefs.save(this, url, res.token, user, pass)
                         NotificationService.start(this)
                         startActivity(Intent(this, MainActivity::class.java))
                         finish()

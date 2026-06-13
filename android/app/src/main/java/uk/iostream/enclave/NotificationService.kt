@@ -73,13 +73,29 @@ class NotificationService : Service() {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                // 4001 = unauthorized (token expired). Try a silent re-auth
+                // before reconnecting so the service self-heals in the background.
+                if (response?.code == 401 || response?.code == 4001) reauth()
                 scheduleReconnect()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (code == 4001) reauth()
                 scheduleReconnect()
             }
         })
+    }
+
+    /** Silent re-auth with stored credentials, updating Prefs so the next
+     *  reconnect uses a fresh token. Best-effort, runs off the main thread. */
+    private fun reauth() {
+        val base = Prefs.serverUrl(this) ?: return
+        val user = Prefs.username(this) ?: return
+        val pass = Prefs.password(this) ?: return
+        try {
+            val res = Api.login(base, user, pass)
+            if (res.token != null) Prefs.updateToken(this, res.token)
+        } catch (_: Exception) { }
     }
 
     private fun scheduleReconnect() {

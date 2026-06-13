@@ -13,10 +13,12 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import org.json.JSONObject
+import kotlin.concurrent.thread
 
 /** Full-screen WebView hosting the existing Enclave web UI. The bearer token
- *  obtained at login is injected into the page's localStorage so the web app is
- *  already authenticated (no second login). */
+ *  is injected into the page's localStorage so the web app is already
+ *  authenticated. When the token expires, the app silently re-authenticates
+ *  with the stored credentials so the user is never bounced to a login screen. */
 class MainActivity : Activity() {
 
     private lateinit var webView: WebView
@@ -28,6 +30,8 @@ class MainActivity : Activity() {
     private var pendingSession: String? = null
     // Set when onNewIntent already navigated, so the following onResume doesn't reload over it.
     private var skipNextResumeReload = false
+    // Guard against concurrent/looping silent re-auth attempts.
+    @Volatile private var reauthInFlight = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,19 +58,31 @@ class MainActivity : Activity() {
         }
 
         val baseUrl = Prefs.serverUrl(this)!!
-        val token = Prefs.token(this)!!
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                // Inject the token (and a pending session selection) before app
-                // scripts read localStorage — the web UI store initialises its
-                // selected session from localStorage at load time only.
-                injectToken(token)
+                // Always seed the current (always-fresh, since every login goes
+                // through ConnectionActivity which updates Prefs) token into
+                // localStorage before the SPA reads it.
+                injectToken()
                 injectPendingSession()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
-                injectToken(token)
+                // If the web UI bounced us to its login screen, the token has
+                // expired. Re-authenticate with stored credentials if we have
+                // them (invisible); otherwise hand off to the app's own
+                // connection screen (which captures the password for future
+                // silent re-auth) and finish, so no /login WebView lingers to
+                // bounce us in a loop.
+                if (url != null && url.contains("/login")) {
+                    if (Prefs.canReauth(this@MainActivity)) {
+                        attemptSilentReauth(baseUrl)
+                    } else {
+                        startActivity(Intent(this@MainActivity, ConnectionActivity::class.java))
+                        finish()
+                    }
+                }
             }
 
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -141,9 +157,43 @@ class MainActivity : Activity() {
         webView.loadUrl("$baseUrl/chat")
     }
 
-    private fun injectToken(token: String) {
+    /** Seed the stored token into the page's localStorage before the SPA reads
+     *  it. Prefs is the single source of truth (all logins update it), so we
+     *  always inject the latest. */
+    private fun injectToken() {
+        val token = Prefs.token(this) ?: return
         val js = "try{localStorage.setItem('enclave_token', ${JSONObject.quote(token)});}catch(e){}"
         webView.evaluateJavascript(js, null)
+    }
+
+    /** Token expired (we're on /login) and we have stored credentials:
+     *  re-authenticate off the UI thread, then reload the app authenticated. */
+    private fun attemptSilentReauth(baseUrl: String) {
+        if (reauthInFlight) return
+        if (!Prefs.canReauth(this)) return
+        reauthInFlight = true
+        val user = Prefs.username(this)!!
+        val pass = Prefs.password(this)!!
+        thread {
+            val res = Api.login(baseUrl, user, pass)
+            runOnUiThread {
+                reauthInFlight = false
+                if (res.token != null) {
+                    Prefs.updateToken(this, res.token)
+                    NotificationService.start(this)
+                    // Re-enter the app authenticated.
+                    val js = "try{localStorage.setItem('enclave_token', ${JSONObject.quote(res.token)});}catch(e){}"
+                    webView.evaluateJavascript(js) {
+                        webView.loadUrl("$baseUrl/")
+                    }
+                } else {
+                    // Stored creds no longer valid (e.g. password changed) — let
+                    // the user re-enter them via the app's connection screen.
+                    startActivity(Intent(this, ConnectionActivity::class.java))
+                    finish()
+                }
+            }
+        }
     }
 
     /** If a session is pending (from a notification tap), write it to localStorage
