@@ -114,6 +114,57 @@ class MimirLibrarianWorker:
                 # Avoid hot-spin on persistent failure
                 await asyncio.sleep(5)
 
+    def _break_stale_lock(self) -> None:
+        """Remove the workspace write lock iff its owner process is dead.
+
+        The lock file (``<canonical_log>.lock``) records the owning pid as a
+        ``pid=<n>`` line. If that process no longer exists the lock is stale
+        (the owner was killed without releasing it) and we delete it so the
+        next run can proceed. A live owner is left strictly untouched, so this
+        never races a legitimately-running librarian.
+        """
+        lock_path = Path(str(self._canonical_log) + ".lock")
+        try:
+            text = lock_path.read_text()
+        except (OSError, ValueError):
+            return  # no lock, or unreadable — nothing to break
+        pid = None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("pid="):
+                try:
+                    pid = int(line[4:].strip())
+                except ValueError:
+                    pid = None
+                break
+        if pid is None:
+            log.warning(
+                "Mimir librarian: lock file %s has no parseable pid — "
+                "leaving it in place (manual inspection needed)", lock_path,
+            )
+            return
+        # os.kill(pid, 0) raises ProcessLookupError if the pid is dead,
+        # PermissionError if it exists but we can't signal it (still alive).
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            try:
+                lock_path.unlink()
+                log.warning(
+                    "Mimir librarian: removed stale write lock %s "
+                    "(owner pid %d is dead)", lock_path, pid,
+                )
+            except OSError as e:
+                log.warning(
+                    "Mimir librarian: failed to remove stale lock %s: %s",
+                    lock_path, e,
+                )
+        except PermissionError:
+            log.debug(
+                "Mimir librarian: lock owner pid %d still alive — not breaking",
+                pid,
+            )
+
     async def _run_once(self) -> None:
         if not Path(self._librarian_bin).is_file():
             log.warning(
@@ -131,6 +182,16 @@ class MimirLibrarianWorker:
                     return
             except OSError:
                 pass
+
+        # Break a stale workspace write lock before running. The librarian
+        # acquires an advisory lock file (<canonical_log>.lock) for the run and
+        # is supposed to release it on exit, but if a previous run was SIGKILLed
+        # mid-flight (e.g. our own run-timeout kill below, or an orchestrator
+        # crash) the lock file is orphaned and every subsequent run fails with
+        # "workspace write lock already held" (rc=70) — a permanent stall. We
+        # only break it when the recorded owner pid is provably dead, so a live
+        # run is never disturbed.
+        self._break_stale_lock()
 
         cmd = [
             str(self._librarian_bin), "run",
@@ -167,15 +228,29 @@ class MimirLibrarianWorker:
                     proc.communicate(), timeout=self._run_timeout_secs,
                 )
             except asyncio.TimeoutError:
+                # Terminate gracefully first (SIGTERM) so the librarian can run
+                # its lock-release/cleanup path; only SIGKILL if it ignores the
+                # request. A bare SIGKILL here was the original stall source: it
+                # left the workspace write lock orphaned, wedging every later
+                # run. The dead-pid lock breaker above now recovers from that
+                # too, but a clean shutdown avoids the failed run entirely.
                 log.warning(
-                    "Mimir librarian: run timed out after %ss, killing",
+                    "Mimir librarian: run timed out after %ss, terminating",
                     self._run_timeout_secs,
                 )
                 try:
-                    proc.kill()
+                    proc.terminate()
                 except ProcessLookupError:
                     pass
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    log.warning("Mimir librarian: did not exit on SIGTERM, killing")
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
                 return
             if proc.returncode == 0:
                 # Extract the final summary line from stderr (the librarian
