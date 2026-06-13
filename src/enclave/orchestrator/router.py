@@ -1111,6 +1111,53 @@ class MessageRouter:
                         "session": session_credits or {},
                     },
                 )
+        elif msg.type == MessageType.FUSION_EVENT:
+            kind = msg.payload.get("kind", "")
+            if kind == "grade":
+                # Persist the complexity grade and broadcast it live.
+                score = msg.payload.get("score", 0)
+                tier = msg.payload.get("tier", "base")
+                reason = msg.payload.get("reason", "")
+                task = msg.payload.get("task", "")
+                try:
+                    self._cost.record_complexity(
+                        session_id=session.id, score=score, tier=tier,
+                        used_fusion=False, reason=reason, task=task,
+                    )
+                except Exception as e:
+                    log.warning("Failed to record complexity: %s", e)
+                if self._control:
+                    self._control.notify_fusion(session.id, {
+                        "kind": "grade", "score": score, "tier": tier,
+                        "reason": reason,
+                    })
+            elif kind == "fusion":
+                # A fusion run completed — record that fusion was used (update
+                # the latest grade if present) and broadcast the trace.
+                preset = msg.payload.get("preset", "")
+                models = msg.payload.get("models", [])
+                try:
+                    self._cost.record_complexity(
+                        session_id=session.id,
+                        score=msg.payload.get("score", 4),
+                        tier="fusion", used_fusion=True, preset=preset,
+                        reason=msg.payload.get("reason", "fusion run"),
+                        task=(msg.payload.get("prompt", "") or "")[:1000],
+                    )
+                except Exception as e:
+                    log.warning("Failed to record fusion use: %s", e)
+                if self._control:
+                    self._control.notify_fusion(session.id, {
+                        "kind": "fusion",
+                        "preset": preset,
+                        "preset_name": msg.payload.get("preset_name", ""),
+                        "models": models,
+                        "judge_model": msg.payload.get("judge_model", ""),
+                        "synthesizer_model": msg.payload.get("synthesizer_model", ""),
+                        "participants": msg.payload.get("participants", []),
+                        "judge_analysis": msg.payload.get("judge_analysis", ""),
+                        "final": msg.payload.get("final", ""),
+                    })
         elif msg.type == MessageType.NIX_SHELL_REQUEST:
             await self._handle_nix_shell_request(session, msg)
         elif msg.type == MessageType.PORT_REQUEST:

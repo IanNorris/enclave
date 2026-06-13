@@ -1338,26 +1338,25 @@ async def _run_copilot_oneshot(
         return f"[Error: {e}]"
 
 
-async def _run_fusion(preset: dict, prompt: str) -> str:
-    """Run the Fusion pipeline for one preset and return a synthesized answer.
+async def _run_fusion(preset: dict, prompt: str) -> dict:
+    """Run the Fusion pipeline for one preset.
 
     Stages: fan out the prompt to each participant model in parallel → judge
-    extracts structure → synthesizer writes the final answer. The returned text
-    leads with the synthesized answer and appends a foldable transparency trace
-    (each participant's take + the judge's analysis), keeping Fusion auditable.
+    extracts structure → synthesizer writes the final answer. Returns a dict
+    with the final answer plus the full trace (participant responses, judge
+    analysis, resolved models) so the caller can both render it and emit a
+    structured FUSION_EVENT for the UI.
     """
     participants: list[list[str]] = preset.get("participants") or []
     judge_prefs = tuple(preset.get("judge") or ()) or _MODEL_PREFERENCES
     synth_prefs = tuple(preset.get("synthesizer") or ()) or _MODEL_PREFERENCES
 
-    # Resolve each participant seat to an available model (de-dupe identical ids
-    # so we don't pay twice for the same model).
     seats: list[str] = []
     for prefs in participants:
         model = _resolve_model(tuple(prefs)) if prefs else _resolve_model(_MODEL_PREFERENCES)
         seats.append(model)
     if not seats:
-        return "[Fusion error: preset has no participants]"
+        return {"error": "preset has no participants"}
 
     print(
         "[agent] fusion[%s]: %d participants (%s)" % (
@@ -1385,17 +1384,36 @@ async def _run_fusion(preset: dict, prompt: str) -> str:
     print(f"[agent] fusion: synthesizing with {synth_model}", file=sys.stderr)
     final = await _run_copilot_oneshot(synth_model, synth_prompt, timeout=240.0)
 
-    # Assemble: synthesized answer + foldable transparency trace.
+    return {
+        "preset_id": preset.get("id", ""),
+        "preset_name": preset.get("name", preset.get("id", "fusion")),
+        "participants": [
+            {"model": label, "response": text} for label, text in responses
+        ],
+        "judge_model": judge_model,
+        "judge_analysis": judge_analysis,
+        "synthesizer_model": synth_model,
+        "final": final,
+    }
+
+
+def _format_fusion_result(result: dict) -> str:
+    """Render a fusion result dict as markdown: final answer + foldable trace."""
+    final = result.get("final", "")
+    judge_model = result.get("judge_model", "")
+    synth_model = result.get("synthesizer_model", "")
+    name = result.get("preset_name", "fusion")
     trace_parts = [
-        f"### {label}\n\n{text}" for label, text in responses
+        f"### {p['model']}\n\n{p['response']}"
+        for p in result.get("participants", [])
     ]
     trace = "\n\n".join(trace_parts)
     return (
         f"{final}\n\n"
         "<details>\n<summary>Fusion trace "
-        f"(preset: {preset.get('name', preset.get('id', 'fusion'))}, "
-        f"judge: {judge_model}, synthesizer: {synth_model})</summary>\n\n"
-        f"#### Judge analysis\n\n{judge_analysis}\n\n"
+        f"(preset: {name}, judge: {judge_model}, synthesizer: {synth_model})"
+        "</summary>\n\n"
+        f"#### Judge analysis\n\n{result.get('judge_analysis', '')}\n\n"
         f"#### Participant responses\n\n{trace}\n</details>"
     )
 
@@ -1752,6 +1770,29 @@ async def try_init_copilot(
                     + instructions_text
                 )
                 print(f"[agent] Loaded workspace instructions ({len(instructions_text)} chars)", file=sys.stderr)
+
+        # Auto Fusion mode: when enabled for the session, instruct the agent to
+        # self-grade complexity and escalate hard work to the fusion pipeline.
+        if os.environ.get("ENCLAVE_AUTO_FUSION", "").strip() in ("1", "true", "yes"):
+            prompt_parts.append(
+                "# Auto Fusion mode (ENABLED)\n\n"
+                "This session runs in **Auto Fusion**: use a cheaper model for "
+                "routine work, and escalate to a panel of models (Fusion) for "
+                "high-complexity work — automatically.\n\n"
+                "**At the start of any substantive task** (planning, design, a "
+                "tricky algorithm, an architectural choice, or a high-risk "
+                "change), FIRST call `grade_complexity` with a short description "
+                "of what you're about to do. It returns a 1-5 score and a tier:\n"
+                "- tier **base** (1-3): just do the work yourself as normal.\n"
+                "- tier **fusion** (4-5): call the `fusion` tool with the task "
+                "as the prompt, then base your answer/implementation on its "
+                "synthesized result.\n\n"
+                "Do NOT grade trivial chatter, obvious one-liners, or simple "
+                "follow-ups — only grade genuine units of work. Never grade more "
+                "than once for the same unit of work. The grade is shown to the "
+                "user live, so be honest, not inflationary."
+            )
+            print("[agent] Auto Fusion mode enabled", file=sys.stderr)
 
         # Load session-specific prompt (.enclave-session-prompt)
         session_prompt_path = Path(working_directory) / ".enclave-session-prompt"
@@ -4816,7 +4857,32 @@ async def try_init_copilot(
                     text_result_for_llm=f"Fusion failed: {e}",
                     result_type="error",
                 )
-            return ToolResult(text_result_for_llm=result)
+            if result.get("error"):
+                return ToolResult(
+                    text_result_for_llm=f"Fusion error: {result['error']}",
+                    result_type="error",
+                )
+
+            # Emit a structured FUSION_EVENT so the UI can show the model combo
+            # and a tappable trace (participant outcomes + judge decision).
+            if ipc is not None:
+                models = [p["model"] for p in result.get("participants", [])]
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.FUSION_EVENT,
+                    payload={
+                        "kind": "fusion",
+                        "preset": result.get("preset_id", ""),
+                        "preset_name": result.get("preset_name", ""),
+                        "models": models,
+                        "judge_model": result.get("judge_model", ""),
+                        "synthesizer_model": result.get("synthesizer_model", ""),
+                        "participants": result.get("participants", []),
+                        "judge_analysis": result.get("judge_analysis", ""),
+                        "final": result.get("final", ""),
+                        "prompt": prompt[:2000],
+                    },
+                )))
+            return ToolResult(text_result_for_llm=_format_fusion_result(result))
 
         fusion_tool = Tool(
             name="fusion",
@@ -4857,6 +4923,92 @@ async def try_init_copilot(
             },
         )
         custom_tools.append(fusion_tool)
+
+        # ── Custom tool: grade_complexity — Auto Fusion router ──
+        # Scores the current task 1-5 and records it so Auto Fusion can route
+        # cheap tasks to the base model and escalate hard ones to fusion. The
+        # grade is emitted to the UI (live complexity + recommended tier).
+        async def _grade_complexity_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            task = (args.get("task") or "").strip()
+            if not task:
+                return ToolResult(
+                    text_result_for_llm="Error: provide a 'task' to grade.",
+                    result_type="error",
+                )
+            fusion_doc = _fusion_mod.load_workspace_fusion(working_directory)
+            threshold = int(fusion_doc.get("auto_threshold", 4))
+            grader_model = _resolve_model(
+                tuple(fusion_doc.get("base_model", "") and [fusion_doc["base_model"]] or [])
+                or _MODEL_PREFERENCES
+            )
+            grade_prompt = _fusion_mod.build_complexity_prompt(task)
+            raw = await _run_copilot_oneshot(grader_model, grade_prompt, timeout=90.0)
+            graded = _fusion_mod.parse_complexity(raw, threshold=threshold)
+            score = graded["score"]
+            tier = graded["tier"]
+            reason = graded["reason"]
+
+            # Emit + record (orchestrator persists to the complexity DB).
+            if ipc is not None:
+                _fire_and_forget(ipc.send(Message(
+                    type=MessageType.FUSION_EVENT,
+                    payload={
+                        "kind": "grade",
+                        "score": score,
+                        "tier": tier,
+                        "reason": reason,
+                        "threshold": threshold,
+                        "task": task[:1000],
+                    },
+                )))
+
+            preset_hint = ""
+            if tier == "fusion":
+                presets = _fusion_mod.enabled_presets(fusion_doc)
+                if presets:
+                    preset_hint = (
+                        f" Use the `fusion` tool (preset '{presets[0]['id']}') "
+                        "for this task."
+                    )
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Complexity: {score}/5 → tier '{tier}' "
+                    f"(threshold {threshold}). {reason}{preset_hint}"
+                ),
+            )
+
+        grade_complexity_tool = Tool(
+            name="grade_complexity",
+            description=(
+                "Auto Fusion: grade the complexity (1-5) of the task you're "
+                "about to do, to decide whether to answer with the base model "
+                "or escalate to `fusion`. Call this at the START of substantive "
+                "work — planning, design, tricky implementation, or anything "
+                "high-stakes. 1-2 = trivial/simple, 3 = moderate, 4-5 = complex "
+                "(use fusion). When the result says tier 'fusion', call the "
+                "`fusion` tool for the actual work. Skip this for routine "
+                "chatter and obvious one-liners."
+            ),
+            handler=_grade_complexity_handler,
+            skip_permission=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "A short description of the task/turn you're about "
+                            "to tackle, with enough context to judge its "
+                            "complexity."
+                        ),
+                    },
+                },
+                "required": ["task"],
+            },
+        )
+        custom_tools.append(grade_complexity_tool)
+
 
 
         # ── Custom tool: web_search ──

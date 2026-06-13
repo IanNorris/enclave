@@ -48,6 +48,7 @@ class ContainerProfile:
     smartcard: bool = False  # bind-mount the host pcscd socket for PC/SC card access
     persist_home: bool = False  # bind-mount <workspace>/.home over $HOME so caches persist
     host_wayland: bool = True  # with gui: mount the host Wayland socket (off = GPU/KVM only, run nested)
+    auto_fusion: bool = False  # enable Auto Fusion (self-grade complexity + escalate to fusion)
     description: str = ""
 
 
@@ -343,6 +344,7 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                         smartcard=pdata.get("smartcard", False),
                         persist_home=pdata.get("persist_home", False),
                         host_wayland=pdata.get("host_wayland", True),
+                        auto_fusion=pdata.get("auto_fusion", False),
                         description=pdata.get("description", ""),
                     )
 

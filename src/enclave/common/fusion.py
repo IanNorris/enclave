@@ -39,14 +39,14 @@ DEFAULT_FUSION: list[dict[str, Any]] = [
     {
         "id": "frontier",
         "name": "Frontier",
-        "description": "Beyond-frontier: a panel of top models, judged and synthesized.",
+        "description": "Beyond-frontier: top models at max reasoning, judged and synthesized. Used for complexity 4-5.",
         "participants": [
-            ["claude-opus-4.8", "claude-opus-4.6", "claude-opus-4.5"],
-            ["gpt-5.5", "gpt-5.4", "gpt-5.2"],
-            ["claude-sonnet-4.6", "claude-sonnet-4.5"],
+            ["claude-opus-4.8-max", "claude-opus-4.8-xhigh", "claude-opus-4.8", "claude-opus-4.6"],
+            ["gpt-5.5-xhigh", "gpt-5.5", "gpt-5.4"],
+            ["claude-opus-4.7-xhigh", "claude-opus-4.7", "claude-sonnet-4.6"],
         ],
-        "judge": ["claude-opus-4.8", "claude-opus-4.6", "gpt-5.5"],
-        "synthesizer": ["claude-opus-4.8", "claude-opus-4.6", "gpt-5.5"],
+        "judge": ["claude-opus-4.8-max", "claude-opus-4.8-xhigh", "claude-opus-4.8", "gpt-5.5"],
+        "synthesizer": ["claude-opus-4.8-max", "claude-opus-4.8-xhigh", "claude-opus-4.8", "gpt-5.5"],
         "enabled": True,
     },
     {
@@ -151,11 +151,11 @@ def normalize_fusion(data: Any) -> dict[str, Any]:
     if isinstance(data, dict):
         presets = data.get("presets", [])
         base_model = data.get("base_model", "")
-        auto_threshold = data.get("auto_threshold", 60)
+        auto_threshold = data.get("auto_threshold", 4)
     elif isinstance(data, list):
-        presets, base_model, auto_threshold = data, "", 60
+        presets, base_model, auto_threshold = data, "", 4
     else:
-        presets, base_model, auto_threshold = [], "", 60
+        presets, base_model, auto_threshold = [], "", 4
     if not isinstance(presets, list):
         presets = []
 
@@ -176,9 +176,9 @@ def normalize_fusion(data: Any) -> dict[str, Any]:
         normalized.append(preset)
 
     try:
-        threshold = max(0, min(100, int(auto_threshold)))
+        threshold = max(1, min(5, int(auto_threshold)))
     except (TypeError, ValueError):
-        threshold = 60
+        threshold = 4
 
     return {
         "version": FUSION_VERSION,
@@ -196,7 +196,7 @@ def default_fusion() -> dict[str, Any]:
         "version": FUSION_VERSION,
         "presets": DEFAULT_FUSION,
         "base_model": "claude-sonnet-4.6",
-        "auto_threshold": 60,
+        "auto_threshold": 4,
     })
 
 
@@ -345,20 +345,54 @@ def build_synthesizer_prompt(
 def build_complexity_prompt(task: str) -> str:
     """Prompt for the complexity grader (Auto Fusion).
 
-    Returns a small JSON object the caller parses: a 0-100 complexity score, a
+    Returns a small JSON object the caller parses: a 1-5 complexity score, a
     recommended tier, and a one-line rationale.
     """
     return (
         "You are a fast task-complexity grader for an AI coding agent. Given "
-        "the task/turn below, rate how much it would benefit from a panel of "
-        "models (Fusion) versus a single capable model. Consider: ambiguity, "
-        "architectural/design stakes, breadth of knowledge required, risk of "
-        "subtle error, and whether multiple valid approaches exist. Routine, "
-        "mechanical, or well-specified tasks score LOW; open-ended planning, "
-        "API/architecture design, tricky algorithms, or high-risk changes "
-        "score HIGH.\n\n"
+        "the task/turn below, rate on a 1-5 scale how much it would benefit "
+        "from a panel of models (Fusion) versus a single capable model. "
+        "Consider: ambiguity, architectural/design stakes, breadth of "
+        "knowledge required, risk of subtle error, and whether multiple valid "
+        "approaches exist.\n\n"
+        "Scale:\n"
+        "1 = trivial/mechanical (rename, format, obvious one-liner)\n"
+        "2 = simple, well-specified\n"
+        "3 = moderate; some judgement but a single model handles it\n"
+        "4 = complex; design stakes or subtle risk — a panel helps\n"
+        "5 = very complex; open-ended planning, tricky algorithm/architecture, "
+        "high-risk change — a panel clearly helps\n\n"
         "Respond with ONLY a compact JSON object, no prose:\n"
-        '{\"score\": <0-100 int>, \"tier\": \"base\"|\"fusion\", '
-        '\"reason\": \"<one short sentence>\"}\n\n'
-        f"--- Task ---\n{task}"
+        '{"score": <1-5 int>, "tier": "base"|"fusion", '
+        '"reason": "<one short sentence>"}'
+        "\n\n--- Task ---\n"
+        f"{task}"
     )
+
+
+def parse_complexity(raw: str, *, threshold: int = 4) -> dict[str, Any]:
+    """Parse a grader response into {score:1-5, tier, reason}.
+
+    Tolerant of code fences / surrounding prose: extracts the first JSON object.
+    Falls back to a mid score if unparseable. `tier` is derived from the score
+    vs threshold when the model didn't supply a clean one.
+    """
+    score = 3
+    reason = ""
+    tier = ""
+    text = (raw or "").strip()
+    # Find the first {...} block.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            obj = json.loads(text[start:end + 1])
+            score = int(obj.get("score", 3))
+            reason = str(obj.get("reason", "")).strip()
+            tier = str(obj.get("tier", "")).strip().lower()
+        except (ValueError, TypeError):
+            pass
+    score = max(1, min(5, score))
+    if tier not in ("base", "fusion"):
+        tier = "fusion" if score >= threshold else "base"
+    return {"score": score, "tier": tier, "reason": reason}

@@ -59,6 +59,9 @@ class MessageType(str, Enum):
     # Token/cost tracking
     USAGE_REPORT = "usage_report"
 
+    # Fusion / Auto Fusion: complexity grades and fusion-run traces
+    FUSION_EVENT = "fusion_event"
+
     # Environment management
     NIX_SHELL_REQUEST = "nix_shell_request"
     PORT_REQUEST = "port_request"

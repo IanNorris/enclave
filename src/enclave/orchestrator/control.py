@@ -201,6 +201,27 @@ class ControlServer:
         """
         self._emit(session_id, {"ok": True, "type": "credits", **payload})
 
+    def notify_fusion(self, session_id: str, payload: dict) -> None:
+        """Called by the router on Auto Fusion grade + fusion events.
+
+        - kind="grade": live complexity update (1-5) + recommended tier. Pushed
+          to the chat stream so the UI shows current complexity; also broadcast
+          on the global channel so the sidebar can show it. Not persisted.
+        - kind="fusion": a completed fusion run with the model combo + trace
+          (participant outcomes + judge analysis). Persisted (in PERSIST_TYPES)
+          so the tappable trace survives reloads.
+        """
+        kind = payload.get("kind", "")
+        if kind == "grade":
+            self._emit(session_id, {"ok": True, "type": "complexity", **payload})
+            self._emit_notification({
+                "type": "complexity", "session_id": session_id,
+                "score": payload.get("score"), "tier": payload.get("tier"),
+                "reason": payload.get("reason", ""),
+            })
+        elif kind == "fusion":
+            self._emit(session_id, {"ok": True, "type": "fusion", **payload})
+
     def _emit_notification(self, event: dict) -> None:
         """Push a cross-session notification event to all global subscribers."""
         for q in list(self._notification_subscribers):
