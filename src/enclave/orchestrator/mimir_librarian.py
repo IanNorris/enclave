@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import shlex
+import sys
 from pathlib import Path
 
 log = logging.getLogger("enclave.mimir.librarian")
@@ -42,6 +43,8 @@ class MimirLibrarianWorker:
         run_timeout_secs: float = 600.0,
         llm_timeout_secs: int = 120,
         max_retries: int = 2,
+        sidecar_enabled: bool = True,
+        sidecar_model: str = "claude-haiku-4.5",
     ) -> None:
         self._librarian_bin = librarian_bin
         self._canonical_log = Path(canonical_log)
@@ -53,6 +56,76 @@ class MimirLibrarianWorker:
         self._event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
+        # Warm-session sidecar: a long-lived helper that keeps one
+        # ``copilot --acp`` server warm so the librarian doesn't cold-spawn a
+        # full CLI agent per draft. Lazily started on first run; the librarian
+        # falls back to cold-spawn if it is unavailable, so this is a pure
+        # optimization. Only meaningful for the copilot backend.
+        self._sidecar_enabled = sidecar_enabled and (
+            os.environ.get("MIMIR_LIBRARIAN_LLM", "copilot") == "copilot"
+        )
+        self._sidecar_model = sidecar_model
+        self._sidecar_socket = self._canonical_log.parent / "copilot-sidecar.sock"
+        self._sidecar_proc: asyncio.subprocess.Process | None = None
+
+    # ── warm-session sidecar lifecycle ──────────────────────────────────
+    async def _ensure_sidecar(self) -> bool:
+        """Start the warm-session sidecar if enabled and not already running.
+
+        Idempotent. Returns True if the sidecar socket is available for this
+        run, False otherwise (in which case the librarian uses cold-spawn).
+        """
+        if not self._sidecar_enabled:
+            return False
+        # Already running and healthy?
+        if self._sidecar_proc is not None and self._sidecar_proc.returncode is None:
+            return self._sidecar_socket.exists()
+
+        # (Re)start the sidecar in the same interpreter/venv as the orchestrator.
+        try:
+            self._sidecar_proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "enclave.orchestrator.mimir_sidecar",
+                "--socket", str(self._sidecar_socket),
+                "--model", self._sidecar_model,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except Exception as e:
+            log.warning("Mimir sidecar: failed to launch (%s); using cold-spawn", e)
+            self._sidecar_proc = None
+            return False
+
+        # Wait briefly for the socket to appear (server boots a copilot --acp
+        # session — a few seconds). If it doesn't, proceed without it.
+        for _ in range(40):  # ~20s
+            if self._sidecar_socket.exists():
+                log.info("Mimir sidecar: warm-session helper ready at %s", self._sidecar_socket)
+                return True
+            if self._sidecar_proc.returncode is not None:
+                log.warning("Mimir sidecar: exited during startup; using cold-spawn")
+                self._sidecar_proc = None
+                return False
+            await asyncio.sleep(0.5)
+        log.warning("Mimir sidecar: socket did not appear in time; using cold-spawn")
+        return False
+
+    async def _stop_sidecar(self) -> None:
+        proc, self._sidecar_proc = self._sidecar_proc, None
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        except ProcessLookupError:
+            pass
+        try:
+            self._sidecar_socket.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def start(self) -> None:
         if self._task is None:
@@ -77,6 +150,7 @@ class MimirLibrarianWorker:
                 except (asyncio.CancelledError, Exception):
                     pass
             self._task = None
+        await self._stop_sidecar()
 
     def trigger(self, reason: str = "") -> None:
         """Request a librarian run. Coalesces with concurrent triggers."""
@@ -193,6 +267,11 @@ class MimirLibrarianWorker:
         # run is never disturbed.
         self._break_stale_lock()
 
+        # Bring up the warm-session sidecar (idempotent). If it's available,
+        # route classification through it; the librarian falls back to
+        # cold-spawn per draft if the socket is unreachable mid-run.
+        sidecar_up = await self._ensure_sidecar()
+
         cmd = [
             str(self._librarian_bin), "run",
             "--workspace", str(self._canonical_log),
@@ -200,6 +279,8 @@ class MimirLibrarianWorker:
             "--llm-timeout-secs", str(self._llm_timeout_secs),
             "--max-retries", str(self._max_retries),
         ]
+        if sidecar_up:
+            cmd += ["--copilot-sidecar", str(self._sidecar_socket)]
         env = os.environ.copy()
         env.setdefault("MIMIR_LIBRARIAN_LLM", "copilot")
         # The librarian shells out to an LLM CLI (default `copilot`). The
