@@ -356,6 +356,37 @@ async def get_credits(request: Request, session: str = ""):
     return empty
 
 
+@router.get("/complexity")
+async def get_complexity(request: Request, session: str = "", limit: int = 500):
+    """Return recorded Auto Fusion complexity grades (for the graph).
+
+    Pass ``session`` for one session's scores, or omit for global. Served from
+    the orchestrator's control socket, which reads the persisted cost tracker.
+    """
+    data_dir = Path(request.app.state.config.data_dir)
+    sock_path = data_dir / "control.sock"
+    if not sock_path.exists():
+        return {"scores": []}
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        req = {"action": "complexity", "limit": limit}
+        if session:
+            req["session"] = session
+        writer.write(json.dumps(req).encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        writer.close()
+        await writer.wait_closed()
+        if line:
+            resp = json.loads(line.decode())
+            if resp.get("ok"):
+                return {"scores": resp.get("scores", [])}
+    except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        import logging
+        logging.getLogger("enclave.webui").warning("Complexity query failed: %s", e)
+    return {"scores": []}
+
+
 @router.get("/{session_id}/history")
 async def get_history(request: Request, session_id: str, limit: int = 100, offset: int = 0):
     """Get conversation history for a session.

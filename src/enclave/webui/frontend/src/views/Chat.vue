@@ -8,6 +8,21 @@
         <span class="status-label">{{ agentStateLabel }}</span>
       </div>
 
+      <!-- Auto Fusion: live complexity indicator (1-5) -->
+      <div
+        v-if="complexity"
+        class="complexity-float"
+        :class="'cx-' + complexity.score + (complexity.tier === 'fusion' ? ' cx-fusion' : '')"
+        :title="complexity.reason"
+      >
+        <span class="cx-label">Complexity</span>
+        <span class="cx-dots">
+          <span v-for="n in 5" :key="n" class="cx-dot" :class="{ on: n <= complexity.score }"></span>
+        </span>
+        <span class="cx-num">{{ complexity.score }}/5</span>
+        <span v-if="complexity.tier === 'fusion'" class="cx-tier">⚡ Fusion</span>
+      </div>
+
       <!-- Artifacts grip handle (right edge on desktop, top edge on mobile) -->
       <div class="doc-tools" :class="{ 'mobile-portrait': isMobilePortrait }">
         <button
@@ -218,6 +233,29 @@
               <div v-if="evt.mimetype?.startsWith('image/')" class="file-send-preview">
                 <img v-if="evt.filePath" :src="workspaceFileUrl(evt.filePath)" class="file-send-img clickable-img" @click="openLightbox(workspaceFileUrl(evt.filePath))" />
                 <img v-else-if="evt.mxcUrl" :src="mediaUrl(evt.mxcUrl)" class="file-send-img clickable-img" @click="openLightbox(mediaUrl(evt.mxcUrl))" />
+              </div>
+            </div>
+
+            <!-- Fusion run: model combo + tappable trace -->
+            <div v-if="evt.type === 'fusion'" class="fusion-block">
+              <div class="event-header" @click="evt.expanded = !evt.expanded">
+                <span class="event-icon">⚡</span>
+                <span class="event-label">Fusion · {{ evt.preset }}</span>
+                <span class="fusion-models">{{ (evt.models || []).join(' + ') }}</span>
+                <span class="expand-toggle">{{ evt.expanded ? '▼' : '▶' }}</span>
+              </div>
+              <div v-if="evt.expanded" class="fusion-trace">
+                <div class="fusion-trace-meta">
+                  judge: {{ evt.judge_model }} · synthesizer: {{ evt.synthesizer_model }}
+                </div>
+                <details class="fusion-section" open>
+                  <summary>Judge analysis</summary>
+                  <div class="fusion-content" v-html="renderMarkdown(evt.judge_analysis)"></div>
+                </details>
+                <details v-for="(p, pi) in evt.participants" :key="pi" class="fusion-section">
+                  <summary>{{ p.model }}</summary>
+                  <div class="fusion-content" v-html="renderMarkdown(p.response)"></div>
+                </details>
               </div>
             </div>
           </div>
@@ -557,6 +595,8 @@ const streamingText = ref('')
 const activityText = ref('')
 const askUserPrompt = ref(null)
 const askUserAnswer = ref('')
+// Auto Fusion: latest complexity grade (1-5) + recommended tier, shown live.
+const complexity = ref(null)
 let currentThinkingIdx = -1
 const liveEventsExpanded = ref(false)
 const LIVE_EVENTS_VISIBLE = 5
@@ -680,6 +720,7 @@ function clearLiveState() {
   activityText.value = ''
   askUserPrompt.value = null
   askUserAnswer.value = ''
+  complexity.value = null
   currentThinkingIdx = -1
   turnEvents.value = {}
   expandedTurns.value = {}
@@ -809,6 +850,28 @@ function handleStreamEvent(msg) {
     // snapshot + per-session consumed AI Units. Routed through the shared
     // composable so the global tab bar reflects it too.
     applyCreditsUpdate(msg)
+    return
+  }
+
+  if (type === 'complexity') {
+    // Auto Fusion: live task-complexity grade (1-5) + recommended tier.
+    complexity.value = { score: msg.score, tier: msg.tier, reason: msg.reason || '' }
+    return
+  }
+
+  if (type === 'fusion') {
+    // A completed fusion run — render it as a tappable card in the live turn.
+    liveEvents.value.push({
+      type: 'fusion',
+      preset: msg.preset_name || msg.preset || 'fusion',
+      models: msg.models || [],
+      judge_model: msg.judge_model || '',
+      synthesizer_model: msg.synthesizer_model || '',
+      participants: msg.participants || [],
+      judge_analysis: msg.judge_analysis || '',
+      final: msg.final || '',
+      expanded: false,
+    })
     return
   }
 
@@ -1385,6 +1448,72 @@ function formatTime(ts) {
   background: var(--bg-sidebar);
   border: 1px solid var(--border);
   pointer-events: none;
+}
+
+/* Auto Fusion complexity indicator (top-right, non-scrolling). */
+.complexity-float {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.75rem;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+}
+
+.complexity-float.cx-fusion {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.cx-label { text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.65rem; }
+.cx-dots { display: inline-flex; gap: 2px; }
+.cx-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--border);
+}
+.cx-dot.on { background: var(--accent); }
+.cx-1 .cx-dot.on, .cx-2 .cx-dot.on { background: #4caf7a; }
+.cx-3 .cx-dot.on { background: #e8a838; }
+.cx-4 .cx-dot.on, .cx-5 .cx-dot.on { background: #e05555; }
+.cx-num { font-variant-numeric: tabular-nums; }
+.cx-tier { color: var(--accent); font-weight: 600; }
+
+/* Fusion run card (model combo + tappable trace). */
+.fusion-block {
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card, #1e1e24);
+  margin: 0.25rem 0;
+}
+.fusion-block .event-header {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.5rem 0.7rem; cursor: pointer;
+}
+.fusion-models {
+  font-size: 0.78rem; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.fusion-trace { padding: 0 0.7rem 0.6rem; }
+.fusion-trace-meta {
+  font-size: 0.72rem; color: var(--text-muted, #5c6078);
+  margin: 0.25rem 0 0.5rem;
+}
+.fusion-section { margin: 0.3rem 0; }
+.fusion-section summary {
+  cursor: pointer; font-size: 0.82rem; color: var(--text-secondary);
+  padding: 0.2rem 0;
+}
+.fusion-content {
+  font-size: 0.85rem; padding: 0.3rem 0 0.3rem 0.8rem;
+  border-left: 2px solid var(--border);
 }
 
 .agent-status-float .status-indicator {

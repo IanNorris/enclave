@@ -387,6 +387,8 @@ class ControlServer:
                 await self._handle_models(req, writer)
             elif action == "credits":
                 await self._handle_credits(req, writer)
+            elif action == "complexity":
+                await self._handle_complexity(req, writer)
             elif action == "profiles":
                 await self._handle_profiles(writer)
             elif action == "panel_get":
@@ -602,6 +604,21 @@ class ControlServer:
         payload.update(credits)
         payload["session"] = session_credits or {}
         await self._write(writer, payload)
+
+    async def _handle_complexity(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Return recorded Auto Fusion complexity grades for the graph.
+
+        Pass ``session`` for one session's scores, or omit for global.
+        """
+        session_id = req.get("session", "")
+        try:
+            scores = self._router._cost.complexity_scores(
+                session_id or None, limit=int(req.get("limit", 500)),
+            )
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        await self._write(writer, {"ok": True, "type": "complexity", "scores": scores})
 
     async def _handle_profiles(self, writer: asyncio.StreamWriter) -> None:
         """Return the configured container profiles for project creation."""
