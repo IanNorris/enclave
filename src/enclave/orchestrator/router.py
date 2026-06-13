@@ -20,6 +20,7 @@ from enclave.common.config import UserMapping
 from enclave.common.cost_tracker import CostTracker
 from enclave.common.logging import get_logger
 from enclave.common import panel as panel_mod
+from enclave.common import fusion as fusion_mod
 from enclave.common.protocol import Message, MessageType
 from enclave.orchestrator.approval import ApprovalManager
 from enclave.orchestrator.commands import (
@@ -521,12 +522,17 @@ class MessageRouter:
             log.error("Failed to restore concierge: %s", e)
 
     def _seed_concierge_workspace(self, session: Session) -> None:
-        """Seed the concierge workspace with the panel definition."""
+        """Seed the concierge workspace with the panel + fusion definitions."""
         try:
             panel_doc = panel_mod.load_panel(self._data_dir)
             panel_mod.write_workspace_panel(session.workspace_path, panel_doc)
         except Exception as e:
             log.warning("Failed to seed concierge panel: %s", e)
+        try:
+            fusion_doc = fusion_mod.load_fusion(self._data_dir)
+            fusion_mod.write_workspace_fusion(session.workspace_path, fusion_doc)
+        except Exception as e:
+            log.warning("Failed to seed concierge fusion: %s", e)
 
     # ------------------------------------------------------------------
     # Periodic health monitoring
@@ -3088,6 +3094,13 @@ class MessageRouter:
             panel_mod.write_workspace_panel(session.workspace_path, panel_doc)
         except Exception as e:
             log.warning("[project:%s] Failed to seed panel: %s", project_name, e)
+
+        # Seed the Fusion presets (same rationale as the panel).
+        try:
+            fusion_doc = fusion_mod.load_fusion(self._data_dir)
+            fusion_mod.write_workspace_fusion(session.workspace_path, fusion_doc)
+        except Exception as e:
+            log.warning("[project:%s] Failed to seed fusion: %s", project_name, e)
 
         log.info("[project:%s] Starting container...", project_name)
         started, error = await self.containers.start_session(session.id)

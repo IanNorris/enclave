@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from enclave.agent.ipc_client import IPCClient
 from enclave.common import panel as _panel_mod
+from enclave.common import fusion as _fusion_mod
 from enclave.common.protocol import Message, MessageType
 
 if TYPE_CHECKING:
@@ -1287,6 +1288,116 @@ def _resolve_model(preferences: tuple[str, ...]) -> str:
         if candidate in _AVAILABLE_MODEL_IDS:
             return candidate
     return preferences[0]
+
+
+def _copilot_cli_bin() -> str:
+    """Resolve the bundled copilot CLI binary (for one-shot model calls)."""
+    try:
+        import copilot as _copilot_pkg
+        cli_dir = os.path.dirname(_copilot_pkg.__file__)
+        return os.path.join(cli_dir, "bin", "copilot")
+    except Exception:
+        return "copilot"
+
+
+async def _run_copilot_oneshot(
+    model: str, prompt: str, *, timeout: float = 180.0,
+) -> str:
+    """Run a single non-interactive `copilot -p` call with a specific model.
+
+    Shared by consult_panel and Fusion: spawns the bundled copilot CLI, returns
+    the cleaned stdout text (or a bracketed error/empty marker). Never raises.
+    """
+    cli_bin = _copilot_cli_bin()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli_bin, "-p", prompt,
+            "--model", model,
+            "--no-auto-update",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+        text = stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            return f"[No response. stderr: {err[:300]}]"
+        # Strip CLI decoration lines (status bullets, tool JSON echoes).
+        lines = text.split("\n")
+        cleaned = [
+            ln for ln in lines
+            if not ln.startswith("●") and not ln.strip().startswith("└ {")
+        ]
+        return "\n".join(cleaned).strip() or text
+    except asyncio.TimeoutError:
+        return f"[Timed out after {int(timeout)}s]"
+    except Exception as e:
+        return f"[Error: {e}]"
+
+
+async def _run_fusion(preset: dict, prompt: str) -> str:
+    """Run the Fusion pipeline for one preset and return a synthesized answer.
+
+    Stages: fan out the prompt to each participant model in parallel → judge
+    extracts structure → synthesizer writes the final answer. The returned text
+    leads with the synthesized answer and appends a foldable transparency trace
+    (each participant's take + the judge's analysis), keeping Fusion auditable.
+    """
+    participants: list[list[str]] = preset.get("participants") or []
+    judge_prefs = tuple(preset.get("judge") or ()) or _MODEL_PREFERENCES
+    synth_prefs = tuple(preset.get("synthesizer") or ()) or _MODEL_PREFERENCES
+
+    # Resolve each participant seat to an available model (de-dupe identical ids
+    # so we don't pay twice for the same model).
+    seats: list[str] = []
+    for prefs in participants:
+        model = _resolve_model(tuple(prefs)) if prefs else _resolve_model(_MODEL_PREFERENCES)
+        seats.append(model)
+    if not seats:
+        return "[Fusion error: preset has no participants]"
+
+    print(
+        "[agent] fusion[%s]: %d participants (%s)" % (
+            preset.get("id", "?"), len(seats), ", ".join(seats),
+        ),
+        file=sys.stderr,
+    )
+
+    # Stage 1 — fan out (parallel).
+    part_prompt = _fusion_mod.build_participant_prompt(prompt)
+    responses_raw = await asyncio.gather(*(
+        _run_copilot_oneshot(model, part_prompt) for model in seats
+    ))
+    responses = list(zip(seats, responses_raw))
+
+    # Stage 2 — judge.
+    judge_model = _resolve_model(judge_prefs)
+    judge_prompt = _fusion_mod.build_judge_prompt(prompt, responses)
+    print(f"[agent] fusion: judging with {judge_model}", file=sys.stderr)
+    judge_analysis = await _run_copilot_oneshot(judge_model, judge_prompt, timeout=240.0)
+
+    # Stage 3 — synthesize.
+    synth_model = _resolve_model(synth_prefs)
+    synth_prompt = _fusion_mod.build_synthesizer_prompt(prompt, judge_analysis, responses)
+    print(f"[agent] fusion: synthesizing with {synth_model}", file=sys.stderr)
+    final = await _run_copilot_oneshot(synth_model, synth_prompt, timeout=240.0)
+
+    # Assemble: synthesized answer + foldable transparency trace.
+    trace_parts = [
+        f"### {label}\n\n{text}" for label, text in responses
+    ]
+    trace = "\n\n".join(trace_parts)
+    return (
+        f"{final}\n\n"
+        "<details>\n<summary>Fusion trace "
+        f"(preset: {preset.get('name', preset.get('id', 'fusion'))}, "
+        f"judge: {judge_model}, synthesizer: {synth_model})</summary>\n\n"
+        f"#### Judge analysis\n\n{judge_analysis}\n\n"
+        f"#### Participant responses\n\n{trace}\n</details>"
+    )
 
 
 async def _configure_model(
@@ -4572,13 +4683,6 @@ async def try_init_copilot(
                 )
 
             # Launch every enabled panelist in parallel via copilot -p subprocesses.
-            try:
-                import copilot as _copilot_pkg
-                cli_dir = os.path.dirname(_copilot_pkg.__file__)
-                cli_bin = os.path.join(cli_dir, "bin", "copilot")
-            except Exception:
-                cli_bin = "copilot"
-
             panelists = []
             for member in members:
                 prefs = tuple(member.get("models") or ())
@@ -4590,33 +4694,7 @@ async def try_init_copilot(
                 name: str, model: str, prompt: str,
             ) -> tuple[str, str]:
                 """Run a single panelist and return (name, response)."""
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        cli_bin, "-p", prompt,
-                        "--model", model,
-                        "--no-auto-update",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env={**os.environ, "NO_COLOR": "1"},
-                    )
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=180.0,
-                    )
-                    text = stdout.decode("utf-8", errors="replace").strip()
-                    if not text:
-                        err = stderr.decode("utf-8", errors="replace").strip()
-                        return (name, f"[No response. stderr: {err[:300]}]")
-                    # Strip CLI decoration lines
-                    lines = text.split("\n")
-                    cleaned = [
-                        ln for ln in lines
-                        if not ln.startswith("●") and not ln.strip().startswith("└ {")
-                    ]
-                    return (name, "\n".join(cleaned).strip() or text)
-                except asyncio.TimeoutError:
-                    return (name, "[Timed out after 180s]")
-                except Exception as e:
-                    return (name, f"[Error: {e}]")
+                return (name, await _run_copilot_oneshot(model, prompt))
 
             print(
                 "[agent] consult_panel: launching %d panelists (%s)" % (
@@ -4690,6 +4768,96 @@ async def try_init_copilot(
             },
         )
         custom_tools.append(consult_panel_tool)
+
+        # ── Custom tool: fusion — transparent compound model ──
+        # Fan a prompt out to a panel of DIVERSE models in parallel, have a
+        # judge extract the structure of their responses, then a synthesizer
+        # write the final grounded answer. Unlike consult_panel (archetype
+        # personas; caller synthesizes), fusion uses model diversity and
+        # synthesizes for you — the "transparent consult_panel".
+        async def _fusion_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            prompt = (args.get("prompt") or "").strip()
+            preset_id = (args.get("preset") or "").strip()
+            if not prompt:
+                return ToolResult(
+                    text_result_for_llm="Error: provide a 'prompt' to fuse.",
+                    result_type="error",
+                )
+
+            fusion_doc = _fusion_mod.load_workspace_fusion(working_directory)
+            presets = _fusion_mod.enabled_presets(fusion_doc)
+            if not presets:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: no Fusion presets are enabled. Configure at "
+                        "least one preset (participants + judge + synthesizer)."
+                    ),
+                    result_type="error",
+                )
+            preset = (
+                _fusion_mod.get_preset(fusion_doc, preset_id)
+                if preset_id else presets[0]
+            )
+            if preset is None:
+                avail = ", ".join(p["id"] for p in presets)
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Error: unknown Fusion preset '{preset_id}'. "
+                        f"Available: {avail}."
+                    ),
+                    result_type="error",
+                )
+
+            try:
+                result = await _run_fusion(preset, prompt)
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"Fusion failed: {e}",
+                    result_type="error",
+                )
+            return ToolResult(text_result_for_llm=result)
+
+        fusion_tool = Tool(
+            name="fusion",
+            description=(
+                "Fusion — a transparent compound model. Fans your prompt out to "
+                "a panel of DIVERSE models in parallel, a judge extracts the "
+                "structure of their answers (consensus, contradictions, blind "
+                "spots), and a synthesizer writes the single best final answer. "
+                "Use for hard one-shot questions where model diversity helps: "
+                "complex planning, tricky design/algorithm decisions, research "
+                "questions, or high-risk calls. (consult_panel is the archetype "
+                "variant where YOU synthesize; fusion synthesizes for you.) "
+                "Pick a preset by cost/quality: 'frontier', 'balanced', or "
+                "'budget' (default: the first enabled preset)."
+            ),
+            handler=_fusion_handler,
+            skip_permission=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The full question/task to fuse. Include all "
+                            "relevant context and constraints — each model "
+                            "answers this independently."
+                        ),
+                    },
+                    "preset": {
+                        "type": "string",
+                        "description": (
+                            "Which fusion preset to use (e.g. 'frontier', "
+                            "'balanced', 'budget'). Omit for the default."
+                        ),
+                    },
+                },
+                "required": ["prompt"],
+            },
+        )
+        custom_tools.append(fusion_tool)
+
 
         # ── Custom tool: web_search ──
         async def _web_search_handler(invocation: object) -> ToolResult:
