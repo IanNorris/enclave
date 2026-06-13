@@ -417,6 +417,22 @@ class MessageRouter:
                 socket_path = await self.ipc.create_socket(session.id)
                 session.socket_path = str(socket_path)
 
+                # Re-seed the panel + fusion definitions so restored sessions
+                # pick up the current host config (custom presets/models) on
+                # resume, matching fresh-start behaviour.
+                try:
+                    panel_mod.write_workspace_panel(
+                        session.workspace_path, panel_mod.load_panel(self._data_dir),
+                    )
+                except Exception as e:
+                    log.warning("Failed to re-seed panel for %s: %s", session.id, e)
+                try:
+                    fusion_mod.write_workspace_fusion(
+                        session.workspace_path, fusion_mod.load_fusion(self._data_dir),
+                    )
+                except Exception as e:
+                    log.warning("Failed to re-seed fusion for %s: %s", session.id, e)
+
                 # Start the container
                 started, error = await self.containers.start_session(session.id)
                 if started:
