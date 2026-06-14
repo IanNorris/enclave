@@ -1300,6 +1300,12 @@ _NO_REASONING_EFFORT_MODELS: frozenset[str] = frozenset()
 # Populated at startup by _configure_model(); shared with consult_panel.
 _AVAILABLE_MODEL_IDS: set[str] = set()
 
+# model id → list of supported reasoning-effort levels, from each model's
+# capabilities.supports.reasoning_effort (the authoritative per-model list; the
+# flat supportedReasoningEfforts field is understated for some models). Used to
+# clamp a requested effort down to what a model actually allows.
+_MODEL_REASONING_EFFORTS: dict[str, list[str]] = {}
+
 
 def _resolve_model(preferences: tuple[str, ...]) -> str:
     """Pick the first model from preferences that's actually available.
@@ -1329,6 +1335,7 @@ def _copilot_cli_bin() -> str:
 
 async def _run_oneshot_warm(
     client: object, model: str, prompt: str, *, timeout: float = 180.0,
+    reasoning_effort: str = "",
 ) -> str:
     """Run a single prompt against a warm CopilotClient via a throwaway session.
 
@@ -1339,6 +1346,10 @@ async def _run_oneshot_warm(
     the cold-start cost and the nested-subprocess fragility of spawning
     ``copilot -p`` from inside a live tool handler. Never raises; returns a
     bracketed marker on failure so callers can degrade gracefully.
+
+    When *reasoning_effort* is set, it's clamped to the model's supported levels
+    and applied via set_model after creation; rejection falls back to the
+    model's default effort rather than failing the call.
     """
     from copilot.generated.session_events import AssistantMessageData
 
@@ -1353,6 +1364,19 @@ async def _run_oneshot_warm(
             available_tools=[],
         )
         sid = getattr(session, "session_id", None)
+        effort = _fusion_mod.clamp_effort(
+            reasoning_effort, _MODEL_REASONING_EFFORTS.get(model),
+        )
+        if effort:
+            try:
+                await session.set_model(model, reasoning_effort=effort)
+            except Exception as e:
+                # Model rejected the effort despite the catalog — run at default.
+                print(
+                    f"[agent] _run_oneshot_warm: {model} rejected effort "
+                    f"'{effort}' ({e}); using default",
+                    file=sys.stderr,
+                )
         resp = await session.send_and_wait(prompt, timeout=timeout)
         if resp is not None and isinstance(resp.data, AssistantMessageData):
             return (resp.data.content or "").strip()
@@ -1375,6 +1399,7 @@ async def _run_oneshot_warm(
 
 async def _run_copilot_oneshot(
     model: str, prompt: str, *, timeout: float = 180.0, client: object | None = None,
+    reasoning_effort: str = "",
 ) -> str:
     """Run a single non-interactive model call with a specific model.
 
@@ -1385,7 +1410,9 @@ async def _run_copilot_oneshot(
     error/empty marker). Never raises.
     """
     if client is not None:
-        return await _run_oneshot_warm(client, model, prompt, timeout=timeout)
+        return await _run_oneshot_warm(
+            client, model, prompt, timeout=timeout, reasoning_effort=reasoning_effort,
+        )
     cli_bin = _copilot_cli_bin()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1432,6 +1459,7 @@ async def _run_fusion(preset: dict, prompt: str, *, client: object | None = None
     participants: list[list[str]] = preset.get("participants") or []
     judge_prefs = tuple(preset.get("judge") or ()) or _MODEL_PREFERENCES
     synth_prefs = tuple(preset.get("synthesizer") or ()) or _MODEL_PREFERENCES
+    effort = str(preset.get("reasoning_effort") or "")
 
     seats: list[str] = []
     for prefs in participants:
@@ -1441,8 +1469,8 @@ async def _run_fusion(preset: dict, prompt: str, *, client: object | None = None
         return {"error": "preset has no participants"}
 
     print(
-        "[agent] fusion[%s]: %d participants (%s)" % (
-            preset.get("id", "?"), len(seats), ", ".join(seats),
+        "[agent] fusion[%s]: %d participants (%s) effort=%s" % (
+            preset.get("id", "?"), len(seats), ", ".join(seats), effort or "default",
         ),
         file=sys.stderr,
     )
@@ -1450,7 +1478,8 @@ async def _run_fusion(preset: dict, prompt: str, *, client: object | None = None
     # Stage 1 — fan out (parallel).
     part_prompt = _fusion_mod.build_participant_prompt(prompt)
     responses_raw = await asyncio.gather(*(
-        _run_copilot_oneshot(model, part_prompt, client=client) for model in seats
+        _run_copilot_oneshot(model, part_prompt, client=client, reasoning_effort=effort)
+        for model in seats
     ))
     responses = list(zip(seats, responses_raw))
 
@@ -1458,13 +1487,17 @@ async def _run_fusion(preset: dict, prompt: str, *, client: object | None = None
     judge_model = _resolve_model(judge_prefs)
     judge_prompt = _fusion_mod.build_judge_prompt(prompt, responses)
     print(f"[agent] fusion: judging with {judge_model}", file=sys.stderr)
-    judge_analysis = await _run_copilot_oneshot(judge_model, judge_prompt, timeout=240.0, client=client)
+    judge_analysis = await _run_copilot_oneshot(
+        judge_model, judge_prompt, timeout=240.0, client=client, reasoning_effort=effort,
+    )
 
     # Stage 3 — synthesize.
     synth_model = _resolve_model(synth_prefs)
     synth_prompt = _fusion_mod.build_synthesizer_prompt(prompt, judge_analysis, responses)
     print(f"[agent] fusion: synthesizing with {synth_model}", file=sys.stderr)
-    final = await _run_copilot_oneshot(synth_model, synth_prompt, timeout=240.0, client=client)
+    final = await _run_copilot_oneshot(
+        synth_model, synth_prompt, timeout=240.0, client=client, reasoning_effort=effort,
+    )
 
     return {
         "preset_id": preset.get("id", ""),
@@ -1514,15 +1547,23 @@ async def _configure_model(
     global _AVAILABLE_MODEL_IDS
     # Try to discover available models via the client.
     target = _MODEL_PREFERENCES[0]
+    global _MODEL_REASONING_EFFORTS
     try:
         if client is not None:
             try:
                 models = await client.list_models()
                 _AVAILABLE_MODEL_IDS = {m.id for m in models}
+                _MODEL_REASONING_EFFORTS = {
+                    m.id: list(
+                        getattr(getattr(m.capabilities, "supports", None), "reasoning_effort", None)
+                        or []
+                    )
+                    for m in models
+                }
             except Exception as e:
                 # Newer CLI releases may return models with null `supports`/`limits`
                 # fields that trip the SDK's pydantic parser. Fall back to a raw
-                # JSON-RPC call and extract just the ids we need.
+                # JSON-RPC call and extract the ids + per-model effort lists.
                 print(
                     f"[agent] list_models parse failed ({e}); trying raw RPC",
                     file=sys.stderr,
@@ -1530,6 +1571,13 @@ async def _configure_model(
                 raw = await client._client.request("models.list", {})
                 _AVAILABLE_MODEL_IDS = {
                     m.get("id") for m in raw.get("models", []) if m.get("id")
+                }
+                _MODEL_REASONING_EFFORTS = {
+                    m["id"]: list(
+                        ((m.get("capabilities") or {}).get("supports") or {})
+                        .get("reasoning_effort") or []
+                    )
+                    for m in raw.get("models", []) if m.get("id")
                 }
             chosen = next(
                 (m for m in _MODEL_PREFERENCES if m in _AVAILABLE_MODEL_IDS),
@@ -5031,6 +5079,7 @@ async def try_init_copilot(
             raw = await _run_copilot_oneshot(
                 grader_model, grade_prompt, timeout=90.0,
                 client=(agent_state.sdk_client if agent_state else None),
+                reasoning_effort=str(fusion_doc.get("base_reasoning_effort") or ""),
             )
             graded = _fusion_mod.parse_complexity(raw, threshold=threshold)
             score = graded["score"]

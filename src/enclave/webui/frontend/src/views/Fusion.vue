@@ -42,6 +42,12 @@
             />
           </div>
           <div class="routing-field">
+            <label class="field-label">Base reasoning effort</label>
+            <select v-model="baseEffort" class="models-input">
+              <option v-for="e in EFFORTS" :key="e.v" :value="e.v">{{ e.label }}</option>
+            </select>
+          </div>
+          <div class="routing-field">
             <label class="field-label">Escalation threshold: <strong>{{ autoThreshold }}/5</strong></label>
             <input type="range" min="1" max="5" step="1" v-model.number="autoThreshold" class="slider" />
             <div class="threshold-scale">
@@ -112,7 +118,14 @@
         <input v-model="p.judgeText" class="models-input" list="known-models" placeholder="gpt-5.5, claude-opus-4.8" />
 
         <label class="field-label">Synthesizer (priority order)</label>
-        <input v-model="p.synthText" class="models-input" list="known-models" placeholder="claude-opus-4.8-max" />
+        <input v-model="p.synthText" class="models-input" list="known-models" placeholder="claude-opus-4.8" />
+
+        <label class="field-label">
+          Reasoning effort — clamped per-model to each model's ceiling
+        </label>
+        <select v-model="p.reasoning_effort" class="models-input">
+          <option v-for="e in EFFORTS" :key="e.v" :value="e.v">{{ e.label }}</option>
+        </select>
       </div>
 
       <datalist id="known-models">
@@ -130,6 +143,7 @@ import { api } from '../api.js'
 
 const presets = ref([])
 const baseModel = ref('')
+const baseEffort = ref('')
 const autoThreshold = ref(4)
 const knownModels = ref([])
 const loading = ref(true)
@@ -137,6 +151,17 @@ const saving = ref(false)
 const message = ref('')
 const isError = ref(false)
 let keyCounter = 0
+
+// Reasoning-effort options. "" = let each model use its default; otherwise the
+// agent clamps the request down to each model's supported ceiling.
+const EFFORTS = [
+  { v: '', label: 'Default (per model)' },
+  { v: 'low', label: 'Low' },
+  { v: 'medium', label: 'Medium' },
+  { v: 'high', label: 'High' },
+  { v: 'xhigh', label: 'X-High' },
+  { v: 'max', label: 'Max' },
+]
 
 const complexityScores = ref([])
 const graphScope = ref('')
@@ -159,6 +184,7 @@ function toEditable(p) {
     participants: (p.participants || []).map((grp) => ({ text: listToText(grp) })),
     judgeText: listToText(p.judge),
     synthText: listToText(p.synthesizer),
+    reasoning_effort: p.reasoning_effort || '',
   }
 }
 
@@ -171,6 +197,7 @@ function fromEditable(p) {
     participants: p.participants.map((part) => textToList(part.text)).filter((g) => g.length),
     judge: textToList(p.judgeText),
     synthesizer: textToList(p.synthText),
+    reasoning_effort: p.reasoning_effort || '',
   }
 }
 
@@ -181,6 +208,7 @@ async function load() {
     const data = await api.getFusion()
     presets.value = (data.presets || []).map(toEditable)
     baseModel.value = data.base_model || ''
+    baseEffort.value = data.base_reasoning_effort || ''
     autoThreshold.value = data.auto_threshold || 4
   } catch (e) {
     isError.value = true
@@ -244,11 +272,13 @@ async function save() {
     const doc = {
       presets: presets.value.map(fromEditable),
       base_model: baseModel.value.trim(),
+      base_reasoning_effort: baseEffort.value,
       auto_threshold: autoThreshold.value,
     }
     const data = await api.updateFusion(doc)
     presets.value = (data.fusion?.presets || []).map(toEditable)
     baseModel.value = data.fusion?.base_model || ''
+    baseEffort.value = data.fusion?.base_reasoning_effort || ''
     autoThreshold.value = data.fusion?.auto_threshold || 4
     const pushed = data.pushed || 0
     message.value = `Saved. Applied to ${pushed} active session${pushed === 1 ? '' : 's'}.`

@@ -30,6 +30,45 @@ FUSION_VERSION = 1
 #: reads at fusion time.
 WORKSPACE_FUSION_FILE = ".enclave-fusion.json"
 
+#: Reasoning-effort levels, lowest → highest. Used to clamp a requested effort
+#: down to the highest level a given model actually supports. "" / "none" mean
+#: "no explicit effort" (let the model use its default).
+REASONING_LADDER: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+
+
+def clamp_effort(desired: str, supported: list[str] | None) -> str:
+    """Return the highest supported effort not exceeding *desired*.
+
+    The model catalog's per-model ``capabilities.supports.reasoning_effort``
+    list is authoritative (the flat ``supportedReasoningEfforts`` field is
+    understated for some models). Given the preset's requested level and a
+    model's supported list, pick the strongest level that model allows without
+    exceeding the request. Returns "" when there's nothing to apply (no request,
+    unknown support, or only "none"), meaning "don't set an explicit effort".
+    """
+    if not desired or desired == "none":
+        return ""
+    if not supported:
+        # Unknown support — return the request as-is and let the caller apply it
+        # with graceful fallback (set_model retries without effort on rejection).
+        return desired
+    try:
+        want_rank = REASONING_LADDER.index(desired)
+    except ValueError:
+        want_rank = len(REASONING_LADDER) - 1  # treat unknown as "max"
+    best = ""
+    best_rank = -1
+    for lvl in supported:
+        if lvl in ("none", ""):
+            continue
+        try:
+            rank = REASONING_LADDER.index(lvl)
+        except ValueError:
+            continue
+        if rank <= want_rank and rank > best_rank:
+            best, best_rank = lvl, rank
+    return best
+
 
 # Built-in fusion presets. Each preset's ``participants``/``judge``/
 # ``synthesizer`` are ordered preference lists — the first id actually available
@@ -39,14 +78,19 @@ DEFAULT_FUSION: list[dict[str, Any]] = [
     {
         "id": "frontier",
         "name": "Frontier",
-        "description": "Beyond-frontier: top models at max reasoning, judged and synthesized. Used for complexity 4-5.",
+        "description": "Top models at high reasoning, judged and synthesized. Used for complexity 4-5.",
         "participants": [
-            ["claude-opus-4.8-max", "claude-opus-4.8-xhigh", "claude-opus-4.8", "claude-opus-4.6"],
-            ["gpt-5.5-xhigh", "gpt-5.5", "gpt-5.4"],
-            ["claude-opus-4.7-xhigh", "claude-opus-4.7", "claude-sonnet-4.6"],
+            ["claude-opus-4.8"],
+            ["gpt-5.5"],
+            ["gemini-3.1-pro-preview"],
         ],
-        "judge": ["claude-opus-4.8-max", "claude-opus-4.8-xhigh", "claude-opus-4.8", "gpt-5.5"],
-        "synthesizer": ["claude-opus-4.8-max", "claude-opus-4.8-xhigh", "claude-opus-4.8", "gpt-5.5"],
+        "judge": ["claude-opus-4.8", "gpt-5.5"],
+        "synthesizer": ["claude-opus-4.8", "gpt-5.5"],
+        # Reasoning effort requested for every model in this preset. Clamped
+        # per-model to the highest level that model actually supports (see
+        # clamp_effort): opus-4.8 honours "max", gpt-5.5 caps at "xhigh",
+        # gemini-3.1-pro caps at "high" — each runs at its own ceiling.
+        "reasoning_effort": "max",
         "enabled": True,
     },
     {
@@ -60,6 +104,7 @@ DEFAULT_FUSION: list[dict[str, Any]] = [
         ],
         "judge": ["claude-opus-4.6", "gpt-5.4"],
         "synthesizer": ["claude-opus-4.6", "gpt-5.4"],
+        "reasoning_effort": "medium",
         "enabled": True,
     },
     {
@@ -73,6 +118,7 @@ DEFAULT_FUSION: list[dict[str, Any]] = [
         ],
         "judge": ["claude-sonnet-4.6", "gpt-5.4-mini"],
         "synthesizer": ["claude-sonnet-4.6", "gpt-5.4-mini"],
+        "reasoning_effort": "",
         "enabled": True,
     },
 ]
@@ -142,16 +188,25 @@ def normalize_preset(raw: dict[str, Any], *, index: int = 0) -> dict[str, Any]:
         "participants": _coerce_participants(raw.get("participants")),
         "judge": _coerce_models(raw.get("judge")),
         "synthesizer": _coerce_models(raw.get("synthesizer")),
+        "reasoning_effort": _coerce_effort(raw.get("reasoning_effort")),
         "enabled": bool(raw.get("enabled", True)),
     }
 
 
+def _coerce_effort(value: Any) -> str:
+    """Normalize a reasoning-effort value to a known ladder level or ""."""
+    s = str(value or "").strip().lower()
+    return s if s in REASONING_LADDER else ""
+
+
 def normalize_fusion(data: Any) -> dict[str, Any]:
     """Coerce arbitrary input into a well-formed fusion document."""
+    base_effort = ""
     if isinstance(data, dict):
         presets = data.get("presets", [])
         base_model = data.get("base_model", "")
         auto_threshold = data.get("auto_threshold", 4)
+        base_effort = _coerce_effort(data.get("base_reasoning_effort"))
     elif isinstance(data, list):
         presets, base_model, auto_threshold = data, "", 4
     else:
@@ -186,6 +241,9 @@ def normalize_fusion(data: Any) -> dict[str, Any]:
         # The cheap base model for Auto Fusion (escalates to a preset past the
         # complexity threshold). Empty = use the session's configured model.
         "base_model": str(base_model or "").strip(),
+        # Reasoning effort for the base model (grading + routine work). Empty =
+        # no explicit effort. Clamped per-model like preset efforts.
+        "base_reasoning_effort": base_effort,
         "auto_threshold": threshold,
     }
 
@@ -196,6 +254,7 @@ def default_fusion() -> dict[str, Any]:
         "version": FUSION_VERSION,
         "presets": DEFAULT_FUSION,
         "base_model": "claude-sonnet-4.6",
+        "base_reasoning_effort": "",
         "auto_threshold": 4,
     })
 

@@ -60,12 +60,14 @@ class FusionPreset(BaseModel):
     participants: list[list[str]] = []
     judge: list[str] = []
     synthesizer: list[str] = []
+    reasoning_effort: str = ""
     enabled: bool = True
 
 
 class FusionUpdate(BaseModel):
     presets: list[FusionPreset]
     base_model: str = ""
+    base_reasoning_effort: str = ""
     auto_threshold: int = 4
 
 
@@ -84,6 +86,7 @@ async def update_fusion(request: Request, body: FusionUpdate):
     doc = {
         "presets": [p.model_dump() for p in body.presets],
         "base_model": body.base_model,
+        "base_reasoning_effort": body.base_reasoning_effort,
         "auto_threshold": body.auto_threshold,
     }
     resp = await _control_request(request, {"action": "fusion_set", "fusion": doc})
