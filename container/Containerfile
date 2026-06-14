@@ -103,6 +103,23 @@ RUN pip install --no-cache-dir "graphifyy[mcp]"
 # `curl | tar` step keyed on a pinned version.
 COPY container/mimir-bin/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/mimir-* 2>/dev/null || true
+# The Mimir binaries are built on the NixOS host, so their ELF interpreter and
+# RUNPATH point at /nix/store paths that don't exist in this Debian image —
+# executing them otherwise fails with a misleading "No such file or directory".
+# Repoint any Nix interpreter to the standard loader (container glibc is newer
+# than the binaries' requirement, so this is ABI-safe). patchelf is installed
+# only for this step and removed after to keep the layer small.
+RUN if ls /usr/local/bin/mimir-* >/dev/null 2>&1; then \
+        apt-get update && apt-get install -y --no-install-recommends patchelf && \
+        for b in /usr/local/bin/mimir-cli /usr/local/bin/mimir-librarian /usr/local/bin/mimir-mcp; do \
+            [ -f "$b" ] || continue; \
+            case "$(patchelf --print-interpreter "$b" 2>/dev/null)" in \
+                /nix/*) patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
+                                 --set-rpath /lib/x86_64-linux-gnu "$b" ;; \
+            esac; \
+        done && \
+        apt-get purge -y patchelf && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # github-copilot-sdk 0.3.0 ships a bundled `copilot` binary (CLI 1.0.36-0) that
 # already exposes the current model set (incl. claude-opus-4.8) AND speaks the

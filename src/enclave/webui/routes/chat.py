@@ -356,6 +356,37 @@ async def get_credits(request: Request, session: str = ""):
     return empty
 
 
+@router.get("/complexity")
+async def get_complexity(request: Request, session: str = "", limit: int = 500):
+    """Return recorded Auto Fusion complexity grades (for the graph).
+
+    Pass ``session`` for one session's scores, or omit for global. Served from
+    the orchestrator's control socket, which reads the persisted cost tracker.
+    """
+    data_dir = Path(request.app.state.config.data_dir)
+    sock_path = data_dir / "control.sock"
+    if not sock_path.exists():
+        return {"scores": []}
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        req = {"action": "complexity", "limit": limit}
+        if session:
+            req["session"] = session
+        writer.write(json.dumps(req).encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        writer.close()
+        await writer.wait_closed()
+        if line:
+            resp = json.loads(line.decode())
+            if resp.get("ok"):
+                return {"scores": resp.get("scores", [])}
+    except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        import logging
+        logging.getLogger("enclave.webui").warning("Complexity query failed: %s", e)
+    return {"scores": []}
+
+
 @router.get("/{session_id}/history")
 async def get_history(request: Request, session_id: str, limit: int = 100, offset: int = 0):
     """Get conversation history for a session.
@@ -597,13 +628,35 @@ async def get_models(request: Request, session_id: str, refresh: bool = False):
     Reads from the cached .enclave-models.json file by default.
     Pass ?refresh=true to query live from the agent's Copilot SDK
     (updates the cache file as a side effect).
+
+    Fusion/Auto-Fusion pseudo-models are prepended so they are pickable from
+    the same list; the active fusion mode (if any) overrides ``current``.
     """
     ws_base = Path(request.app.state.config.container.workspace_base) / session_id
     models_path = ws_base / ".enclave-models.json"
+    data_dir = Path(request.app.state.config.data_dir)
+
+    def _augment(result: dict) -> dict:
+        """Prepend fusion pseudo-models and reflect the active fusion mode."""
+        try:
+            from enclave.common import fusion as _fusion
+            fusion_cfg = _fusion.load_fusion(data_dir)
+            pseudo = _fusion.fusion_model_ids(fusion_cfg)
+            available = list(result.get("available") or [])
+            # Keep real models, prepend fusion ids (avoid dupes)
+            available = pseudo + [m for m in available if m not in pseudo]
+            result["available"] = available
+            result["fusion_models"] = pseudo
+            mode = _fusion.read_fusion_mode(ws_base)
+            if mode:
+                result["current"] = mode
+            result["fusion_mode"] = mode
+        except Exception:
+            pass
+        return result
 
     if refresh:
         # Query live via control socket
-        data_dir = Path(request.app.state.config.data_dir)
         sock_path = data_dir / "control.sock"
         if sock_path.exists():
             try:
@@ -617,28 +670,51 @@ async def get_models(request: Request, session_id: str, refresh: bool = False):
                 if line:
                     resp = json.loads(line.decode())
                     if resp.get("ok"):
-                        return {
+                        return _augment({
                             "current": resp.get("current"),
                             "available": resp.get("available", []),
                             "preferences": [],
-                        }
+                        })
             except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as e:
                 import logging
                 logging.getLogger("enclave.webui").warning("Models refresh failed: %s", e)
 
     # Fall back to cached file
     if not models_path.exists():
-        return {"current": None, "available": [], "preferences": []}
+        return _augment({"current": None, "available": [], "preferences": []})
     try:
         data = json.loads(models_path.read_text())
-        return data
+        return _augment(data)
     except Exception:
-        return {"current": None, "available": [], "preferences": []}
+        return _augment({"current": None, "available": [], "preferences": []})
 
 
 @router.post("/{session_id}/model")
 async def set_model(request: Request, session_id: str, body: SendMessage):
-    """Request a model change by sending a /model command to the agent."""
+    """Request a model change by sending a /model command to the agent.
+
+    Fusion/Auto-Fusion picks are not real SDK models: they set a per-session
+    fusion mode (consumed by the agent per-turn) and leave the underlying base
+    model untouched. Picking a real model clears any active fusion mode.
+    """
+    ws_base = Path(request.app.state.config.container.workspace_base) / session_id
+    from enclave.common import fusion as _fusion
+
+    if _fusion.is_fusion_model(body.content):
+        # Persist the fusion mode; do NOT touch the SDK model.
+        try:
+            ws_base.mkdir(parents=True, exist_ok=True)
+            _fusion.write_fusion_mode(ws_base, body.content)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to set fusion mode: {e}")
+        return {"sent": True, "model": body.content, "fusion_mode": body.content}
+
+    # Real model pick: clear any fusion mode, then change the SDK model.
+    try:
+        _fusion.write_fusion_mode(ws_base, "")
+    except Exception:
+        pass
+
     room_id = _get_room_id(request, session_id)
     if not room_id:
         raise HTTPException(status_code=404, detail="Session room not found")
@@ -647,7 +723,6 @@ async def set_model(request: Request, session_id: str, body: SendMessage):
     event_id = await _send_matrix_message(config, room_id, f"/model {body.content}")
 
     # Update the current model in the models file
-    ws_base = Path(request.app.state.config.container.workspace_base) / session_id
     models_path = ws_base / ".enclave-models.json"
     try:
         if models_path.exists():

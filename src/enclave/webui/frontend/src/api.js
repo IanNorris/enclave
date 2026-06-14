@@ -149,6 +149,15 @@ export const api = {
   }),
   getPanelModels: () => request('/panel/models'),
 
+  // Fusion configuration (compound-model presets + Auto Fusion routing)
+  getFusion: () => request('/fusion'),
+  updateFusion: (doc) => request('/fusion', {
+    method: 'PUT',
+    body: JSON.stringify(doc),
+  }),
+  getFusionModels: () => request('/fusion/models'),
+  getComplexityHistory: (session) => request(`/chat/complexity${session ? `?session=${encodeURIComponent(session)}` : ''}`),
+
   // Scheduling
   getSchedules: () => request('/schedules'),
   createSchedule: (payload) => request('/schedules', {

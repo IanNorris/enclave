@@ -39,6 +39,11 @@ const routes = [
     component: () => import('./views/Panel.vue'),
   },
   {
+    path: '/fusion',
+    name: 'fusion',
+    component: () => import('./views/Fusion.vue'),
+  },
+  {
     path: '/schedules',
     name: 'schedules',
     component: () => import('./views/Schedules.vue'),

@@ -26,12 +26,27 @@
       </div>
     </div>
 
-    <!-- Right: AI credits + model picker -->
+    <!-- Right: AI credits + complexity + current models + model picker -->
     <div class="tabbar-right">
       <span v-if="creditsLabel" class="ai-credits" :title="creditsTitle">{{ creditsLabel }}</span>
+      <ComplexityBadge
+        v-if="liveComplexity && liveComplexity.score"
+        :score="liveComplexity.score"
+        :tier="liveComplexity.tier"
+        :reason="liveComplexity.reason"
+      />
+      <span v-if="liveModels" class="live-models" :title="'Models in use: ' + liveModels">
+        <span class="live-models-icon">⚡</span>{{ liveModels }}
+      </span>
       <div class="model-picker" v-if="models.available.length">
-        <select v-model="currentModel" @change="changeModel(selectedSessionId)" class="model-select">
-          <option v-for="m in models.available" :key="m" :value="m">{{ m }}</option>
+        <select v-model="currentModel" @change="changeModel(selectedSessionId)" class="model-select"
+                :class="{ 'is-fusion': isFusionSelected }">
+          <optgroup v-if="fusionOptions.length" label="✦ Fusion">
+            <option v-for="m in fusionOptions" :key="m" :value="m">{{ fusionLabel(m) }}</option>
+          </optgroup>
+          <optgroup v-if="realModelOptions.length" label="Models">
+            <option v-for="m in realModelOptions" :key="m" :value="m">{{ m }}</option>
+          </optgroup>
         </select>
         <button
           class="model-refresh"
@@ -49,6 +64,8 @@ import { computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '../stores/session.js'
 import { useModels } from '../composables/useModels.js'
+import { useFusion } from '../composables/useFusion.js'
+import ComplexityBadge from './ComplexityBadge.vue'
 
 defineEmits(['toggle-sidebar'])
 
@@ -60,6 +77,23 @@ const {
   creditsLabel, creditsTitle,
   loadModels, loadCredits, refreshModels, changeModel,
 } = useModels()
+const { liveComplexity, liveModels } = useFusion()
+
+// Fusion pseudo-models are surfaced by the backend in `fusion_models`; split
+// them from real models so the picker can group them under a "Fusion" header.
+const fusionSet = computed(() => new Set(models.value.fusion_models || []))
+const fusionOptions = computed(() => (models.value.available || []).filter(m => fusionSet.value.has(m)))
+const realModelOptions = computed(() => (models.value.available || []).filter(m => !fusionSet.value.has(m)))
+const isFusionSelected = computed(() => fusionSet.value.has(currentModel.value))
+
+function fusionLabel(id) {
+  if (id === 'auto-fusion') return 'Auto Fusion (grade + escalate)'
+  if (id.startsWith('fusion:')) {
+    const p = id.slice('fusion:'.length)
+    return `Fusion: ${p.charAt(0).toUpperCase()}${p.slice(1)}`
+  }
+  return id
+}
 
 const tabs = [
   { key: 'chat', label: 'Chat', icon: '💬', to: '/chat', names: ['chat'] },
@@ -170,6 +204,19 @@ watch(selectedSessionId, (id) => {
   text-overflow: ellipsis;
 }
 
+.live-models {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: 220px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.live-models-icon { color: var(--accent); }
+
 .model-picker {
   display: flex;
   align-items: center;
@@ -185,6 +232,12 @@ watch(selectedSessionId, (id) => {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm, 4px);
   max-width: 220px;
+}
+
+.model-select.is-fusion {
+  border-color: var(--accent, #7c5cff);
+  box-shadow: 0 0 0 1px var(--accent, #7c5cff);
+  font-weight: 600;
 }
 
 .model-refresh {
@@ -239,6 +292,9 @@ watch(selectedSessionId, (id) => {
     display: inline;
     font-size: 0.7rem;
     max-width: 8rem;
+  }
+  .live-models {
+    display: none;
   }
   .model-select {
     max-width: 110px;

@@ -231,6 +231,7 @@ const settingsItems = computed(() => [
   { to: '/sessions', icon: '🗂️', label: 'Sessions' },
   { to: '/memories', icon: '🧠', label: 'Memories' },
   { to: '/panel', icon: '🎛️', label: 'Panel' },
+  { to: '/fusion', icon: '✦', label: 'Fusion' },
   { to: '/schedules', icon: '⏰', label: 'Schedules' },
   { to: '/asks', icon: '❓', label: 'Asks', badge: pendingAsks.value || 0 },
 ])

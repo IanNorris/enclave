@@ -143,7 +143,7 @@ def get_event_store(workspace_base: Path, session_id: str) -> EventStore:
 # Excludes streaming deltas, thinking tokens, activity, ping/turn markers.
 PERSIST_TYPES = frozenset({
     "tool_start", "tool_complete", "response", "file_send", "ask_user",
-    "user_message", "structured_response",
+    "user_message", "structured_response", "fusion", "complexity",
 })
 
 
