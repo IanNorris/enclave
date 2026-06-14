@@ -1360,7 +1360,11 @@ async def _run_oneshot_warm(
     except asyncio.TimeoutError:
         return f"[Timed out after {int(timeout)}s]"
     except Exception as e:
+        print(f"[agent] _run_oneshot_warm Exception: {type(e).__name__}: {e}", file=sys.stderr)
         return f"[Error: {e}]"
+    except BaseException as e:
+        print(f"[agent] _run_oneshot_warm BaseException: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
     finally:
         if sid is not None:
             try:
@@ -4948,7 +4952,7 @@ async def try_init_copilot(
             # and a tappable trace (participant outcomes + judge decision).
             if ipc is not None:
                 models = [p["model"] for p in result.get("participants", [])]
-                _fire_and_forget(ipc.send(Message(
+                await ipc.send(Message(
                     type=MessageType.FUSION_EVENT,
                     payload={
                         "kind": "fusion",
@@ -4962,7 +4966,7 @@ async def try_init_copilot(
                         "final": result.get("final", ""),
                         "prompt": prompt[:2000],
                     },
-                )))
+                ))
             return ToolResult(text_result_for_llm=_format_fusion_result(result))
 
         fusion_tool = Tool(
@@ -5035,7 +5039,7 @@ async def try_init_copilot(
 
             # Emit + record (orchestrator persists to the complexity DB).
             if ipc is not None:
-                _fire_and_forget(ipc.send(Message(
+                await ipc.send(Message(
                     type=MessageType.FUSION_EVENT,
                     payload={
                         "kind": "grade",
@@ -5045,7 +5049,7 @@ async def try_init_copilot(
                         "threshold": threshold,
                         "task": task[:1000],
                     },
-                )))
+                ))
 
             preset_hint = ""
             if tier == "fusion":
