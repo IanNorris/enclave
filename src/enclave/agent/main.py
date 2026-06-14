@@ -1327,14 +1327,61 @@ def _copilot_cli_bin() -> str:
         return "copilot"
 
 
-async def _run_copilot_oneshot(
-    model: str, prompt: str, *, timeout: float = 180.0,
+async def _run_oneshot_warm(
+    client: object, model: str, prompt: str, *, timeout: float = 180.0,
 ) -> str:
-    """Run a single non-interactive `copilot -p` call with a specific model.
+    """Run a single prompt against a warm CopilotClient via a throwaway session.
 
-    Shared by consult_panel and Fusion: spawns the bundled copilot CLI, returns
-    the cleaned stdout text (or a bracketed error/empty marker). Never raises.
+    Creates a fresh, tool-disabled session on the already-running ACP client
+    (state cleared between calls), sends the prompt, waits for the assistant's
+    final message, then deletes the session. This is the same warm-ACP +
+    fresh-session pattern as the Mimir sidecar, applied in-process: it avoids
+    the cold-start cost and the nested-subprocess fragility of spawning
+    ``copilot -p`` from inside a live tool handler. Never raises; returns a
+    bracketed marker on failure so callers can degrade gracefully.
     """
+    from copilot.generated.session_events import AssistantMessageData
+
+    async def _deny(_req: object) -> object:
+        return None  # tools disabled — no permission request should arrive
+
+    sid = None
+    try:
+        session = await client.create_session(  # type: ignore[attr-defined]
+            on_permission_request=_deny,
+            model=model,
+            available_tools=[],
+        )
+        sid = getattr(session, "session_id", None)
+        resp = await session.send_and_wait(prompt, timeout=timeout)
+        if resp is not None and isinstance(resp.data, AssistantMessageData):
+            return (resp.data.content or "").strip()
+        return "[No response]"
+    except asyncio.TimeoutError:
+        return f"[Timed out after {int(timeout)}s]"
+    except Exception as e:
+        return f"[Error: {e}]"
+    finally:
+        if sid is not None:
+            try:
+                await client.delete_session(sid)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+
+async def _run_copilot_oneshot(
+    model: str, prompt: str, *, timeout: float = 180.0, client: object | None = None,
+) -> str:
+    """Run a single non-interactive model call with a specific model.
+
+    Shared by consult_panel and Fusion. When *client* (a warm CopilotClient) is
+    provided, runs against a throwaway session on it — fast and robust from
+    inside a live tool handler. Otherwise falls back to cold-spawning the
+    bundled ``copilot -p`` CLI. Returns cleaned text (or a bracketed
+    error/empty marker). Never raises.
+    """
+    if client is not None:
+        return await _run_oneshot_warm(client, model, prompt, timeout=timeout)
     cli_bin = _copilot_cli_bin()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1365,7 +1412,7 @@ async def _run_copilot_oneshot(
         return f"[Error: {e}]"
 
 
-async def _run_fusion(preset: dict, prompt: str) -> dict:
+async def _run_fusion(preset: dict, prompt: str, *, client: object | None = None) -> dict:
     """Run the Fusion pipeline for one preset.
 
     Stages: fan out the prompt to each participant model in parallel → judge
@@ -1373,6 +1420,10 @@ async def _run_fusion(preset: dict, prompt: str) -> dict:
     with the final answer plus the full trace (participant responses, judge
     analysis, resolved models) so the caller can both render it and emit a
     structured FUSION_EVENT for the UI.
+
+    When *client* (a warm CopilotClient) is provided, every model call runs
+    against a throwaway session on it instead of cold-spawning copilot — fast
+    and safe from inside a live tool handler.
     """
     participants: list[list[str]] = preset.get("participants") or []
     judge_prefs = tuple(preset.get("judge") or ()) or _MODEL_PREFERENCES
@@ -1395,7 +1446,7 @@ async def _run_fusion(preset: dict, prompt: str) -> dict:
     # Stage 1 — fan out (parallel).
     part_prompt = _fusion_mod.build_participant_prompt(prompt)
     responses_raw = await asyncio.gather(*(
-        _run_copilot_oneshot(model, part_prompt) for model in seats
+        _run_copilot_oneshot(model, part_prompt, client=client) for model in seats
     ))
     responses = list(zip(seats, responses_raw))
 
@@ -1403,13 +1454,13 @@ async def _run_fusion(preset: dict, prompt: str) -> dict:
     judge_model = _resolve_model(judge_prefs)
     judge_prompt = _fusion_mod.build_judge_prompt(prompt, responses)
     print(f"[agent] fusion: judging with {judge_model}", file=sys.stderr)
-    judge_analysis = await _run_copilot_oneshot(judge_model, judge_prompt, timeout=240.0)
+    judge_analysis = await _run_copilot_oneshot(judge_model, judge_prompt, timeout=240.0, client=client)
 
     # Stage 3 — synthesize.
     synth_model = _resolve_model(synth_prefs)
     synth_prompt = _fusion_mod.build_synthesizer_prompt(prompt, judge_analysis, responses)
     print(f"[agent] fusion: synthesizing with {synth_model}", file=sys.stderr)
-    final = await _run_copilot_oneshot(synth_model, synth_prompt, timeout=240.0)
+    final = await _run_copilot_oneshot(synth_model, synth_prompt, timeout=240.0, client=client)
 
     return {
         "preset_id": preset.get("id", ""),
@@ -4878,7 +4929,10 @@ async def try_init_copilot(
                 )
 
             try:
-                result = await _run_fusion(preset, prompt)
+                result = await _run_fusion(
+                    preset, prompt,
+                    client=(agent_state.sdk_client if agent_state else None),
+                )
             except Exception as e:
                 return ToolResult(
                     text_result_for_llm=f"Fusion failed: {e}",
@@ -4970,7 +5024,10 @@ async def try_init_copilot(
                 or _MODEL_PREFERENCES
             )
             grade_prompt = _fusion_mod.build_complexity_prompt(task)
-            raw = await _run_copilot_oneshot(grader_model, grade_prompt, timeout=90.0)
+            raw = await _run_copilot_oneshot(
+                grader_model, grade_prompt, timeout=90.0,
+                client=(agent_state.sdk_client if agent_state else None),
+            )
             graded = _fusion_mod.parse_complexity(raw, threshold=threshold)
             score = graded["score"]
             tier = graded["tier"]
