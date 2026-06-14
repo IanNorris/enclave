@@ -1020,6 +1020,11 @@ function handleStreamEvent(msg) {
     // doesn't get misattributed to this one.
     pendingComplexity = null
     pendingFusions = []
+    // Clear the live complexity indicator so it reflects only the *current*
+    // message: a grade of 5 on a previous turn must not linger over later
+    // messages that weren't graded. It re-populates if this turn grades.
+    complexity.value = null
+    resetFusion()
     setAgentState('thinking')
     return
   }
