@@ -40,6 +40,7 @@ async function request(path, options = {}) {
 export const api = {
   // Sessions
   getSessions: () => request('/sessions'),
+  getActivity: () => request('/sessions/activity'),
   getProfiles: () => request('/sessions/profiles'),
   createSession: (name, profile = '') => request('/sessions', {
     method: 'POST',

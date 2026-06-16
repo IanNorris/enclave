@@ -373,6 +373,8 @@ class ControlServer:
 
             if action == "list":
                 await self._handle_list(writer)
+            elif action == "activity":
+                await self._handle_activity(writer)
             elif action == "send":
                 await self._handle_send(req, writer, reader)
             elif action == "subscribe":
@@ -442,6 +444,20 @@ class ControlServer:
                 "awaiting_input": self._awaiting_input.get(session.id, False),
             })
         await self._write(writer, {"ok": True, "type": "sessions", "sessions": sessions})
+
+    async def _handle_activity(self, writer: asyncio.StreamWriter) -> None:
+        """Return the current coarse activity state for every known session.
+
+        Lets a freshly-loaded (or reconnected) Web UI seed its live activity
+        indicators from a snapshot rather than waiting for the next streamed
+        ``session_activity`` event. Without this, opening a session that is
+        mid-tool-call (e.g. a multi-minute fusion run that emits a single
+        tool_start then goes quiet) shows no working indicator at all.
+        """
+        await self._write(writer, {
+            "ok": True, "type": "activity_state",
+            "states": dict(self._activity_state),
+        })
 
     async def _handle_stop(self, req: dict, writer: asyncio.StreamWriter) -> None:
         session_id = req.get("session", "")

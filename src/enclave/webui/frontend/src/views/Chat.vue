@@ -710,6 +710,7 @@ onMounted(async () => {
   if (selectedSession.value) {
     loadHistory()
     loadDocList()
+    seedAgentState(selectedSession.value)
   }
   loadDraft(selectedSession.value)
   window.addEventListener('keydown', onLightboxKey)
@@ -756,8 +757,23 @@ watch(selectedSession, (newVal) => {
   docPanelOpen.value = false
   restoreOpenDoc()
   loadDraft(newVal)
-  if (newVal) { loadHistory(); loadDocList() }
+  if (newVal) { loadHistory(); loadDocList(); seedAgentState(newVal) }
 })
+
+// Seed the live status float from the orchestrator's current activity snapshot
+// so opening a session that is mid-tool-call (e.g. a multi-minute fusion run
+// that emits one tool_start then goes quiet) shows a working indicator instead
+// of appearing idle until the next streamed event.
+async function seedAgentState(sessionId) {
+  try {
+    const resp = await api.getActivity()
+    if (sessionId !== selectedSession.value) return  // session changed mid-fetch
+    const state = resp?.states?.[sessionId]
+    if (state && state !== 'idle' && agentState.value === 'unknown') {
+      setAgentState(state)
+    }
+  } catch { /* ignore */ }
+}
 
 function clearLiveState() {
   liveEvents.value = []
@@ -884,6 +900,8 @@ function connectWebSocket() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = localStorage.getItem('enclave_token')
   ws = new WebSocket(`${proto}//${location.host}/api/chat/${selectedSession.value}/stream?token=${token}`)
+
+  ws.onopen = () => { seedAgentState(selectedSession.value) }
 
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data)

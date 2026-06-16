@@ -206,6 +206,21 @@ async def list_sessions(request: Request):
     return _discover_sessions(request)
 
 
+@router.get("/activity")
+async def session_activity(request: Request):
+    """Current coarse activity state per session, for seeding live indicators.
+
+    Returns ``{session_id: "idle"|"thinking"|"tool"|"responding"}``. The Web UI
+    fetches this on load/reconnect so a session that is mid-tool-call shows a
+    working indicator immediately instead of appearing idle until the next
+    streamed event arrives.
+    """
+    resp = await _control_request(request, {"action": "activity"})
+    if not resp or not resp.get("ok"):
+        return {"states": {}}
+    return {"states": resp.get("states", {})}
+
+
 @router.get("/profiles")
 async def list_profiles(request: Request):
     """List the configured container profiles available for new sessions."""

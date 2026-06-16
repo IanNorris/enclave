@@ -326,12 +326,22 @@ async function togglePush() {
   }
 }
 
+async function seedActivity() {
+  // Snapshot current per-session activity so sidebar indicators are correct on
+  // load/reconnect, not just after the next streamed session_activity event.
+  try {
+    const resp = await api.getActivity()
+    if (resp && resp.states) activityState.value = { ...activityState.value, ...resp.states }
+  } catch { /* ignore */ }
+}
+
 function connectNotifWs() {
   if (!hasToken.value) return
   const token = localStorage.getItem('enclave_token')
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   try {
     notifWs = new WebSocket(`${proto}//${location.host}/api/notifications/stream?token=${token}`)
+    notifWs.onopen = () => { seedActivity() }
     notifWs.onmessage = (ev) => {
       let msg = null
       try { msg = JSON.parse(ev.data) } catch { /* ignore */ }
