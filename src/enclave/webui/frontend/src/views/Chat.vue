@@ -834,17 +834,20 @@ async function loadEvents() {
         }
         if (bestTurn == null) continue
         if (!meta[bestTurn]) meta[bestTurn] = { complexity: null, fusions: [] }
+        // The /events API nests the payload under evt.data (unlike the flattened
+        // WS stream), so read fusion/complexity fields from there.
+        const d = evt.data || {}
         if (evt.type === 'complexity') {
-          meta[bestTurn].complexity = { score: evt.score, tier: evt.tier, reason: evt.reason || '' }
+          meta[bestTurn].complexity = { score: d.score, tier: d.tier, reason: d.reason || '' }
         } else {
           meta[bestTurn].fusions.push({
-            preset: evt.preset_name || evt.preset || 'fusion',
-            models: evt.models || [],
-            judge_model: evt.judge_model || '',
-            synthesizer_model: evt.synthesizer_model || '',
-            participants: evt.participants || [],
-            judge_analysis: evt.judge_analysis || '',
-            final: evt.final || '',
+            preset: d.preset_name || d.preset || 'fusion',
+            models: d.models || [],
+            judge_model: d.judge_model || '',
+            synthesizer_model: d.synthesizer_model || '',
+            participants: d.participants || [],
+            judge_analysis: d.judge_analysis || '',
+            final: d.final || '',
           })
         }
         continue
