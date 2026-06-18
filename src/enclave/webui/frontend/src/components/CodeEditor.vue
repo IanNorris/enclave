@@ -7,6 +7,7 @@ import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { EditorState } from '@codemirror/state'
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
+import { search, searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import { markdown } from '@codemirror/lang-markdown'
 import { json } from '@codemirror/lang-json'
 import { oneDark } from '@codemirror/theme-one-dark'
@@ -40,7 +41,12 @@ function buildState(doc) {
       highlightActiveLine(),
       highlightActiveLineGutter(),
       history(),
-      keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+      // CodeMirror virtualises off-screen lines, so the browser's native
+      // Ctrl/Cmd+F can't match text that isn't rendered. Use the editor's own
+      // search panel (Mod-f) which searches the full document instead.
+      search({ top: true }),
+      highlightSelectionMatches(),
+      keymap.of([...searchKeymap, ...defaultKeymap, ...historyKeymap, indentWithTab]),
       EditorView.lineWrapping,
       oneDark,
       ...langExtension(props.language),
@@ -92,4 +98,19 @@ onBeforeUnmount(() => {
   font-size: 0.9rem;
 }
 .code-editor :deep(.cm-scroller) { overflow: auto; }
+/* Search panel (Mod-f): keep inputs legible and tappable on the dark editor. */
+.code-editor :deep(.cm-panel.cm-search) {
+  padding: 6px 8px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.code-editor :deep(.cm-panel.cm-search input),
+.code-editor :deep(.cm-panel.cm-search button) {
+  font-size: 0.85rem;
+}
+.code-editor :deep(.cm-panel.cm-search input[type="text"]) {
+  padding: 2px 6px;
+}
 </style>
