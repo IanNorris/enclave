@@ -697,6 +697,24 @@ def _reconcile_artifact(art_dir: Path, entry: dict) -> bool:
     if cur_hash == stored:
         return False
 
+    # A tracked save (publish_artifact or the UI save endpoint) bumps the version
+    # itself and snapshots the previous content to .v{version-1}. If that snapshot
+    # hashes to the previously-accounted content, the bump is already recorded —
+    # just adopt the new hash (and ensure a current shadow) without re-counting it
+    # as an out-of-band edit. Two consecutive versions are never identical (we
+    # don't bump on an unchanged hash), so this can't misfire on a real edit.
+    prev_shadow = _shadow_path(art_dir, filename, version - 1)
+    if version > 1 and prev_shadow.exists() and _file_sha256(prev_shadow) == stored:
+        cur_shadow = _shadow_path(art_dir, filename, version)
+        if not cur_shadow.exists():
+            try:
+                shutil.copy2(str(target), str(cur_shadow))
+            except OSError:
+                pass
+        entry["content_hash"] = cur_hash
+        entry["size"] = target.stat().st_size
+        return True
+
     # Out-of-band edit. The shadow .v{version} holds the pre-edit content; keep
     # it as the historical snapshot of `version`, then bump.
     now = datetime.now(timezone.utc).isoformat()
