@@ -356,9 +356,10 @@
         <input type="file" ref="chatFile" style="display:none" @change="attachFiles" multiple accept="image/*,application/pdf,text/*" />
         <textarea
           v-model="draft"
-          placeholder="Send a message… (paste or drop images)"
-          @keydown.enter.exact.prevent="send"
+          :placeholder="composerPlaceholder"
+          @keydown.enter.exact="onEnterKey"
           @keydown.shift.enter.exact=""
+          @input="autoGrow"
           @paste="onPaste"
           rows="1"
           ref="inputEl"
@@ -484,6 +485,14 @@ const docPanelOpen = ref(false)
 const outerOrientation = ref(localStorage.getItem('enclave_outer_orientation') || 'horizontal')
 const outerSize = ref(parseFloat(localStorage.getItem('enclave_outer_size')) || 58) // % for chat pane
 const isMobilePortrait = ref(false)
+// Touch / on-screen-keyboard devices: Enter inserts a newline (the Send button
+// sends) since there's no easy Shift+Enter. Also drives the smaller line cap.
+const isCoarsePointer = ref(false)
+const isMobile = computed(() => isMobilePortrait.value || isCoarsePointer.value)
+const composerPlaceholder = computed(() =>
+  isMobile.value
+    ? 'Send a message…'
+    : 'Send a message… (Enter to send, Shift+Enter for newline)')
 const docRefreshTick = ref(0) // bumped on agent activity → DocumentPane re-checks for external changes
 let _mqlPortrait = null
 
@@ -590,6 +599,7 @@ function loadDraft(id) {
 }
 watch(draft, (v) => {
   const id = selectedSession.value
+  nextTick(autoGrow)
   if (!id) return
   if (v) localStorage.setItem(draftKey(id), v)
   else localStorage.removeItem(draftKey(id))
@@ -706,6 +716,9 @@ onMounted(async () => {
   _mqlPortrait.addEventListener('change', applyPortrait)
   _mqlPortrait._handler = applyPortrait
 
+  // Touch / on-screen-keyboard devices use Enter-for-newline.
+  try { isCoarsePointer.value = window.matchMedia('(pointer: coarse)').matches } catch { /* ignore */ }
+
   restoreOpenDoc()
   if (selectedSession.value) {
     loadHistory()
@@ -713,8 +726,25 @@ onMounted(async () => {
     seedAgentState(selectedSession.value)
   }
   loadDraft(selectedSession.value)
+  nextTick(autoGrow)
   window.addEventListener('keydown', onLightboxKey)
+  window.addEventListener('keydown', onTypeToFocus)
 })
+
+// Start typing anywhere (no field focused) to jump straight into the composer,
+// so the keystroke lands in the message box without a manual click.
+function onTypeToFocus(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return
+  if (e.key == null || e.key.length !== 1) return  // ignore Enter, arrows, F-keys…
+  if (!selectedSession.value) return
+  if (lightboxImage.value) return  // don't steal keys from the image viewer
+  const ae = document.activeElement
+  const tag = ae && ae.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (ae && ae.isContentEditable)) return
+  const el = inputEl.value
+  if (!el) return
+  el.focus()  // focus during keydown so the character is inserted by the browser
+}
 
 // Attach a MutationObserver to the messages container so mermaid diagrams are
 // rendered whenever new content is injected via v-html (history, live stream,
@@ -734,6 +764,7 @@ onUnmounted(() => {
   if (_mermaidTimer) clearTimeout(_mermaidTimer)
   pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
   window.removeEventListener('keydown', onLightboxKey)
+  window.removeEventListener('keydown', onTypeToFocus)
   if (_mqlPortrait && _mqlPortrait._handler) {
     _mqlPortrait.removeEventListener('change', _mqlPortrait._handler)
     _mqlPortrait = null
@@ -1216,11 +1247,40 @@ function handleStreamEvent(msg) {
   }
 }
 
+// Enter handling: on desktop Enter sends (Shift+Enter makes a newline). On
+// touch devices there's no easy Shift+Enter, so Enter inserts a newline and the
+// Send button is the only way to send.
+function onEnterKey(e) {
+  if (isMobile.value) return  // allow the default newline
+  e.preventDefault()
+  send()
+}
+
+// Auto-grow the composer to fit its content, capped at 8 lines (4 on mobile),
+// after which it scrolls. Runs on input, paste, draft restore and after send.
+function autoGrow() {
+  const el = inputEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  const cs = getComputedStyle(el)
+  const lh = parseFloat(cs.lineHeight) || 20
+  const padTop = parseFloat(cs.paddingTop) || 0
+  const padBottom = parseFloat(cs.paddingBottom) || 0
+  const borderTop = parseFloat(cs.borderTopWidth) || 0
+  const borderBottom = parseFloat(cs.borderBottomWidth) || 0
+  const maxLines = isMobile.value ? 4 : 8
+  const maxH = lh * maxLines + padTop + padBottom + borderTop + borderBottom
+  const newH = Math.min(el.scrollHeight + borderTop + borderBottom, maxH)
+  el.style.height = newH + 'px'
+  el.style.overflowY = el.scrollHeight + borderTop + borderBottom > maxH ? 'auto' : 'hidden'
+}
+
 async function send() {
   if ((!draft.value.trim() && !pendingFiles.value.length) || !selectedSession.value) return
   const content = draft.value.trim()
   draft.value = ''
   sending.value = true
+  nextTick(autoGrow)
 
   // Sending a message answers any pending ask_user question — dismiss its card.
   if (askUserPrompt.value) {
@@ -2145,7 +2205,8 @@ function toggleCardFusion(ti, ri) {
   flex: 1;
   resize: none;
   min-height: 42px;
-  max-height: 150px;
+  line-height: 1.4;
+  overflow-y: hidden;
   font-family: inherit;
 }
 
