@@ -83,16 +83,24 @@ class ControlServer:
         if self._socket_path.exists():
             self._socket_path.unlink(missing_ok=True)
 
-    def notify_user_message(self, session_id: str, content: str, sender: str = "") -> None:
+    def notify_user_message(
+        self, session_id: str, content: str, sender: str = "",
+        images: list[str] | None = None,
+    ) -> None:
         """Called by the router when a user message is delivered to the agent.
 
         Emitted from every dispatch path (Matrix project rooms and control-socket
         injection) so the webui's event persister durably records user turns
-        regardless of where the message originated.
+        regardless of where the message originated. ``images`` carries any
+        workspace-relative paths of image attachments so the Web UI can render
+        the picture the user sent alongside their message.
         """
-        self._emit(session_id, {
+        event = {
             "ok": True, "type": "user_message", "content": content, "sender": sender,
-        })
+        }
+        if images:
+            event["images"] = images
+        self._emit(session_id, event)
 
     def notify_response(self, session_id: str, content: str) -> None:
         """Called by the router when an agent sends a response."""

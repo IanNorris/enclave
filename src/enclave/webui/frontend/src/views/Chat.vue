@@ -40,13 +40,18 @@
 
         <!-- Completed turns from SQLite -->
         <div v-for="(turn, idx) in turns" :key="turn.turn_index ?? `m-${idx}`" class="turn">
-          <div v-if="turn.user_message" class="message user-message">
+          <div v-if="turn.user_message || (turn.user_images && turn.user_images.length)" class="message user-message">
             <div class="message-meta">
               <span class="sender">User</span>
               <span v-if="turn.source === 'queued'" class="queued-badge">queued</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
             </div>
-            <div class="message-body" v-html="renderMarkdown(turn.user_message)"></div>
+            <div v-if="turn.user_images && turn.user_images.length" class="user-images">
+              <img v-for="(img, ii) in turn.user_images" :key="ii"
+                   :src="userImageUrl(img)"
+                   class="user-img clickable-img" @click="openLightbox(userImageUrl(img))" />
+            </div>
+            <div v-if="turn.user_message" class="message-body" v-html="renderMarkdown(turn.user_message)"></div>
           </div>
 
           <!-- Persisted event segments for this turn (tool calls interleaved with responses) -->
@@ -1011,26 +1016,32 @@ function handleStreamEvent(msg) {
     if (idx >= 0) {
       turns.value[idx] = msg
     } else {
-      // Remove any queued message that matches this turn's user_message.
-      // The SDK wraps messages with <current_datetime>, so check if the
-      // turn's user_message contains the queued text (or vice versa).
+      // Remove any queued message that matches this turn's user_message, and
+      // carry its image previews onto the reconciled turn so the picture the
+      // user sent stays visible (the SDK turn carries no image metadata).
+      // Image-only sends still arrive with a placeholder body, so user_message
+      // is truthy here in every user-initiated turn.
       if (msg.user_message) {
-        const qIdx = turns.value.findIndex(t =>
+        let qIdx = turns.value.findIndex(t =>
           t.source === 'queued' && (
             t.user_message === msg.user_message ||
             msg.user_message.includes(t.user_message)
           )
         )
-        if (qIdx >= 0) {
-          turns.value.splice(qIdx, 1)
-        } else {
-          // Fallback: remove the most recent queued message
+        if (qIdx < 0) {
+          // Fallback: the most recent queued message (covers image-only sends,
+          // whose placeholder body won't match the queued empty text).
           for (let i = turns.value.length - 1; i >= 0; i--) {
-            if (turns.value[i].source === 'queued') {
-              turns.value.splice(i, 1)
-              break
-            }
+            if (turns.value[i].source === 'queued') { qIdx = i; break }
           }
+        }
+        if (qIdx >= 0) {
+          const q = turns.value[qIdx]
+          if (q.user_images && q.user_images.length &&
+              !(msg.user_images && msg.user_images.length)) {
+            msg.user_images = q.user_images
+          }
+          turns.value.splice(qIdx, 1)
         }
       }
       // Remove any live-cache entry that matches this turn's assistant_response
@@ -1288,12 +1299,17 @@ async function send() {
     askUserAnswer.value = ''
   }
 
-  // Immediately show the message as "queued"
-  if (content) {
+  // Immediately show the message as "queued" (with any image previews) so the
+  // user sees what they sent before the upload round-trips. The queued turn
+  // takes ownership of the preview blob URLs; they're revoked when it's
+  // reconciled away or on unmount, not by clearPendingFiles below.
+  const queuedPreviews = pendingFiles.value.filter(f => f.preview).map(f => f.preview)
+  if (content || queuedPreviews.length) {
     const ts = new Date().toISOString()
     turns.value.push({
       turn_index: null,
       user_message: content,
+      user_images: queuedPreviews,
       assistant_response: null,
       timestamp: ts,
       source: 'queued',
@@ -1319,7 +1335,9 @@ async function send() {
           body: form,
         })
       }
-      clearPendingFiles()
+      // Clear the picker without revoking the preview URLs: the queued turn now
+      // owns them for display until it's reconciled away (or the view unmounts).
+      pendingFiles.value = []
     } else {
       await api.sendChatMessage(selectedSession.value, content)
     }
@@ -1515,6 +1533,14 @@ function workspaceFileUrl(filePath) {
   const encoded = rel.split('/').map(encodeURIComponent).join('/')
   const token = localStorage.getItem('enclave_token') || ''
   return `/api/chat/${selectedSession.value}/file/${encoded}?token=${encodeURIComponent(token)}`
+}
+
+// Render a user-attached image. Locally-queued sends carry a blob:/data: preview
+// URL (used as-is); persisted/reloaded turns carry a workspace path served via
+// the file proxy.
+function userImageUrl(img) {
+  if (/^(blob:|data:|https?:)/i.test(img)) return img
+  return workspaceFileUrl(img)
 }
 
 function mediaUrl(mxcUrl) {
@@ -2497,6 +2523,19 @@ function toggleCardFusion(ti, ri) {
 .file-send-img {
   max-width: 450px;
   max-height: 300px;
+  border-radius: var(--radius-sm);
+  cursor: zoom-in;
+}
+
+.user-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+.user-img {
+  max-width: 320px;
+  max-height: 240px;
   border-radius: var(--radius-sm);
   cursor: zoom-in;
 }

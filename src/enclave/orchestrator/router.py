@@ -51,6 +51,24 @@ from enclave.orchestrator.control import ControlServer
 
 log = get_logger("router")
 
+
+def _attachment_image_paths(attachments: list[dict[str, Any]] | None) -> list[str]:
+    """Workspace-relative paths of image attachments, for Web UI rendering.
+
+    Returns the ``local_path`` (container-relative, e.g.
+    ``/workspace/.attachments/foo.png``) of each image attachment so the Web UI
+    can show the picture the user sent alongside their message. Non-image and
+    not-yet-downloaded attachments are skipped.
+    """
+    paths: list[str] = []
+    for att in attachments or []:
+        ct = (att.get("content_type") or "").lower()
+        local = att.get("local_path")
+        if local and ct.startswith("image/"):
+            paths.append(local)
+    return paths
+
+
 # Minimum interval between Matrix message edits (seconds)
 _EDIT_THROTTLE = 5.0
 
@@ -366,7 +384,10 @@ class MessageRouter:
             self._touch_activity(session_id)
             log.info("Injected control message to %s: %s", session_id, content[:80])
             # Record the user turn so the webui can reconstruct history.
-            self._control.notify_user_message(session_id, content, "control")
+            self._control.notify_user_message(
+                session_id, content, "control",
+                images=_attachment_image_paths(resolved_attachments),
+            )
             # Echo to Matrix so the user can see what was sent
             await self.matrix.send_message(
                 session.room_id,
@@ -993,7 +1014,10 @@ class MessageRouter:
             )
         else:
             # Record the user turn so the webui can reconstruct history.
-            self._control.notify_user_message(session.id, body, sender)
+            self._control.notify_user_message(
+                session.id, body, sender,
+                images=_attachment_image_paths(resolved_attachments),
+            )
 
     # ------------------------------------------------------------------
     # IPC → Router (agent responses)

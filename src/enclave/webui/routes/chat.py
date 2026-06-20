@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -110,10 +110,12 @@ def _reconstruct_turns(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             turns.append(cur)
             cur = None
 
-    def new_turn(ts: str, user_message: str | None = None) -> dict[str, Any]:
+    def new_turn(ts: str, user_message: str | None = None,
+                 user_images: list[str] | None = None) -> dict[str, Any]:
         return {
             "turn_index": 0,
             "user_message": user_message,
+            "user_images": user_images or [],
             "assistant_response": None,
             "timestamp": ts,
         }
@@ -143,7 +145,10 @@ def _reconstruct_turns(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         if etype == "user_message":
             flush()
-            cur = new_turn(ts, user_message=data.get("content", ""))
+            cur = new_turn(
+                ts, user_message=data.get("content", ""),
+                user_images=data.get("images") or [],
+            )
         elif etype == "response":
             content = data.get("content", "")
             if content:
@@ -736,7 +741,7 @@ async def set_model(request: Request, session_id: str, body: SendMessage):
 
 
 @router.post("/{session_id}/upload")
-async def upload_file(request: Request, session_id: str, file: UploadFile = File(...), message: str = ""):
+async def upload_file(request: Request, session_id: str, file: UploadFile = File(...), message: str = Form("")):
     """Upload a file and send it to the agent via control socket (with attachment metadata).
 
     Also uploads to Matrix for the conversation record (best-effort).
