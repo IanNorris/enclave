@@ -37,3 +37,7 @@ result
 *.key
 enclave.yaml
 node_modules/
+
+# OpenSpec review workflow data (not spec content)
+openspec/changes/**/.enclave-review.json
+openspec/changes/**/.enclave-review-history.json
