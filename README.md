@@ -101,6 +101,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.
 - **matrix-nio[e2ee]** — Matrix E2EE client
 - **podman** — rootless container sandboxing
 - **FastAPI + Vue 3** — web UI (HTTPS, token auth)
+- **[OpenSpec](https://github.com/Fission-AI/OpenSpec)** — spec-driven development workflow (vendored as a submodule under `third_party/openspec`); specs live in `openspec/` and are reviewable in the web UI's **Specs** tab
 - **Conduit** — Matrix homeserver
 - **systemd** — service management
 - **Nix** — reproducible builds and dev environment

@@ -121,6 +121,15 @@ export const api = {
   artifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}`,
   rawArtifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}?raw=1`,
 
+  // OpenSpec changes
+  getOpenSpecChanges: (id) => request(`/sessions/${id}/openspec/changes`),
+  getOpenSpecChange: (id, name) => request(`/sessions/${id}/openspec/changes/${name}`),
+  postOpenSpecReview: (id, name, state, note = '') =>
+    request(`/sessions/${id}/openspec/changes/${name}/review`, {
+      method: 'POST',
+      body: JSON.stringify({ state, note }),
+    }),
+
   // Deferred Asks
   getAsks: (sessionId, status = 'pending') => {
     const params = new URLSearchParams({ status })

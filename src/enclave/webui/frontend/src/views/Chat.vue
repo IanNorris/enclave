@@ -378,8 +378,15 @@
           :class="outerOrientation"
           @pointerdown="startOuterDrag"
         ><div class="divider-grip"></div></div>
+        <div v-if="pinnedSpec" class="outer-doc spec-pin-panel" :style="docPaneStyle">
+          <div class="doc-list-head">
+            <span>📌 {{ pinnedSpec.title }}</span>
+            <button class="doc-panel-close" title="Unpin" @click="unpinSpec">✕</button>
+          </div>
+          <div class="spec-pin-body md" v-html="pinnedSpecHtml"></div>
+        </div>
         <DocumentPane
-          v-if="openDoc"
+          v-else-if="openDoc"
           class="outer-doc"
           :style="docPaneStyle"
           :session="selectedSession"
@@ -542,6 +549,44 @@ function closeDocPanel() {
   docPanelOpen.value = false
   openDoc.value = ''
   if (selectedSession.value) localStorage.removeItem(docStorageKey(selectedSession.value))
+}
+
+// ─── Pinned OpenSpec spec (shown in the same pull-out panel) ───
+const pinnedSpec = ref(null)        // { changeId, path, title }
+const pinnedSpecHtml = ref('')
+function pinnedSpecKey() { return `enclave:${selectedSession.value}:pinnedSpec` }
+async function restorePinnedSpec() {
+  pinnedSpec.value = null
+  pinnedSpecHtml.value = ''
+  if (!selectedSession.value) return
+  let saved = null
+  try { saved = JSON.parse(localStorage.getItem(pinnedSpecKey()) || 'null') } catch { saved = null }
+  if (!saved || !saved.changeId) return
+  pinnedSpec.value = saved
+  docPanelOpen.value = true
+  try {
+    const d = await api.getOpenSpecChange(selectedSession.value, saved.changeId)
+    // Show the proposal by default; fall back to whatever exists.
+    const body = d.proposal || d.design || d.tasks || ''
+    pinnedSpecHtml.value = renderMarkdown(body)
+  } catch { pinnedSpecHtml.value = '<p class="muted">Could not load spec.</p>' }
+}
+function unpinSpec() {
+  if (selectedSession.value) localStorage.removeItem(pinnedSpecKey())
+  pinnedSpec.value = null
+  pinnedSpecHtml.value = ''
+  if (!openDoc.value) docPanelOpen.value = false
+}
+
+// ─── Pending OpenSpec feedback handoff (from the Specs tab) ───
+function flushPendingFeedback() {
+  if (!selectedSession.value) return
+  const key = `enclave:${selectedSession.value}:pendingFeedback`
+  const msg = localStorage.getItem(key)
+  if (!msg) return
+  localStorage.removeItem(key)
+  draft.value = msg
+  send()
 }
 function toggleOuterOrientation() {
   outerOrientation.value = outerOrientation.value === 'horizontal' ? 'vertical' : 'horizontal'
@@ -725,10 +770,12 @@ onMounted(async () => {
   try { isCoarsePointer.value = window.matchMedia('(pointer: coarse)').matches } catch { /* ignore */ }
 
   restoreOpenDoc()
+  restorePinnedSpec()
   if (selectedSession.value) {
     loadHistory()
     loadDocList()
     seedAgentState(selectedSession.value)
+    flushPendingFeedback()
   }
   loadDraft(selectedSession.value)
   nextTick(autoGrow)
@@ -792,8 +839,9 @@ watch(selectedSession, (newVal) => {
   sending.value = false
   docPanelOpen.value = false
   restoreOpenDoc()
+  restorePinnedSpec()
   loadDraft(newVal)
-  if (newVal) { loadHistory(); loadDocList(); seedAgentState(newVal) }
+  if (newVal) { loadHistory(); loadDocList(); seedAgentState(newVal); flushPendingFeedback() }
 })
 
 // Seed the live status float from the orchestrator's current activity snapshot
@@ -1803,6 +1851,32 @@ function toggleCardFusion(ti, ri) {
   min-width: 0;
   min-height: 0;
 }
+
+.spec-pin-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card, #1e1e24);
+  border-left: 1px solid var(--border);
+  min-width: 0;
+  min-height: 0;
+}
+.spec-pin-body {
+  overflow-y: auto;
+  padding: 0.85rem 1rem;
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+.spec-pin-body :deep(h1) { font-size: 1.15rem; }
+.spec-pin-body :deep(h2) { font-size: 1.02rem; }
+.spec-pin-body :deep(h3) { font-size: 0.92rem; }
+.spec-pin-body :deep(pre) {
+  background: var(--bg-main, #15151a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 0.6rem;
+  overflow-x: auto;
+}
+.spec-pin-body :deep(code) { font-family: monospace; font-size: 0.85em; }
 
 .doc-list-head {
   display: flex;
