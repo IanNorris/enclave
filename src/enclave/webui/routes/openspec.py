@@ -30,34 +30,60 @@ from enclave.common.openspec_log import (
 
 router = APIRouter()
 
-# Repo root = four parents up from this file:
-# src/enclave/webui/routes/openspec.py -> <repo>/
-_REPO_ROOT = Path(__file__).resolve().parents[4]
-
 _CHECK_DONE = re.compile(r"^\s*[-*]\s+\[[xX]\]\s+(.*)$")
 _CHECK_OPEN = re.compile(r"^\s*[-*]\s+\[\s\]\s+(.*)$")
 
 _REVIEW_FILE = ".enclave-review.json"
 
 
-def _openspec_root(session_id: str) -> Path:
+def _get_config(request: Request):
+    return request.app.state.config
+
+
+def _openspec_root(request: Request, session_id: str) -> Path:
     """Resolve the directory whose ``openspec/`` is read for this session.
 
-    Phase A: always the Enclave repo root (overridable via
-    ``ENCLAVE_OPENSPEC_ROOT``). Phase B would return the session workspace.
-    ``session_id`` is accepted now for URL symmetry and a future swap.
+    Phase B (per-project), resolved in priority order so a future
+    ``session.project_root`` config field can supersede without touching callers:
+
+    1. ``ENCLAVE_OPENSPEC_ROOT`` env — global escape hatch (tests / emergencies).
+    2. A ``.openspec_root`` pointer file in the session workspace naming an
+       external project dir — used by host-mode sessions whose project is a repo
+       outside the workspace (e.g. the Enclave dev session points at the repo).
+    3. Default: the session's own workspace (``workspace_base/<session_id>``),
+       which for container sessions is the bind-mounted /workspace — i.e. THE
+       project. New sessions with no ``openspec/`` yield a graceful empty state.
     """
     override = os.environ.get("ENCLAVE_OPENSPEC_ROOT")
-    return Path(override) if override else _REPO_ROOT
+    if override:
+        return Path(override)
+    ws = _workspace_base(request) / session_id
+    ptr = ws / ".openspec_root"
+    if ptr.is_file():
+        try:
+            target = Path(ptr.read_text(encoding="utf-8").strip()).expanduser()
+            if target.is_dir():
+                return target
+        except OSError:
+            pass  # stale/unreadable pointer → degrade to the workspace
+    return ws
 
 
-def _changes_dir(session_id: str) -> Path:
-    return _openspec_root(session_id) / "openspec" / "changes"
+def _workspace_base(request: Request) -> Path:
+    return Path(_get_config(request).container.workspace_base)
 
 
-def _safe_change_dir(session_id: str, name: str) -> Path:
-    """Resolve a change directory, rejecting traversal outside changes/."""
-    base = _changes_dir(session_id).resolve()
+def _changes_dir(request: Request, session_id: str) -> Path:
+    return _openspec_root(request, session_id) / "openspec" / "changes"
+
+
+def _safe_change_dir(request: Request, session_id: str, name: str) -> Path:
+    """Resolve a change directory, rejecting traversal outside changes/.
+
+    ``session_id`` comes from the authenticated route (not user input); the
+    user-supplied ``name`` is the real traversal risk, bounded here.
+    """
+    base = _changes_dir(request, session_id).resolve()
     target = (base / name).resolve()
     try:
         target.relative_to(base)
@@ -147,9 +173,10 @@ def _lifecycle(task_progress: dict, review: dict | None, archived: bool) -> str:
     return "active"
 
 
-def _change_summary(session_id: str, change_dir: Path, archived: bool = False) -> dict:
+def _change_summary(request: Request, session_id: str, change_dir: Path, archived: bool = False) -> dict:
     name = change_dir.name
-    rel = lambda p: str(p.relative_to(_openspec_root(session_id)))  # noqa: E731
+    root = _openspec_root(request, session_id)
+    rel = lambda p: str(p.relative_to(root))  # noqa: E731
     proposal = change_dir / "proposal.md"
     design = change_dir / "design.md"
     tasks = change_dir / "tasks.md"
@@ -176,21 +203,21 @@ async def list_changes(request: Request, session_id: str):
     """List OpenSpec changes, most-recently-edited first so the change the user
     is actively working on is at the top. Archived changes are included with
     ``archived: true`` so the UI can show them in a collapsed section."""
-    changes_dir = _changes_dir(session_id)
+    changes_dir = _changes_dir(request, session_id)
     if not changes_dir.is_dir():
         return {"exists": False, "changes": []}
     changes = []
     for entry in sorted(changes_dir.iterdir()):
         if not entry.is_dir() or entry.name == "archive":
             continue
-        changes.append((_change_mtime(entry), _change_summary(session_id, entry)))
+        changes.append((_change_mtime(entry), _change_summary(request, session_id, entry)))
     # Archived changes (read-only) from changes/archive/<date>-<name>/
     archive_dir = changes_dir / "archive"
     if archive_dir.is_dir():
         for entry in sorted(archive_dir.iterdir()):
             if not entry.is_dir():
                 continue
-            changes.append((_change_mtime(entry), _change_summary(session_id, entry, archived=True)))
+            changes.append((_change_mtime(entry), _change_summary(request, session_id, entry, archived=True)))
     # Newest edit first; the review-log workflow file is ignored by _change_mtime
     # so approving/commenting doesn't reorder the list.
     changes.sort(key=lambda t: t[0], reverse=True)
@@ -216,10 +243,10 @@ def _change_mtime(change_dir: Path) -> float:
 @router.get("/{session_id}/openspec/changes/{name}")
 async def get_change(request: Request, session_id: str, name: str):
     """Return the markdown artifacts + specs map for one change (active or archived)."""
-    change_dir = _safe_change_dir(session_id, name)
+    change_dir = _safe_change_dir(request, session_id, name)
     if not change_dir.is_dir():
         # Fall back to the archive (id of an archived change is <date>-<name>).
-        archived = _safe_change_dir(session_id, f"archive/{name}")
+        archived = _safe_change_dir(request, session_id, f"archive/{name}")
         if archived.is_dir():
             change_dir = archived
         else:
@@ -269,12 +296,12 @@ async def post_review(request: Request, session_id: str, name: str, body: Review
     """
     if body.state not in ("approved", "changes_requested", "commented"):
         raise HTTPException(status_code=400, detail="Invalid review state")
-    change_dir = _safe_change_dir(session_id, name)
+    change_dir = _safe_change_dir(request, session_id, name)
     if not change_dir.is_dir():
         raise HTTPException(status_code=404, detail="Change not found")
 
     now = datetime.now(timezone.utc).isoformat()
-    snapshot, blobs = _snapshot_files(change_dir, _openspec_root(session_id))
+    snapshot, blobs = _snapshot_files(change_dir, _openspec_root(request, session_id))
     event = {
         "id": f"rev_{int(time.time() * 1000)}",
         "type": "review",
@@ -292,7 +319,7 @@ async def post_review(request: Request, session_id: str, name: str, body: Review
 @router.get("/{session_id}/openspec/changes/{name}/state")
 async def get_state(request: Request, session_id: str, name: str):
     """Derived review state + per-comment status for a change."""
-    change_dir = _safe_change_dir(session_id, name)
+    change_dir = _safe_change_dir(request, session_id, name)
     if not change_dir.is_dir():
         raise HTTPException(status_code=404, detail="Change not found")
     events = _read_log(change_dir).get("events", [])
@@ -318,10 +345,10 @@ async def get_diff(request: Request, session_id: str, name: str):
     """
     import difflib
 
-    change_dir = _safe_change_dir(session_id, name)
+    change_dir = _safe_change_dir(request, session_id, name)
     if not change_dir.is_dir():
         raise HTTPException(status_code=404, detail="Change not found")
-    root = _openspec_root(session_id)
+    root = _openspec_root(request, session_id)
     doc = _read_log(change_dir)
     events = doc.get("events", [])
     blobs = doc.get("blobs", {})
@@ -395,11 +422,11 @@ async def post_revision(request: Request, session_id: str, name: str, body: Revi
     review feedback. The handler snapshots the current files itself — it never
     trusts caller-supplied content.
     """
-    change_dir = _safe_change_dir(session_id, name)
+    change_dir = _safe_change_dir(request, session_id, name)
     if not change_dir.is_dir():
         raise HTTPException(status_code=404, detail="Change not found")
     now = datetime.now(timezone.utc).isoformat()
-    snapshot, blobs = _snapshot_files(change_dir, _openspec_root(session_id))
+    snapshot, blobs = _snapshot_files(change_dir, _openspec_root(request, session_id))
     event = {
         "id": f"arev_{int(time.time() * 1000)}",
         "type": "agent_revision",
