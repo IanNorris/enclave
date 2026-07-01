@@ -124,10 +124,11 @@ export const api = {
   // OpenSpec changes
   getOpenSpecChanges: (id) => request(`/sessions/${id}/openspec/changes`),
   getOpenSpecChange: (id, name) => request(`/sessions/${id}/openspec/changes/${name}`),
-  postOpenSpecReview: (id, name, state, note = '') =>
+  getOpenSpecState: (id, name) => request(`/sessions/${id}/openspec/changes/${name}/state`),
+  postOpenSpecReview: (id, name, state, note = '', comments = []) =>
     request(`/sessions/${id}/openspec/changes/${name}/review`, {
       method: 'POST',
-      body: JSON.stringify({ state, note }),
+      body: JSON.stringify({ state, note, comments }),
     }),
 
   // Deferred Asks

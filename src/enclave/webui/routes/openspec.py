@@ -12,14 +12,18 @@ directly. Scaffolding/validate/archive remain the agent's job via the CLI.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+
+from enclave.webui.routes.review_state import derive_state, derive_comment_statuses
 
 router = APIRouter()
 
@@ -29,6 +33,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 
 _CHECK_DONE = re.compile(r"^\s*[-*]\s+\[[xX]\]\s+(.*)$")
 _CHECK_OPEN = re.compile(r"^\s*[-*]\s+\[\s\]\s+(.*)$")
+
+_REVIEW_FILE = ".enclave-review.json"
 
 
 def _openspec_root(session_id: str) -> Path:
@@ -86,14 +92,66 @@ def _task_progress(tasks_md: str | None) -> dict:
     }
 
 
-def _review_state(change_dir: Path) -> dict | None:
-    raw = _read_text(change_dir / ".enclave-review.json")
+def _read_log(change_dir: Path) -> dict:
+    """Load the append-only review log, tolerating absence/corruption."""
+    raw = _read_text(change_dir / _REVIEW_FILE)
     if not raw:
-        return None
+        return {"version": 1, "events": []}
     try:
-        return json.loads(raw)
+        doc = json.loads(raw)
     except json.JSONDecodeError:
-        return None
+        return {"version": 1, "events": []}
+    if "events" not in doc or not isinstance(doc["events"], list):
+        doc["events"] = []
+    return doc
+
+
+def _write_log_atomic(change_dir: Path, doc: dict) -> None:
+    """Write the log via temp-file + rename so a concurrent read never sees a
+    half-written file."""
+    target = change_dir / _REVIEW_FILE
+    tmp = change_dir / f".{_REVIEW_FILE}.{os.getpid()}.{int(time.time()*1000)}.tmp"
+    tmp.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    os.replace(str(tmp), str(target))
+
+
+def _append_event(change_dir: Path, event: dict) -> dict:
+    """Append one event to the log (idempotent on event id) and return the doc."""
+    doc = _read_log(change_dir)
+    if event.get("id") and any(e.get("id") == event["id"] for e in doc["events"]):
+        return doc  # idempotent: duplicate append is a no-op
+    doc["events"].append(event)
+    # Keep the top-level badge fields in sync for the change list (latest review).
+    if event.get("type") == "review":
+        doc["state"] = event.get("state")
+        doc["by"] = event.get("by")
+        doc["at"] = event.get("at")
+    _write_log_atomic(change_dir, doc)
+    return doc
+
+
+def _snapshot_files(change_dir: Path, root: Path) -> dict[str, str]:
+    """Content-hash snapshot of a change's markdown files (store-by-hash)."""
+    snap: dict[str, str] = {}
+    for p in sorted(change_dir.rglob("*.md")):
+        content = _read_text(p)
+        if content is None:
+            continue
+        rel = str(p.relative_to(root))
+        snap[rel] = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return snap
+
+
+def _review_state(change_dir: Path) -> dict | None:
+    """Return a compact review badge {state, note, at} derived from the log."""
+    doc = _read_log(change_dir)
+    events = doc.get("events", [])
+    if not events:
+        # Back-compat: a legacy flat record (pre-event-log) may still carry state.
+        legacy = doc if doc.get("state") else None
+        return {"state": legacy["state"], "at": legacy.get("at")} if legacy else None
+    return {"state": derive_state(events), "at": doc.get("at")}
+
 
 
 def _change_summary(session_id: str, change_dir: Path) -> dict:
@@ -154,30 +212,99 @@ async def get_change(request: Request, session_id: str, name: str):
     }
 
 
+class ReviewComment(BaseModel):
+    id: str
+    section: str = ""
+    path: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    block_text: str = ""
+    block_hash: str = ""
+    comment: str = ""
+
+
 class ReviewBody(BaseModel):
     state: str  # "approved" | "changes_requested" | "commented"
     note: str = ""
+    comments: list[ReviewComment] = []
 
 
 @router.post("/{session_id}/openspec/changes/{name}/review")
 async def post_review(request: Request, session_id: str, name: str, body: ReviewBody):
-    """Persist a durable review record for a change.
+    """Append a review event to the change's append-only log.
 
     The frontend separately sends the agent a tagged chat message; this endpoint
-    only writes the badge so it survives reloads and is visible to the agent.
+    persists the durable review event (with inline comments) so state + history
+    survive reloads and are visible to the agent.
     """
     if body.state not in ("approved", "changes_requested", "commented"):
         raise HTTPException(status_code=400, detail="Invalid review state")
     change_dir = _safe_change_dir(session_id, name)
     if not change_dir.is_dir():
         raise HTTPException(status_code=404, detail="Change not found")
-    record = {
+
+    now = datetime.now(timezone.utc).isoformat()
+    event = {
+        "id": f"rev_{int(time.time() * 1000)}",
+        "type": "review",
+        "at": now,
+        "by": "ian",
         "state": body.state,
-        "note": body.note,
-        "by": "user",
-        "at": datetime.now(timezone.utc).isoformat(),
+        "overall_note": body.note,
+        "comments": [c.model_dump() for c in body.comments],
+        "snapshot_at_review": _snapshot_files(change_dir, _openspec_root(session_id)),
     }
-    (change_dir / ".enclave-review.json").write_text(
-        json.dumps(record, indent=2), encoding="utf-8"
-    )
-    return record
+    _append_event(change_dir, event)
+    return {"ok": True, "review_id": event["id"], "state": derive_state(_read_log(change_dir)["events"])}
+
+
+@router.get("/{session_id}/openspec/changes/{name}/state")
+async def get_state(request: Request, session_id: str, name: str):
+    """Derived review state + per-comment status for a change."""
+    change_dir = _safe_change_dir(session_id, name)
+    if not change_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Change not found")
+    events = _read_log(change_dir).get("events", [])
+    statuses = derive_comment_statuses(events)
+    return {
+        "state": derive_state(events),
+        "comment_statuses": statuses,
+        "events": events,
+    }
+
+
+class RevisionBody(BaseModel):
+    summary: str = ""
+    why: str = ""
+    in_response_to: str = ""
+    related_comment_ids: list[str] = []
+    files_changed: list[str] = []
+
+
+@router.post("/{session_id}/openspec/changes/{name}/revision-log")
+async def post_revision(request: Request, session_id: str, name: str, body: RevisionBody):
+    """Record an agent_revision event (the 'why' a spec changed).
+
+    Called by the agent (via the openspec_revision_log tool) after applying
+    review feedback. The handler snapshots the current files itself — it never
+    trusts caller-supplied content.
+    """
+    change_dir = _safe_change_dir(session_id, name)
+    if not change_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Change not found")
+    now = datetime.now(timezone.utc).isoformat()
+    event = {
+        "id": f"arev_{int(time.time() * 1000)}",
+        "type": "agent_revision",
+        "at": now,
+        "by": "agent",
+        "in_response_to": body.in_response_to or None,
+        "summary": body.summary,
+        "why": body.why,
+        "related_comment_ids": body.related_comment_ids,
+        "files_changed": body.files_changed,
+        "snapshot_after": _snapshot_files(change_dir, _openspec_root(session_id)),
+    }
+    _append_event(change_dir, event)
+    return {"ok": True, "revision_id": event["id"], "state": derive_state(_read_log(change_dir)["events"])}
+

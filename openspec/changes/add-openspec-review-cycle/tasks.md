@@ -2,17 +2,17 @@
 
 ## 1. Event log + derived state (backend)
 
-- [ ] 1.1 Define the event-log schema and an atomic append helper for `.enclave-review.json`
-- [ ] 1.2 Add `review_state.py` with `derive_state(events)` and `derive_comment_statuses(events)`
-- [ ] 1.3 `GET .../openspec/changes/{name}/state` (state + per-comment status view)
-- [ ] 1.4 Extend the review POST to append a `review` event + capture `snapshot_at_review`
+- [x] 1.1 Define the event-log schema and an atomic append helper for `.enclave-review.json`
+- [x] 1.2 Add `review_state.py` with `derive_state(events)` and `derive_comment_statuses(events)`
+- [x] 1.3 `GET .../openspec/changes/{name}/state` (state + per-comment status view)
+- [x] 1.4 Extend the review POST to append a `review` event + capture `snapshot_at_review`
 
 ## 2. Inline commenting (frontend)
 
-- [ ] 2.1 markdown-it `data-line` core rule (incl. fence/table) + normalization
-- [ ] 2.2 Floating comment affordance over `v-html` (hover desktop / tap mobile) via event delegation
-- [ ] 2.3 Capture frozen block context; accumulate draft in `localStorage` with count badges
-- [ ] 2.4 Sticky "Submit review (N)" bar → POST review event + send one tagged chat message
+- [x] 2.1 markdown-it `data-line` core rule (incl. fence/table) + normalization
+- [x] 2.2 Floating comment affordance over `v-html` (hover desktop / tap mobile) via event delegation
+- [x] 2.3 Capture frozen block context; accumulate draft in `localStorage` with count badges
+- [x] 2.4 Sticky "Submit review (N)" bar → POST review event + send one tagged chat message
 
 ## 3. Processing + re-approval
 
