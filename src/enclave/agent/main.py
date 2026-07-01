@@ -3689,6 +3689,124 @@ async def try_init_copilot(
         )
         custom_tools.append(mark_done_tool)
 
+        # Custom tool: openspec_revision_log — record WHY a spec changed after
+        # applying review feedback, closing the OpenSpec review cycle. Writes an
+        # agent_revision event to the change's append-only review log on disk
+        # (Phase A: the openspec/ dir lives in the repo the agent is editing).
+        async def _openspec_revision_log_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            change = (args.get("change") or "").strip()
+            summary = (args.get("summary") or "").strip()
+            if not change or not summary:
+                return ToolResult(
+                    text_result_for_llm="Error: 'change' and 'summary' are required.",
+                    result_type="error",
+                )
+            import time as _time
+            from datetime import datetime as _dt, timezone as _tz
+            try:
+                from enclave.common.openspec_log import snapshot_files, append_event
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"Error: openspec log module unavailable: {e}",
+                    result_type="error",
+                )
+            # Resolve the openspec root: explicit env override, else search upward
+            # from the working directory for an openspec/changes/<change> dir.
+            root = os.environ.get("ENCLAVE_OPENSPEC_ROOT")
+            root_path = Path(root) if root else None
+            if root_path is None:
+                probe = Path(working_directory).resolve()
+                for cand in [probe, *probe.parents]:
+                    if (cand / "openspec" / "changes" / change).is_dir():
+                        root_path = cand
+                        break
+            if root_path is None:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: could not locate openspec/changes/"
+                        f"{change} from {working_directory}. Set ENCLAVE_OPENSPEC_ROOT."
+                    ),
+                    result_type="error",
+                )
+            change_dir = root_path / "openspec" / "changes" / change
+            if not change_dir.is_dir():
+                return ToolResult(
+                    text_result_for_llm=f"Error: change '{change}' not found under {root_path}/openspec/changes.",
+                    result_type="error",
+                )
+            snapshot, blobs = snapshot_files(change_dir, root_path)
+            event = {
+                "id": f"arev_{int(_time.time() * 1000)}",
+                "type": "agent_revision",
+                "at": _dt.now(_tz.utc).isoformat(),
+                "by": "agent",
+                "in_response_to": (args.get("in_response_to") or None),
+                "summary": summary,
+                "why": args.get("why", ""),
+                "related_comment_ids": args.get("related_comment_ids") or [],
+                "files_changed": args.get("files_changed") or [],
+                "resolutions": args.get("resolutions") or [],
+                "snapshot_after": snapshot,
+            }
+            try:
+                append_event(change_dir, event, blobs)
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"Error writing revision log: {e}",
+                    result_type="error",
+                )
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Recorded agent_revision {event['id']} for change '{change}'. "
+                    "The change now returns to the reviewer for re-approval."
+                ),
+            )
+
+        openspec_revision_log_tool = Tool(
+            name="openspec_revision_log",
+            description=(
+                "Record why an OpenSpec spec changed after you applied review "
+                "feedback, closing the review cycle so the change returns to the "
+                "reviewer for re-approval. Call this AFTER editing the spec files "
+                "in response to a review. Provide one resolution per addressed "
+                "comment (or explain a decline)."
+            ),
+            handler=_openspec_revision_log_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "change": {"type": "string", "description": "The change name (folder under openspec/changes/)."},
+                    "summary": {"type": "string", "description": "Short summary of what you changed."},
+                    "why": {"type": "string", "description": "Why the change was made (the reasoning to preserve)."},
+                    "in_response_to": {"type": "string", "description": "The review id being answered (e.g. rev_...), if any."},
+                    "related_comment_ids": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Ids of the review comments this revision addresses.",
+                    },
+                    "files_changed": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Spec files you edited (e.g. proposal.md).",
+                    },
+                    "resolutions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "comment_id": {"type": "string"},
+                                "actionable_intent": {"type": "string"},
+                                "resolution_note": {"type": "string"},
+                            },
+                        },
+                        "description": "Per-comment resolution: the actionable intent + how it was addressed (or why declined).",
+                    },
+                },
+                "required": ["change", "summary"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(openspec_revision_log_tool)
+
         # Custom tool: ask_user — ask the user a question (optionally as a poll)
         async def _ask_user_handler(invocation: object) -> ToolResult:
             args = getattr(invocation, "arguments", {}) or {}
@@ -3765,6 +3883,9 @@ async def try_init_copilot(
             actions = args.get("actions")
             if actions:
                 payload["actions"] = actions
+            decisions = args.get("decisions")
+            if decisions:
+                payload["decisions"] = decisions
             if ipc and ipc.is_connected:
                 await ipc.send(Message(
                     type=MessageType.STRUCTURED_RESPONSE,
@@ -3816,6 +3937,36 @@ async def try_init_copilot(
                             "required": ["label"],
                         },
                         "description": "Call-to-action choices for the user. Each becomes a clickable button.",
+                    },
+                    "decisions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Stable id for this decision (used to key the answer)."},
+                                "question": {"type": "string", "description": "The decision/question text."},
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "label": {"type": "string"},
+                                        },
+                                        "required": ["label"],
+                                    },
+                                    "description": "Selectable options for this decision.",
+                                },
+                                "allowFreeText": {"type": "boolean", "description": "Allow a free-text comment as the answer."},
+                            },
+                            "required": ["id", "question"],
+                        },
+                        "description": (
+                            "A stacked set of INDEPENDENT decisions the user resolves and "
+                            "submits together (each by picking an option or leaving a "
+                            "free-text comment). Use when you need several choices answered "
+                            "in one pass. The user's batched answers come back as one message."
+                        ),
                     },
                     "images": {
                         "type": "array",

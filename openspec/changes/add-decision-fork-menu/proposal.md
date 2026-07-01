@@ -14,15 +14,13 @@ resolvable by picking an option OR leaving a free-text comment, all submitted as
 one batched reply. It is a generic `structured_response` capability — useful
 anywhere the agent faces the user with multiple choices, not just OpenSpec.
 
-## Status: PARKED (spec-only)
+## Status: BUILT
 
-This change is deliberately **not built yet**. It is captured as its own
-independently deliverable change so the idea is preserved, but the current
-priority is shipping the OpenSpec review-cycle vertical slice first. A generic
-form abstraction is best designed against **two** real call-sites; this one will
-be built once a second concrete consumer (beyond OpenSpec review) is in hand.
+Implemented as a generic `structured_response.decisions` field with a batched
+multi-decision form in the web UI. The OpenSpec review flow (and any agent
+facing the user with several choices) is a consumer.
 
-## What changes (when built)
+## What changes
 
 - Extend `structured_response` with an optional `decisions` field parallel to
   `actions`:

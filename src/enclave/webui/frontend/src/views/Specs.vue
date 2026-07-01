@@ -46,7 +46,8 @@
             <button class="btn-sm" @click="pin(selected)" :class="{ pinned: isPinned(selected.id) }">
               {{ isPinned(selected.id) ? '📌 Pinned' : '📌 Pin' }}
             </button>
-            <button class="btn-sm approve" @click="submitReview('approved')">✅ Approve</button>
+            <span v-if="awaitingAgent" class="await-note">⏳ Awaiting agent</span>
+            <button v-if="canApprove" class="btn-sm approve" @click="submitReview('approved')">✅ Approve</button>
           </div>
         </div>
 
@@ -65,6 +66,41 @@
             <div class="md" :data-section="sec.key" :data-path="sec.path" v-html="renderMarkdown(sec.source)"></div>
           </details>
         </div>
+
+        <!-- History / activity timeline: the "why" trail -->
+        <details v-if="timeline.length" class="section history-section">
+          <summary>📜 Review history ({{ timeline.length }})</summary>
+          <div class="timeline">
+            <div v-for="(ev, i) in timeline" :key="i" class="tl-entry" :class="ev.kind">
+              <div class="tl-head">
+                <span class="tl-icon">{{ ev.kind === 'review' ? '👤' : '🤖' }}</span>
+                <span class="tl-title">
+                  <template v-if="ev.kind === 'review'">Review — {{ badgeLabel(ev.state) || ev.state }}</template>
+                  <template v-else>Agent revision</template>
+                </span>
+                <span class="tl-time">{{ fmtTime(ev.at) }}</span>
+              </div>
+              <template v-if="ev.kind === 'review'">
+                <div v-if="ev.note" class="tl-note">{{ ev.note }}</div>
+                <div v-for="c in ev.comments" :key="c.id" class="tl-comment" :class="c.status">
+                  <div class="tl-c-quote" v-if="c.block_text">{{ c.block_text }}</div>
+                  <div class="tl-c-body">
+                    <span class="tl-c-status" :class="c.status">{{ c.status === 'addressed' ? '✓' : '•' }}</span>
+                    {{ c.comment }}
+                  </div>
+                  <div v-if="c.resolution" class="tl-c-resolution">
+                    ↳ <strong>Agent:</strong> {{ c.resolution.resolution_note || c.resolution.actionable_intent || 'addressed' }}
+                  </div>
+                </div>
+              </template>
+              <template v-else>
+                <div v-if="ev.summary" class="tl-note">{{ ev.summary }}</div>
+                <div v-if="ev.why" class="tl-why"><strong>Why:</strong> {{ ev.why }}</div>
+                <div v-if="ev.files.length" class="tl-files">Changed: {{ ev.files.join(', ') }}</div>
+              </template>
+            </div>
+          </div>
+        </details>
 
         <!-- Inline comment editor (bottom sheet — phone-friendly, no offset math) -->
         <div v-if="activeComment" class="comment-editor">
@@ -109,6 +145,8 @@ const loading = ref(false)
 const selected = ref(null)
 const detail = ref({ proposal: '', design: '', tasks: '', specs: {} })
 const derivedState = ref('none')
+const events = ref([])
+const commentStatuses = ref({})
 const sectionsEl = ref(null)
 const ceInput = ref(null)
 
@@ -149,6 +187,45 @@ const STATE_META = {
 const stateLabel = computed(() => STATE_META[derivedState.value]?.label || '')
 const stateClass = computed(() => STATE_META[derivedState.value]?.cls || '')
 function badgeLabel(state) { return STATE_META[state]?.label || '' }
+
+// State-driven CTA: what actions make sense right now.
+const canApprove = computed(() => ['none', 'commented', 'revised_pending_review'].includes(derivedState.value))
+const awaitingAgent = computed(() => derivedState.value === 'changes_requested')
+
+// Resolution lookup: comment id -> {resolution_note, actionable_intent} from the
+// latest agent_revision that resolved it.
+const resolutionByComment = computed(() => {
+  const map = {}
+  for (const e of events.value) {
+    if (e.type !== 'agent_revision') continue
+    for (const r of (e.resolutions || [])) {
+      if (r.comment_id) map[r.comment_id] = { ...r, at: e.at }
+    }
+  }
+  return map
+})
+
+// History timeline: review + agent_revision events, newest first, with the
+// comments (and their resolutions) attached to each review.
+const timeline = computed(() => {
+  return [...events.value].reverse().map(e => {
+    if (e.type === 'review') {
+      return {
+        kind: 'review', at: e.at, state: e.state, note: e.overall_note,
+        comments: (e.comments || []).map(c => ({
+          ...c,
+          status: commentStatuses.value[c.id] || 'open',
+          resolution: resolutionByComment.value[c.id] || null,
+        })),
+      }
+    }
+    return {
+      kind: 'revision', at: e.at, summary: e.summary, why: e.why,
+      files: e.files_changed || [],
+    }
+  })
+})
+function fmtTime(iso) { try { return new Date(iso).toLocaleString() } catch { return iso } }
 
 async function load() {
   if (!selectedSession.value) { changes.value = []; return }
@@ -192,7 +269,9 @@ async function refreshState(id) {
   try {
     const s = await api.getOpenSpecState(selectedSession.value, id)
     derivedState.value = s.state || 'none'
-  } catch { derivedState.value = 'none' }
+    events.value = s.events || []
+    commentStatuses.value = s.comment_statuses || {}
+  } catch { derivedState.value = 'none'; events.value = []; commentStatuses.value = {} }
 }
 
 async function refreshDiff(id) {
@@ -422,4 +501,25 @@ watch([changedLines, showChanges], () => nextTick(decorate))
 .submit-bar .draft-count { font-size: 0.78rem; color: var(--accent, #7c9eff); font-weight: 600; white-space: nowrap; }
 .submit-bar .overall-note { flex: 1; min-width: 140px; width: auto; }
 .btn-sm.ghost { opacity: 0.7; }
+.await-note { font-size: 0.75rem; color: var(--text-muted, #999); }
+
+/* Review history timeline */
+.history-section .timeline { padding: 0.3rem 0 0.6rem; }
+.tl-entry { border-left: 2px solid var(--border, #333); padding: 0.3rem 0 0.5rem 0.7rem; margin-left: 0.3rem; }
+.tl-entry.review { border-left-color: #7c9eff; }
+.tl-entry.revision { border-left-color: #4ade80; }
+.tl-head { display: flex; align-items: baseline; gap: 0.5rem; font-size: 0.82rem; }
+.tl-title { font-weight: 600; }
+.tl-time { color: var(--text-muted, #999); font-size: 0.72rem; margin-left: auto; }
+.tl-note { font-size: 0.82rem; margin: 0.25rem 0; }
+.tl-why { font-size: 0.8rem; color: var(--text-muted, #bbb); margin: 0.2rem 0; }
+.tl-files { font-size: 0.72rem; color: var(--text-muted, #999); font-family: monospace; }
+.tl-comment { margin: 0.35rem 0 0.35rem 0.5rem; padding-left: 0.5rem; border-left: 2px solid var(--border, #333); }
+.tl-comment.addressed { border-left-color: #4ade80; }
+.tl-c-quote { font-size: 0.7rem; color: var(--text-muted, #888); white-space: pre-wrap; max-height: 3em; overflow-y: auto; margin-bottom: 0.15rem; }
+.tl-c-body { font-size: 0.82rem; }
+.tl-c-status { font-weight: 700; }
+.tl-c-status.addressed { color: #4ade80; }
+.tl-c-status.open { color: #fb923c; }
+.tl-c-resolution { font-size: 0.78rem; color: #4ade80; margin-top: 0.15rem; padding-left: 0.8rem; }
 </style>

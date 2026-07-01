@@ -16,20 +16,20 @@
 
 ## 3. Processing + re-approval
 
-- [ ] 3.1 Extend `openspec_revision_log` with `resolutions[]`; snapshot files from disk; idempotent
-- [ ] 3.2 Prompt instruction: call the tool with one resolution per comment after applying feedback
-- [ ] 3.3 State badge + dynamic CTA (Review changes / Approve / Request more) from derived state
-- [ ] 3.4 Per-comment view: verbatim comment + agent resolution + addressed/stale indicators
+- [x] 3.1 Extend `openspec_revision_log` with `resolutions[]`; snapshot files from disk; idempotent
+- [x] 3.2 Prompt instruction: call the tool with one resolution per comment after applying feedback
+- [x] 3.3 State badge + dynamic CTA (Review changes / Approve / Request more) from derived state
+- [x] 3.4 Per-comment view: verbatim comment + agent resolution + addressed/stale indicators
 
 ## 4. Edit highlighting
 
-- [ ] 4.1 Snapshot diff endpoint (`diff?since=review`) using `jsdiff diffLines` on normalized markdown
-- [ ] 4.2 Post-render decoration: `.changed` class on intersecting `data-line` blocks + CSS
-- [ ] 4.3 "Show changes since I last reviewed" toggle; default-on when pending re-approval
+- [x] 4.1 Snapshot diff endpoint (`diff?since=review`) using `jsdiff diffLines` on normalized markdown
+- [x] 4.2 Post-render decoration: `.changed` class on intersecting `data-line` blocks + CSS
+- [x] 4.3 "Show changes since I last reviewed" toggle; default-on when pending re-approval
 
 ## 5. History timeline
 
-- [ ] 5.1 History/Activity section rendering `review` + `agent_revision` events reverse-chronologically
+- [x] 5.1 History/Activity section rendering `review` + `agent_revision` events reverse-chronologically
 
 ## 6. Wrap up
 

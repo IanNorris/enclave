@@ -136,6 +136,32 @@
                 <button class="action-btn" @click="sendActionReply(action.label)">{{ action.label }}</button>
               </div>
             </div>
+            <!-- Decision fork menu: stacked independent decisions, batched submit -->
+            <div v-if="turn.structured.decisions?.length" class="decision-menu">
+              <div v-for="(dec, di) in turn.structured.decisions" :key="dec.id || di" class="decision">
+                <div class="decision-q">{{ dec.question }}</div>
+                <div v-if="dec.options?.length" class="decision-opts">
+                  <button
+                    v-for="(opt, oi) in dec.options" :key="opt.id || oi"
+                    class="decision-opt"
+                    :class="{ selected: decisionAnswers[decKey(turn)][dec.id]?.selected === (opt.id || opt.label) }"
+                    @click="pickOption(turn, dec, opt)"
+                  >{{ opt.label }}</button>
+                </div>
+                <input
+                  v-if="dec.allowFreeText"
+                  class="decision-freetext"
+                  :placeholder="dec.options?.length ? 'or comment…' : 'your answer…'"
+                  :value="decisionAnswers[decKey(turn)][dec.id]?.comment || ''"
+                  @input="setComment(turn, dec, $event.target.value)"
+                />
+              </div>
+              <button
+                class="decision-submit"
+                :disabled="decisionSubmitted[decKey(turn)] || !decisionAnyAnswered(turn)"
+                @click="submitDecisions(turn)"
+              >{{ decisionSubmitted[decKey(turn)] ? 'Submitted ✓' : 'Submit decisions' }}</button>
+            </div>
             <div class="message-meta">
               <span class="sender">Agent</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
@@ -1572,6 +1598,55 @@ function sendActionReply(label) {
   send()
 }
 
+// ─── Decision fork menu: batched multi-decision answers ───
+// Answers are keyed per-card (turn) then per-decision-id. A Proxy-backed default
+// ensures decisionAnswers[cardKey] always exists for the template.
+const decisionAnswers = reactive({})
+const decisionSubmitted = reactive({})
+function decKey(turn) {
+  const k = String(turn.turn_index ?? turn.timestamp ?? 'live')
+  if (!decisionAnswers[k]) decisionAnswers[k] = {}
+  return k
+}
+function pickOption(turn, dec, opt) {
+  const k = decKey(turn)
+  const val = opt.id || opt.label
+  const cur = decisionAnswers[k][dec.id]
+  // Toggle off if re-picking the same option.
+  decisionAnswers[k][dec.id] = { ...(cur || {}), selected: cur?.selected === val ? null : val }
+}
+function setComment(turn, dec, text) {
+  const k = decKey(turn)
+  decisionAnswers[k][dec.id] = { ...(decisionAnswers[k][dec.id] || {}), comment: text }
+}
+function decisionAnyAnswered(turn) {
+  const ans = decisionAnswers[decKey(turn)] || {}
+  return Object.values(ans).some(a => a && (a.selected || (a.comment && a.comment.trim())))
+}
+function submitDecisions(turn) {
+  const k = decKey(turn)
+  if (decisionSubmitted[k]) return
+  const decs = turn.structured?.decisions || []
+  const ans = decisionAnswers[k] || {}
+  const lines = ['[Decision responses]', '']
+  for (const d of decs) {
+    const a = ans[d.id] || {}
+    const label = optLabel(d, a.selected)
+    const parts = []
+    if (label) parts.push(label)
+    if (a.comment && a.comment.trim()) parts.push(`"${a.comment.trim()}"`)
+    lines.push(`- ${d.question} → ${parts.length ? parts.join(' — ') : '(no preference)'}`)
+  }
+  decisionSubmitted[k] = true
+  draft.value = lines.join('\n')
+  send()
+}
+function optLabel(dec, selected) {
+  if (!selected) return ''
+  const o = (dec.options || []).find(o => (o.id || o.label) === selected)
+  return o ? o.label : selected
+}
+
 function workspaceFileUrl(filePath) {
   // Strip leading /workspace/ prefix if present, then build the proxy URL
   // Each path segment is individually encoded to preserve slashes
@@ -2201,6 +2276,59 @@ function toggleCardFusion(ti, ri) {
   background: rgba(74, 222, 128, 0.2);
   box-shadow: 0 0 8px rgba(74, 222, 128, 0.2);
 }
+
+/* Decision fork menu */
+.decision-menu {
+  margin-top: 0.6rem;
+  border-top: 1px solid var(--border, #333);
+  padding-top: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+.decision-q { font-size: 0.88rem; font-weight: 600; margin-bottom: 0.35rem; }
+.decision-opts { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.35rem; }
+.decision-opt {
+  background: var(--bg-main, #15151a);
+  border: 1px solid var(--border, #333);
+  color: inherit;
+  padding: 0.35rem 0.8rem;
+  border-radius: 16px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: all 0.12s;
+}
+.decision-opt:hover { border-color: var(--accent, #7c9eff); }
+.decision-opt.selected {
+  background: var(--accent, #7c9eff);
+  color: #0f0f14;
+  border-color: var(--accent, #7c9eff);
+  font-weight: 600;
+}
+.decision-freetext {
+  width: 100%;
+  background: var(--bg-main, #15151a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  color: inherit;
+  padding: 0.4rem 0.6rem;
+  font-family: inherit;
+  font-size: 0.82rem;
+  box-sizing: border-box;
+}
+.decision-submit {
+  align-self: flex-start;
+  background: rgba(124, 158, 255, 0.15);
+  border: 1px solid var(--accent, #7c9eff);
+  color: var(--accent, #7c9eff);
+  padding: 0.45rem 1.1rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.decision-submit:disabled { opacity: 0.5; cursor: default; }
+.decision-submit:not(:disabled):hover { background: rgba(124, 158, 255, 0.28); }
 
 .segment-response {
   margin: 0.4rem 0;

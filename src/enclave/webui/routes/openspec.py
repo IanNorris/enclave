@@ -24,6 +24,9 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from enclave.webui.routes.review_state import derive_state, derive_comment_statuses
+from enclave.common.openspec_log import (
+    read_log, write_log_atomic, append_event, snapshot_files, content_hash,
+)
 
 router = APIRouter()
 
@@ -93,73 +96,23 @@ def _task_progress(tasks_md: str | None) -> dict:
 
 
 def _read_log(change_dir: Path) -> dict:
-    """Load the append-only review log, tolerating absence/corruption."""
-    raw = _read_text(change_dir / _REVIEW_FILE)
-    if not raw:
-        return {"version": 1, "events": []}
-    try:
-        doc = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"version": 1, "events": []}
-    if "events" not in doc or not isinstance(doc["events"], list):
-        doc["events"] = []
-    return doc
+    return read_log(change_dir)
 
 
 def _write_log_atomic(change_dir: Path, doc: dict) -> None:
-    """Write the log via temp-file + rename so a concurrent read never sees a
-    half-written file."""
-    target = change_dir / _REVIEW_FILE
-    tmp = change_dir / f".{_REVIEW_FILE}.{os.getpid()}.{int(time.time()*1000)}.tmp"
-    tmp.write_text(json.dumps(doc, indent=2), encoding="utf-8")
-    os.replace(str(tmp), str(target))
+    write_log_atomic(change_dir, doc)
 
 
 def _append_event(change_dir: Path, event: dict, blobs: dict[str, str] | None = None) -> dict:
-    """Append one event to the log (idempotent on event id) and return the doc.
-
-    ``blobs`` (hash -> content) are merged into the doc's content-addressed blob
-    store so snapshots referenced by the event can be reconstructed for diffing.
-    """
-    doc = _read_log(change_dir)
-    if event.get("id") and any(e.get("id") == event["id"] for e in doc["events"]):
-        return doc  # idempotent: duplicate append is a no-op
-    if blobs:
-        store = doc.setdefault("blobs", {})
-        store.update(blobs)
-    doc["events"].append(event)
-    # Keep the top-level badge fields in sync for the change list (latest review).
-    if event.get("type") == "review":
-        doc["state"] = event.get("state")
-        doc["by"] = event.get("by")
-        doc["at"] = event.get("at")
-    _write_log_atomic(change_dir, doc)
-    return doc
+    return append_event(change_dir, event, blobs)
 
 
 def _hash(content: str) -> str:
-    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return content_hash(content)
 
 
 def _snapshot_files(change_dir: Path, root: Path) -> tuple[dict[str, str], dict[str, str]]:
-    """Snapshot a change's markdown files.
-
-    Returns ``(snapshot, blobs)`` where ``snapshot`` maps each file path to a
-    content hash and ``blobs`` maps that hash to the content. Blobs are stored
-    content-addressed in the log (deduped across cycles) so an edit diff can be
-    computed against the exact reviewed content.
-    """
-    snap: dict[str, str] = {}
-    blobs: dict[str, str] = {}
-    for p in sorted(change_dir.rglob("*.md")):
-        content = _read_text(p)
-        if content is None:
-            continue
-        rel = str(p.relative_to(root))
-        h = _hash(content)
-        snap[rel] = h
-        blobs[h] = content
-    return snap, blobs
+    return snapshot_files(change_dir, root)
 
 
 def _review_state(change_dir: Path) -> dict | None:
@@ -394,6 +347,7 @@ class RevisionBody(BaseModel):
     in_response_to: str = ""
     related_comment_ids: list[str] = []
     files_changed: list[str] = []
+    resolutions: list[dict] = []
 
 
 @router.post("/{session_id}/openspec/changes/{name}/revision-log")
@@ -419,6 +373,7 @@ async def post_revision(request: Request, session_id: str, name: str, body: Revi
         "why": body.why,
         "related_comment_ids": body.related_comment_ids,
         "files_changed": body.files_changed,
+        "resolutions": body.resolutions,
         "snapshot_after": snapshot,
     }
     _append_event(change_dir, event, blobs)
