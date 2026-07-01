@@ -13,7 +13,7 @@
 
 ## 3. Approve the legacy change
 
-- [ ] 3.1 One-time in-UI Approve of add-openspec-ui (it then derives Done)
+- [x] 3.1 One-time in-UI Approve of add-openspec-ui (it then derives Done)
 
 ## 4. Archive action (rides the container rebuild)
 
@@ -23,4 +23,4 @@
 
 ## 5. Wrap up
 
-- [ ] 5.1 Verify: finished change shows Done, archive moves it to the Archived section
+- [x] 5.1 Verify: finished change shows Done, archive moves it to the Archived section
