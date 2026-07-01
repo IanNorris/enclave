@@ -17,9 +17,9 @@
 
 ## 4. Archive action (rides the container rebuild)
 
-- [ ] 4.1 Add the OpenSpec CLI to the agent container image
-- [ ] 4.2 `openspec_archive` agent tool running `openspec archive <name> --json -y`, surfacing validation failures
-- [ ] 4.3 "Archive" button on done changes, triggered via the agent path; UI refreshes on completion
+- [x] 4.1 Add the OpenSpec CLI to the agent container image
+- [x] 4.2 `openspec_archive` agent tool running `openspec archive <name> --json -y`, surfacing validation failures
+- [x] 4.3 "Archive" button on done changes, triggered via the agent path; UI refreshes on completion
 
 ## 5. Wrap up
 

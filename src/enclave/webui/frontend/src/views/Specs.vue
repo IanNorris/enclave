@@ -82,7 +82,9 @@
               {{ isPinned(selected.id) ? '📌 Pinned' : '📌 Pin' }}
             </button>
             <span v-if="awaitingAgent" class="await-note">⏳ Awaiting agent</span>
-            <button v-if="canApprove" class="btn-sm approve" @click="submitReview('approved')">✅ Approve</button>
+            <button v-if="canApprove && !isArchivedSel" class="btn-sm approve" @click="submitReview('approved')">✅ Approve</button>
+            <button v-if="selected.lifecycle === 'done'" class="btn-sm" @click="archiveChange">🗄️ Archive</button>
+            <span v-if="isArchivedSel" class="await-note">🗄️ Archived (read-only)</span>
           </div>
         </div>
 
@@ -238,6 +240,17 @@ function archivedName(id) { return id.replace(/^\d{4}-\d{2}-\d{2}-/, '') }
 // State-driven CTA: what actions make sense right now.
 const canApprove = computed(() => ['none', 'commented', 'revised_pending_review'].includes(derivedState.value))
 const awaitingAgent = computed(() => derivedState.value === 'changes_requested')
+const isArchivedSel = computed(() => selected.value?.lifecycle === 'archived')
+
+// Archive is agent-mediated: send a tagged message the agent acts on with its
+// openspec_archive tool (the web process never runs the openspec CLI).
+function archiveChange() {
+  if (!selected.value) return
+  const name = selected.value.id
+  const msg = `[OpenSpec] Please archive the change '${name}' (it is done and approved). Run openspec_archive(change='${name}') and commit the resulting spec changes.`
+  localStorage.setItem(`enclave:${selectedSession.value}:pendingFeedback`, msg)
+  router.push('/chat')
+}
 
 // Resolution lookup: comment id -> {resolution_note, actionable_intent} from the
 // latest agent_revision that resolved it.
