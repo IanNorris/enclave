@@ -99,6 +99,7 @@ const tabs = [
   { key: 'chat', label: 'Chat', icon: '💬', to: '/chat', names: ['chat'] },
   { key: 'bugs', label: 'Bugs', icon: '🐛', to: '/bugs', names: ['bugs', 'bug-detail'] },
   { key: 'artifacts', label: 'Artifacts', icon: '📎', to: '/artifacts', names: ['artifacts', 'artifact-preview'] },
+  { key: 'specs', label: 'Specs', icon: '📋', to: '/specs', names: ['specs'] },
   { key: 'timeline', label: 'Timeline', icon: '📅', to: '/timeline', names: ['timeline'] },
   { key: 'settings', label: 'Session Settings', icon: '⚙', to: '/session/settings', names: ['session-settings'] },
 ]

@@ -76,7 +76,24 @@
 
         <!-- Normal content view -->
         <template v-else>
-          <div v-if="selectedArtifact.filename.endsWith('.md')" ref="renderedEl" class="artifact-rendered" v-html="renderMarkdown(artifactContent)"></div>
+          <!-- Interactive HTML artifact: rendered in a sandboxed iframe.
+               sandbox="allow-scripts" WITHOUT allow-same-origin gives the frame
+               an opaque origin: agent-generated JS runs for interactivity but
+               cannot read the auth token, cookies, localStorage, or the parent
+               DOM, and cannot make credentialed same-origin requests. -->
+          <div v-if="isHtmlArtifact(selectedArtifact.filename)" class="artifact-html-wrap">
+            <div class="artifact-html-note">
+              ⚡ Interactive artifact — runs sandboxed (no access to your session, token, or cookies).
+            </div>
+            <iframe
+              class="artifact-html-frame"
+              sandbox="allow-scripts allow-popups allow-forms"
+              :srcdoc="artifactContent"
+              referrerpolicy="no-referrer"
+              title="Interactive artifact"
+            ></iframe>
+          </div>
+          <div v-else-if="selectedArtifact.filename.endsWith('.md')" ref="renderedEl" class="artifact-rendered" v-html="renderMarkdown(artifactContent)"></div>
           <pre v-else>{{ artifactContent }}</pre>
         </template>
       </div>
@@ -152,8 +169,18 @@ function authArtifactUrl(filename) {
   return `${base}?token=${encodeURIComponent(token)}`
 }
 
+function authRawArtifactUrl(filename) {
+  const token = localStorage.getItem('enclave_token')
+  const base = api.rawArtifactUrl(selectedSession.value, filename)
+  return `${base}&token=${encodeURIComponent(token)}`
+}
+
 function isTextArtifact(filename) {
   return /\.(md|txt|json|yaml|yml|csv|log)$/i.test(filename || '')
+}
+
+function isHtmlArtifact(filename) {
+  return /\.html?$/i.test(filename || '')
 }
 
 function toggleFileList() {
@@ -190,6 +217,11 @@ async function viewArtifact(art) {
       const data = await api.getArtifactContent(selectedSession.value, art.filename)
       artifactContent.value = data.content || ''
       nextTick(processMermaid)
+    } else if (isHtmlArtifact(art.filename)) {
+      // Fetch the HTML as text in the parent (authed) and hand it to the
+      // sandboxed iframe via srcdoc, so the token never enters the frame.
+      const resp = await fetch(authRawArtifactUrl(art.filename))
+      artifactContent.value = await resp.text()
     } else {
       window.open(authArtifactUrl(art.filename), '_blank')
       selectedArtifact.value = null
@@ -493,6 +525,26 @@ function formatSize(bytes) {
   line-height: 1.6;
   max-height: 700px;
   overflow-y: auto;
+}
+.artifact-html-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.artifact-html-note {
+  font-size: 0.75rem;
+  color: var(--text-muted, #999);
+  background: var(--bg-main, #15151a);
+  border: 1px solid var(--border, #333);
+  border-radius: var(--radius-sm, 6px);
+  padding: 0.3rem 0.6rem;
+}
+.artifact-html-frame {
+  width: 100%;
+  height: 700px;
+  border: 1px solid var(--border, #333);
+  border-radius: var(--radius-sm, 6px);
+  background: #fff;
 }
 .artifact-rendered :deep(h1) { font-size: 1.3rem; margin: 0.5rem 0; }
 .artifact-rendered :deep(h2) { font-size: 1.1rem; margin: 0.5rem 0; }

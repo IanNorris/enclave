@@ -68,12 +68,18 @@ def create_app(config: EnclaveConfig | None = None) -> FastAPI:
     app.include_router(auth_router)
 
     # Protected API routers — require valid JWT
-    from enclave.webui.routes import asks, bugs, chat, fusion, memories, notifications, panel, schedules, sessions
+    from enclave.webui.routes import asks, bugs, chat, fusion, memories, notifications, openspec, panel, schedules, sessions
 
     app.include_router(
         sessions.router,
         prefix="/api/sessions",
         tags=["sessions"],
+        dependencies=[Depends(get_current_user)],
+    )
+    app.include_router(
+        openspec.router,
+        prefix="/api/sessions",
+        tags=["openspec"],
         dependencies=[Depends(get_current_user)],
     )
     # Artifact file download accepts ?token= query param (browser links can't send headers)

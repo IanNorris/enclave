@@ -40,6 +40,7 @@ async function request(path, options = {}) {
 export const api = {
   // Sessions
   getSessions: () => request('/sessions'),
+  getActivity: () => request('/sessions/activity'),
   getProfiles: () => request('/sessions/profiles'),
   createSession: (name, profile = '') => request('/sessions', {
     method: 'POST',
@@ -119,6 +120,17 @@ export const api = {
     }),
   artifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}`,
   rawArtifactUrl: (id, filename) => `/api/sessions/${id}/artifacts/${filename}?raw=1`,
+
+  // OpenSpec changes
+  getOpenSpecChanges: (id) => request(`/sessions/${id}/openspec/changes`),
+  getOpenSpecChange: (id, name) => request(`/sessions/${id}/openspec/changes/${name}`),
+  getOpenSpecState: (id, name) => request(`/sessions/${id}/openspec/changes/${name}/state`),
+  getOpenSpecDiff: (id, name) => request(`/sessions/${id}/openspec/changes/${name}/diff`),
+  postOpenSpecReview: (id, name, state, note = '', comments = []) =>
+    request(`/sessions/${id}/openspec/changes/${name}/review`, {
+      method: 'POST',
+      body: JSON.stringify({ state, note, comments }),
+    }),
 
   // Deferred Asks
   getAsks: (sessionId, status = 'pending') => {

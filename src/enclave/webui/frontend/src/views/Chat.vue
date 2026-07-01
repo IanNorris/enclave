@@ -40,13 +40,18 @@
 
         <!-- Completed turns from SQLite -->
         <div v-for="(turn, idx) in turns" :key="turn.turn_index ?? `m-${idx}`" class="turn">
-          <div v-if="turn.user_message" class="message user-message">
+          <div v-if="turn.user_message || (turn.user_images && turn.user_images.length)" class="message user-message">
             <div class="message-meta">
               <span class="sender">User</span>
               <span v-if="turn.source === 'queued'" class="queued-badge">queued</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
             </div>
-            <div class="message-body" v-html="renderMarkdown(turn.user_message)"></div>
+            <div v-if="turn.user_images && turn.user_images.length" class="user-images">
+              <img v-for="(img, ii) in turn.user_images" :key="ii"
+                   :src="userImageUrl(img)"
+                   class="user-img clickable-img" @click="openLightbox(userImageUrl(img))" />
+            </div>
+            <div v-if="turn.user_message" class="message-body" v-html="renderMarkdown(turn.user_message)"></div>
           </div>
 
           <!-- Persisted event segments for this turn (tool calls interleaved with responses) -->
@@ -130,6 +135,32 @@
                      class="action-img clickable-img" @click="openLightbox(workspaceFileUrl(action.image))" />
                 <button class="action-btn" @click="sendActionReply(action.label)">{{ action.label }}</button>
               </div>
+            </div>
+            <!-- Decision fork menu: stacked independent decisions, batched submit -->
+            <div v-if="turn.structured.decisions?.length" class="decision-menu">
+              <div v-for="(dec, di) in turn.structured.decisions" :key="dec.id || di" class="decision">
+                <div class="decision-q">{{ dec.question }}</div>
+                <div v-if="dec.options?.length" class="decision-opts">
+                  <button
+                    v-for="(opt, oi) in dec.options" :key="opt.id || oi"
+                    class="decision-opt"
+                    :class="{ selected: decisionAnswers[decKey(turn)][dec.id]?.selected === (opt.id || opt.label) }"
+                    @click="pickOption(turn, dec, opt)"
+                  >{{ opt.label }}</button>
+                </div>
+                <input
+                  v-if="dec.allowFreeText"
+                  class="decision-freetext"
+                  :placeholder="dec.options?.length ? 'or comment…' : 'your answer…'"
+                  :value="decisionAnswers[decKey(turn)][dec.id]?.comment || ''"
+                  @input="setComment(turn, dec, $event.target.value)"
+                />
+              </div>
+              <button
+                class="decision-submit"
+                :disabled="decisionSubmitted[decKey(turn)] || !decisionAnyAnswered(turn)"
+                @click="submitDecisions(turn)"
+              >{{ decisionSubmitted[decKey(turn)] ? 'Submitted ✓' : 'Submit decisions' }}</button>
             </div>
             <div class="message-meta">
               <span class="sender">Agent</span>
@@ -356,9 +387,10 @@
         <input type="file" ref="chatFile" style="display:none" @change="attachFiles" multiple accept="image/*,application/pdf,text/*" />
         <textarea
           v-model="draft"
-          placeholder="Send a message… (paste or drop images)"
-          @keydown.enter.exact.prevent="send"
+          :placeholder="composerPlaceholder"
+          @keydown.enter.exact="onEnterKey"
           @keydown.shift.enter.exact=""
+          @input="autoGrow"
           @paste="onPaste"
           rows="1"
           ref="inputEl"
@@ -372,8 +404,15 @@
           :class="outerOrientation"
           @pointerdown="startOuterDrag"
         ><div class="divider-grip"></div></div>
+        <div v-if="pinnedSpec" class="outer-doc spec-pin-panel" :style="docPaneStyle">
+          <div class="doc-list-head">
+            <span>📌 {{ pinnedSpec.title }}</span>
+            <button class="doc-panel-close" title="Unpin" @click="unpinSpec">✕</button>
+          </div>
+          <div class="spec-pin-body md" v-html="pinnedSpecHtml"></div>
+        </div>
         <DocumentPane
-          v-if="openDoc"
+          v-else-if="openDoc"
           class="outer-doc"
           :style="docPaneStyle"
           :session="selectedSession"
@@ -484,6 +523,14 @@ const docPanelOpen = ref(false)
 const outerOrientation = ref(localStorage.getItem('enclave_outer_orientation') || 'horizontal')
 const outerSize = ref(parseFloat(localStorage.getItem('enclave_outer_size')) || 58) // % for chat pane
 const isMobilePortrait = ref(false)
+// Touch / on-screen-keyboard devices: Enter inserts a newline (the Send button
+// sends) since there's no easy Shift+Enter. Also drives the smaller line cap.
+const isCoarsePointer = ref(false)
+const isMobile = computed(() => isMobilePortrait.value || isCoarsePointer.value)
+const composerPlaceholder = computed(() =>
+  isMobile.value
+    ? 'Send a message…'
+    : 'Send a message… (Enter to send, Shift+Enter for newline)')
 const docRefreshTick = ref(0) // bumped on agent activity → DocumentPane re-checks for external changes
 let _mqlPortrait = null
 
@@ -528,6 +575,44 @@ function closeDocPanel() {
   docPanelOpen.value = false
   openDoc.value = ''
   if (selectedSession.value) localStorage.removeItem(docStorageKey(selectedSession.value))
+}
+
+// ─── Pinned OpenSpec spec (shown in the same pull-out panel) ───
+const pinnedSpec = ref(null)        // { changeId, path, title }
+const pinnedSpecHtml = ref('')
+function pinnedSpecKey() { return `enclave:${selectedSession.value}:pinnedSpec` }
+async function restorePinnedSpec() {
+  pinnedSpec.value = null
+  pinnedSpecHtml.value = ''
+  if (!selectedSession.value) return
+  let saved = null
+  try { saved = JSON.parse(localStorage.getItem(pinnedSpecKey()) || 'null') } catch { saved = null }
+  if (!saved || !saved.changeId) return
+  pinnedSpec.value = saved
+  docPanelOpen.value = true
+  try {
+    const d = await api.getOpenSpecChange(selectedSession.value, saved.changeId)
+    // Show the proposal by default; fall back to whatever exists.
+    const body = d.proposal || d.design || d.tasks || ''
+    pinnedSpecHtml.value = renderMarkdown(body)
+  } catch { pinnedSpecHtml.value = '<p class="muted">Could not load spec.</p>' }
+}
+function unpinSpec() {
+  if (selectedSession.value) localStorage.removeItem(pinnedSpecKey())
+  pinnedSpec.value = null
+  pinnedSpecHtml.value = ''
+  if (!openDoc.value) docPanelOpen.value = false
+}
+
+// ─── Pending OpenSpec feedback handoff (from the Specs tab) ───
+function flushPendingFeedback() {
+  if (!selectedSession.value) return
+  const key = `enclave:${selectedSession.value}:pendingFeedback`
+  const msg = localStorage.getItem(key)
+  if (!msg) return
+  localStorage.removeItem(key)
+  draft.value = msg
+  send()
 }
 function toggleOuterOrientation() {
   outerOrientation.value = outerOrientation.value === 'horizontal' ? 'vertical' : 'horizontal'
@@ -590,6 +675,7 @@ function loadDraft(id) {
 }
 watch(draft, (v) => {
   const id = selectedSession.value
+  nextTick(autoGrow)
   if (!id) return
   if (v) localStorage.setItem(draftKey(id), v)
   else localStorage.removeItem(draftKey(id))
@@ -706,14 +792,37 @@ onMounted(async () => {
   _mqlPortrait.addEventListener('change', applyPortrait)
   _mqlPortrait._handler = applyPortrait
 
+  // Touch / on-screen-keyboard devices use Enter-for-newline.
+  try { isCoarsePointer.value = window.matchMedia('(pointer: coarse)').matches } catch { /* ignore */ }
+
   restoreOpenDoc()
+  restorePinnedSpec()
   if (selectedSession.value) {
     loadHistory()
     loadDocList()
+    seedAgentState(selectedSession.value)
+    flushPendingFeedback()
   }
   loadDraft(selectedSession.value)
+  nextTick(autoGrow)
   window.addEventListener('keydown', onLightboxKey)
+  window.addEventListener('keydown', onTypeToFocus)
 })
+
+// Start typing anywhere (no field focused) to jump straight into the composer,
+// so the keystroke lands in the message box without a manual click.
+function onTypeToFocus(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return
+  if (e.key == null || e.key.length !== 1) return  // ignore Enter, arrows, F-keys…
+  if (!selectedSession.value) return
+  if (lightboxImage.value) return  // don't steal keys from the image viewer
+  const ae = document.activeElement
+  const tag = ae && ae.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (ae && ae.isContentEditable)) return
+  const el = inputEl.value
+  if (!el) return
+  el.focus()  // focus during keydown so the character is inserted by the browser
+}
 
 // Attach a MutationObserver to the messages container so mermaid diagrams are
 // rendered whenever new content is injected via v-html (history, live stream,
@@ -733,6 +842,7 @@ onUnmounted(() => {
   if (_mermaidTimer) clearTimeout(_mermaidTimer)
   pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
   window.removeEventListener('keydown', onLightboxKey)
+  window.removeEventListener('keydown', onTypeToFocus)
   if (_mqlPortrait && _mqlPortrait._handler) {
     _mqlPortrait.removeEventListener('change', _mqlPortrait._handler)
     _mqlPortrait = null
@@ -755,9 +865,25 @@ watch(selectedSession, (newVal) => {
   sending.value = false
   docPanelOpen.value = false
   restoreOpenDoc()
+  restorePinnedSpec()
   loadDraft(newVal)
-  if (newVal) { loadHistory(); loadDocList() }
+  if (newVal) { loadHistory(); loadDocList(); seedAgentState(newVal); flushPendingFeedback() }
 })
+
+// Seed the live status float from the orchestrator's current activity snapshot
+// so opening a session that is mid-tool-call (e.g. a multi-minute fusion run
+// that emits one tool_start then goes quiet) shows a working indicator instead
+// of appearing idle until the next streamed event.
+async function seedAgentState(sessionId) {
+  try {
+    const resp = await api.getActivity()
+    if (sessionId !== selectedSession.value) return  // session changed mid-fetch
+    const state = resp?.states?.[sessionId]
+    if (state && state !== 'idle' && agentState.value === 'unknown') {
+      setAgentState(state)
+    }
+  } catch { /* ignore */ }
+}
 
 function clearLiveState() {
   liveEvents.value = []
@@ -818,17 +944,20 @@ async function loadEvents() {
         }
         if (bestTurn == null) continue
         if (!meta[bestTurn]) meta[bestTurn] = { complexity: null, fusions: [] }
+        // The /events API nests the payload under evt.data (unlike the flattened
+        // WS stream), so read fusion/complexity fields from there.
+        const d = evt.data || {}
         if (evt.type === 'complexity') {
-          meta[bestTurn].complexity = { score: evt.score, tier: evt.tier, reason: evt.reason || '' }
+          meta[bestTurn].complexity = { score: d.score, tier: d.tier, reason: d.reason || '' }
         } else {
           meta[bestTurn].fusions.push({
-            preset: evt.preset_name || evt.preset || 'fusion',
-            models: evt.models || [],
-            judge_model: evt.judge_model || '',
-            synthesizer_model: evt.synthesizer_model || '',
-            participants: evt.participants || [],
-            judge_analysis: evt.judge_analysis || '',
-            final: evt.final || '',
+            preset: d.preset_name || d.preset || 'fusion',
+            models: d.models || [],
+            judge_model: d.judge_model || '',
+            synthesizer_model: d.synthesizer_model || '',
+            participants: d.participants || [],
+            judge_analysis: d.judge_analysis || '',
+            final: d.final || '',
           })
         }
         continue
@@ -884,6 +1013,8 @@ function connectWebSocket() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = localStorage.getItem('enclave_token')
   ws = new WebSocket(`${proto}//${location.host}/api/chat/${selectedSession.value}/stream?token=${token}`)
+
+  ws.onopen = () => { seedAgentState(selectedSession.value) }
 
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data)
@@ -959,26 +1090,32 @@ function handleStreamEvent(msg) {
     if (idx >= 0) {
       turns.value[idx] = msg
     } else {
-      // Remove any queued message that matches this turn's user_message.
-      // The SDK wraps messages with <current_datetime>, so check if the
-      // turn's user_message contains the queued text (or vice versa).
+      // Remove any queued message that matches this turn's user_message, and
+      // carry its image previews onto the reconciled turn so the picture the
+      // user sent stays visible (the SDK turn carries no image metadata).
+      // Image-only sends still arrive with a placeholder body, so user_message
+      // is truthy here in every user-initiated turn.
       if (msg.user_message) {
-        const qIdx = turns.value.findIndex(t =>
+        let qIdx = turns.value.findIndex(t =>
           t.source === 'queued' && (
             t.user_message === msg.user_message ||
             msg.user_message.includes(t.user_message)
           )
         )
-        if (qIdx >= 0) {
-          turns.value.splice(qIdx, 1)
-        } else {
-          // Fallback: remove the most recent queued message
+        if (qIdx < 0) {
+          // Fallback: the most recent queued message (covers image-only sends,
+          // whose placeholder body won't match the queued empty text).
           for (let i = turns.value.length - 1; i >= 0; i--) {
-            if (turns.value[i].source === 'queued') {
-              turns.value.splice(i, 1)
-              break
-            }
+            if (turns.value[i].source === 'queued') { qIdx = i; break }
           }
+        }
+        if (qIdx >= 0) {
+          const q = turns.value[qIdx]
+          if (q.user_images && q.user_images.length &&
+              !(msg.user_images && msg.user_images.length)) {
+            msg.user_images = q.user_images
+          }
+          turns.value.splice(qIdx, 1)
         }
       }
       // Remove any live-cache entry that matches this turn's assistant_response
@@ -1195,11 +1332,40 @@ function handleStreamEvent(msg) {
   }
 }
 
+// Enter handling: on desktop Enter sends (Shift+Enter makes a newline). On
+// touch devices there's no easy Shift+Enter, so Enter inserts a newline and the
+// Send button is the only way to send.
+function onEnterKey(e) {
+  if (isMobile.value) return  // allow the default newline
+  e.preventDefault()
+  send()
+}
+
+// Auto-grow the composer to fit its content, capped at 8 lines (4 on mobile),
+// after which it scrolls. Runs on input, paste, draft restore and after send.
+function autoGrow() {
+  const el = inputEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  const cs = getComputedStyle(el)
+  const lh = parseFloat(cs.lineHeight) || 20
+  const padTop = parseFloat(cs.paddingTop) || 0
+  const padBottom = parseFloat(cs.paddingBottom) || 0
+  const borderTop = parseFloat(cs.borderTopWidth) || 0
+  const borderBottom = parseFloat(cs.borderBottomWidth) || 0
+  const maxLines = isMobile.value ? 4 : 8
+  const maxH = lh * maxLines + padTop + padBottom + borderTop + borderBottom
+  const newH = Math.min(el.scrollHeight + borderTop + borderBottom, maxH)
+  el.style.height = newH + 'px'
+  el.style.overflowY = el.scrollHeight + borderTop + borderBottom > maxH ? 'auto' : 'hidden'
+}
+
 async function send() {
   if ((!draft.value.trim() && !pendingFiles.value.length) || !selectedSession.value) return
   const content = draft.value.trim()
   draft.value = ''
   sending.value = true
+  nextTick(autoGrow)
 
   // Sending a message answers any pending ask_user question — dismiss its card.
   if (askUserPrompt.value) {
@@ -1207,12 +1373,17 @@ async function send() {
     askUserAnswer.value = ''
   }
 
-  // Immediately show the message as "queued"
-  if (content) {
+  // Immediately show the message as "queued" (with any image previews) so the
+  // user sees what they sent before the upload round-trips. The queued turn
+  // takes ownership of the preview blob URLs; they're revoked when it's
+  // reconciled away or on unmount, not by clearPendingFiles below.
+  const queuedPreviews = pendingFiles.value.filter(f => f.preview).map(f => f.preview)
+  if (content || queuedPreviews.length) {
     const ts = new Date().toISOString()
     turns.value.push({
       turn_index: null,
       user_message: content,
+      user_images: queuedPreviews,
       assistant_response: null,
       timestamp: ts,
       source: 'queued',
@@ -1238,7 +1409,9 @@ async function send() {
           body: form,
         })
       }
-      clearPendingFiles()
+      // Clear the picker without revoking the preview URLs: the queued turn now
+      // owns them for display until it's reconciled away (or the view unmounts).
+      pendingFiles.value = []
     } else {
       await api.sendChatMessage(selectedSession.value, content)
     }
@@ -1425,6 +1598,55 @@ function sendActionReply(label) {
   send()
 }
 
+// ─── Decision fork menu: batched multi-decision answers ───
+// Answers are keyed per-card (turn) then per-decision-id. A Proxy-backed default
+// ensures decisionAnswers[cardKey] always exists for the template.
+const decisionAnswers = reactive({})
+const decisionSubmitted = reactive({})
+function decKey(turn) {
+  const k = String(turn.turn_index ?? turn.timestamp ?? 'live')
+  if (!decisionAnswers[k]) decisionAnswers[k] = {}
+  return k
+}
+function pickOption(turn, dec, opt) {
+  const k = decKey(turn)
+  const val = opt.id || opt.label
+  const cur = decisionAnswers[k][dec.id]
+  // Toggle off if re-picking the same option.
+  decisionAnswers[k][dec.id] = { ...(cur || {}), selected: cur?.selected === val ? null : val }
+}
+function setComment(turn, dec, text) {
+  const k = decKey(turn)
+  decisionAnswers[k][dec.id] = { ...(decisionAnswers[k][dec.id] || {}), comment: text }
+}
+function decisionAnyAnswered(turn) {
+  const ans = decisionAnswers[decKey(turn)] || {}
+  return Object.values(ans).some(a => a && (a.selected || (a.comment && a.comment.trim())))
+}
+function submitDecisions(turn) {
+  const k = decKey(turn)
+  if (decisionSubmitted[k]) return
+  const decs = turn.structured?.decisions || []
+  const ans = decisionAnswers[k] || {}
+  const lines = ['[Decision responses]', '']
+  for (const d of decs) {
+    const a = ans[d.id] || {}
+    const label = optLabel(d, a.selected)
+    const parts = []
+    if (label) parts.push(label)
+    if (a.comment && a.comment.trim()) parts.push(`"${a.comment.trim()}"`)
+    lines.push(`- ${d.question} → ${parts.length ? parts.join(' — ') : '(no preference)'}`)
+  }
+  decisionSubmitted[k] = true
+  draft.value = lines.join('\n')
+  send()
+}
+function optLabel(dec, selected) {
+  if (!selected) return ''
+  const o = (dec.options || []).find(o => (o.id || o.label) === selected)
+  return o ? o.label : selected
+}
+
 function workspaceFileUrl(filePath) {
   // Strip leading /workspace/ prefix if present, then build the proxy URL
   // Each path segment is individually encoded to preserve slashes
@@ -1434,6 +1656,14 @@ function workspaceFileUrl(filePath) {
   const encoded = rel.split('/').map(encodeURIComponent).join('/')
   const token = localStorage.getItem('enclave_token') || ''
   return `/api/chat/${selectedSession.value}/file/${encoded}?token=${encodeURIComponent(token)}`
+}
+
+// Render a user-attached image. Locally-queued sends carry a blob:/data: preview
+// URL (used as-is); persisted/reloaded turns carry a workspace path served via
+// the file proxy.
+function userImageUrl(img) {
+  if (/^(blob:|data:|https?:)/i.test(img)) return img
+  return workspaceFileUrl(img)
 }
 
 function mediaUrl(mxcUrl) {
@@ -1696,6 +1926,32 @@ function toggleCardFusion(ti, ri) {
   min-width: 0;
   min-height: 0;
 }
+
+.spec-pin-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card, #1e1e24);
+  border-left: 1px solid var(--border);
+  min-width: 0;
+  min-height: 0;
+}
+.spec-pin-body {
+  overflow-y: auto;
+  padding: 0.85rem 1rem;
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+.spec-pin-body :deep(h1) { font-size: 1.15rem; }
+.spec-pin-body :deep(h2) { font-size: 1.02rem; }
+.spec-pin-body :deep(h3) { font-size: 0.92rem; }
+.spec-pin-body :deep(pre) {
+  background: var(--bg-main, #15151a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 0.6rem;
+  overflow-x: auto;
+}
+.spec-pin-body :deep(code) { font-family: monospace; font-size: 0.85em; }
 
 .doc-list-head {
   display: flex;
@@ -2021,6 +2277,59 @@ function toggleCardFusion(ti, ri) {
   box-shadow: 0 0 8px rgba(74, 222, 128, 0.2);
 }
 
+/* Decision fork menu */
+.decision-menu {
+  margin-top: 0.6rem;
+  border-top: 1px solid var(--border, #333);
+  padding-top: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+.decision-q { font-size: 0.88rem; font-weight: 600; margin-bottom: 0.35rem; }
+.decision-opts { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.35rem; }
+.decision-opt {
+  background: var(--bg-main, #15151a);
+  border: 1px solid var(--border, #333);
+  color: inherit;
+  padding: 0.35rem 0.8rem;
+  border-radius: 16px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: all 0.12s;
+}
+.decision-opt:hover { border-color: var(--accent, #7c9eff); }
+.decision-opt.selected {
+  background: var(--accent, #7c9eff);
+  color: #0f0f14;
+  border-color: var(--accent, #7c9eff);
+  font-weight: 600;
+}
+.decision-freetext {
+  width: 100%;
+  background: var(--bg-main, #15151a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  color: inherit;
+  padding: 0.4rem 0.6rem;
+  font-family: inherit;
+  font-size: 0.82rem;
+  box-sizing: border-box;
+}
+.decision-submit {
+  align-self: flex-start;
+  background: rgba(124, 158, 255, 0.15);
+  border: 1px solid var(--accent, #7c9eff);
+  color: var(--accent, #7c9eff);
+  padding: 0.45rem 1.1rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.decision-submit:disabled { opacity: 0.5; cursor: default; }
+.decision-submit:not(:disabled):hover { background: rgba(124, 158, 255, 0.28); }
+
 .segment-response {
   margin: 0.4rem 0;
   padding: 0.5rem 0.75rem;
@@ -2124,7 +2433,8 @@ function toggleCardFusion(ti, ri) {
   flex: 1;
   resize: none;
   min-height: 42px;
-  max-height: 150px;
+  line-height: 1.4;
+  overflow-y: hidden;
   font-family: inherit;
 }
 
@@ -2415,6 +2725,19 @@ function toggleCardFusion(ti, ri) {
 .file-send-img {
   max-width: 450px;
   max-height: 300px;
+  border-radius: var(--radius-sm);
+  cursor: zoom-in;
+}
+
+.user-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+.user-img {
+  max-width: 320px;
+  max-height: 240px;
   border-radius: var(--radius-sm);
   cursor: zoom-in;
 }

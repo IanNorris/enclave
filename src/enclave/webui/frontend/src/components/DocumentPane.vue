@@ -65,7 +65,7 @@
 
       <template v-else>
         <!-- View -->
-        <MarkdownViewer v-if="mode === 'view'" :source="content" />
+        <MarkdownViewer v-if="mode === 'view'" :source="content" :session="session" :base-dir="docBaseDir" />
 
         <!-- Edit -->
         <CodeEditor
@@ -84,7 +84,7 @@
             <CodeEditor v-model="editContent" :language="language" />
           </template>
           <template #b>
-            <MarkdownViewer :source="editContent" />
+            <MarkdownViewer :source="editContent" :session="session" :base-dir="docBaseDir" />
           </template>
         </SplitPane>
 
@@ -149,6 +149,15 @@ const language = computed(() => {
 })
 
 const dirty = computed(() => editContent.value !== content.value)
+
+// Directory (relative to the workspace root) that this document lives in, so
+// the viewer can resolve relative image paths via the file proxy. Artifacts are
+// served from artifacts/; if the filename itself carries a subpath, include it.
+const docBaseDir = computed(() => {
+  const parts = (props.filename || '').split('/')
+  parts.pop()
+  return ['artifacts', ...parts].join('/')
+})
 
 const STORAGE_MODE = 'enclave_doc_mode'
 const STORAGE_INNER = 'enclave_doc_inner_orientation'

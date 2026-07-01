@@ -83,16 +83,24 @@ class ControlServer:
         if self._socket_path.exists():
             self._socket_path.unlink(missing_ok=True)
 
-    def notify_user_message(self, session_id: str, content: str, sender: str = "") -> None:
+    def notify_user_message(
+        self, session_id: str, content: str, sender: str = "",
+        images: list[str] | None = None,
+    ) -> None:
         """Called by the router when a user message is delivered to the agent.
 
         Emitted from every dispatch path (Matrix project rooms and control-socket
         injection) so the webui's event persister durably records user turns
-        regardless of where the message originated.
+        regardless of where the message originated. ``images`` carries any
+        workspace-relative paths of image attachments so the Web UI can render
+        the picture the user sent alongside their message.
         """
-        self._emit(session_id, {
+        event = {
             "ok": True, "type": "user_message", "content": content, "sender": sender,
-        })
+        }
+        if images:
+            event["images"] = images
+        self._emit(session_id, event)
 
     def notify_response(self, session_id: str, content: str) -> None:
         """Called by the router when an agent sends a response."""
@@ -373,6 +381,8 @@ class ControlServer:
 
             if action == "list":
                 await self._handle_list(writer)
+            elif action == "activity":
+                await self._handle_activity(writer)
             elif action == "send":
                 await self._handle_send(req, writer, reader)
             elif action == "subscribe":
@@ -442,6 +452,20 @@ class ControlServer:
                 "awaiting_input": self._awaiting_input.get(session.id, False),
             })
         await self._write(writer, {"ok": True, "type": "sessions", "sessions": sessions})
+
+    async def _handle_activity(self, writer: asyncio.StreamWriter) -> None:
+        """Return the current coarse activity state for every known session.
+
+        Lets a freshly-loaded (or reconnected) Web UI seed its live activity
+        indicators from a snapshot rather than waiting for the next streamed
+        ``session_activity`` event. Without this, opening a session that is
+        mid-tool-call (e.g. a multi-minute fusion run that emits a single
+        tool_start then goes quiet) shows no working indicator at all.
+        """
+        await self._write(writer, {
+            "ok": True, "type": "activity_state",
+            "states": dict(self._activity_state),
+        })
 
     async def _handle_stop(self, req: dict, writer: asyncio.StreamWriter) -> None:
         session_id = req.get("session", "")

@@ -136,6 +136,19 @@ medium (workaround exists), low (cosmetic).
 
 Include observed vs expected, error messages, file paths, commit context.
 
+## OpenSpec review workflow
+
+If the project uses OpenSpec (an `openspec/` directory with changes under
+`openspec/changes/<name>/`), specs are reviewed in the web UI's **Specs** tab.
+When the reviewer requests changes, you'll receive a message tagged
+`[OpenSpec review on change '<name>'] CHANGES REQUESTED` listing inline comments
+with quoted block context. After you edit the spec files to address that
+feedback, **call `openspec_revision_log`** with the change name, a summary, the
+`why`, `in_response_to` the review id, and one `resolutions` entry per addressed
+comment (or a `resolution_note` explaining a decline). This records why the spec
+changed and returns it to the reviewer for re-approval — locate each block by its
+quoted text, since line numbers may have shifted.
+
 ## Artifacts
 
 Use `publish_artifact` when the user asks for a report, investigation,

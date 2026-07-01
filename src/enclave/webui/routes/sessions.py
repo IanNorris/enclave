@@ -7,6 +7,7 @@ inspect and clear state, and manage named snapshots.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -204,6 +205,21 @@ class SnapshotCreate(BaseModel):
 async def list_sessions(request: Request):
     """List all known sessions with their status."""
     return _discover_sessions(request)
+
+
+@router.get("/activity")
+async def session_activity(request: Request):
+    """Current coarse activity state per session, for seeding live indicators.
+
+    Returns ``{session_id: "idle"|"thinking"|"tool"|"responding"}``. The Web UI
+    fetches this on load/reconnect so a session that is mid-tool-call shows a
+    working indicator immediately instead of appearing idle until the next
+    streamed event arrives.
+    """
+    resp = await _control_request(request, {"action": "activity"})
+    if not resp or not resp.get("ok"):
+        return {"states": {}}
+    return {"states": resp.get("states", {})}
 
 
 @router.get("/profiles")
@@ -620,6 +636,126 @@ def _write_manifest(request: Request, session_id: str, entries: list[dict]) -> N
     manifest_path.write_text(json.dumps(entries, indent=2))
 
 
+# Editable text artifact extensions — only these participate in versioning /
+# reconciliation (binary files like PNGs aren't diffed or shadowed).
+_EDITABLE_EXTS = (".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log")
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _shadow_path(art_dir: Path, filename: str, version: int) -> Path:
+    p = Path(filename)
+    return art_dir / f"{p.stem}.v{version}{p.suffix}"
+
+
+def _reconcile_artifact(art_dir: Path, entry: dict) -> bool:
+    """Fold out-of-band edits into an artifact's version history.
+
+    Versions are normally created by ``publish_artifact`` (agent) and the UI
+    save endpoint, both of which snapshot + bump the manifest. But an agent can
+    also edit ``artifacts/<file>`` directly with generic file tools, which
+    bypasses versioning entirely — the file changes while the manifest goes
+    stale. This reconciles that on read.
+
+    Mechanism: the manifest records ``content_hash`` for the last-accounted
+    content, and a shadow copy of that content lives at ``.v{version}``. When the
+    on-disk content no longer matches ``content_hash``, the shadow still holds
+    the *pre-edit* content, so we promote it to a historical version, bump the
+    version, and refresh the shadow + hash for the new current content. Returns
+    True if the entry was modified (caller must persist the manifest).
+    """
+    filename = entry.get("filename")
+    if not filename or not filename.lower().endswith(_EDITABLE_EXTS):
+        return False
+    target = art_dir / filename
+    if not target.exists():
+        return False
+    cur_hash = _file_sha256(target)
+    if cur_hash is None:
+        return False
+
+    version = entry.get("version", 1)
+    stored = entry.get("content_hash")
+
+    # First observation (older artifacts predate content_hash): establish the
+    # invariant — record the hash and lay down a shadow of the current content —
+    # without inventing history.
+    if stored is None:
+        try:
+            shutil.copy2(str(target), str(_shadow_path(art_dir, filename, version)))
+        except OSError:
+            pass
+        entry["content_hash"] = cur_hash
+        entry["size"] = target.stat().st_size
+        return True
+
+    if cur_hash == stored:
+        return False
+
+    # A tracked save (publish_artifact or the UI save endpoint) bumps the version
+    # itself and snapshots the previous content to .v{version-1}. If that snapshot
+    # hashes to the previously-accounted content, the bump is already recorded —
+    # just adopt the new hash (and ensure a current shadow) without re-counting it
+    # as an out-of-band edit. Two consecutive versions are never identical (we
+    # don't bump on an unchanged hash), so this can't misfire on a real edit.
+    prev_shadow = _shadow_path(art_dir, filename, version - 1)
+    if version > 1 and prev_shadow.exists() and _file_sha256(prev_shadow) == stored:
+        cur_shadow = _shadow_path(art_dir, filename, version)
+        if not cur_shadow.exists():
+            try:
+                shutil.copy2(str(target), str(cur_shadow))
+            except OSError:
+                pass
+        entry["content_hash"] = cur_hash
+        entry["size"] = target.stat().st_size
+        return True
+
+    # Out-of-band edit. The shadow .v{version} holds the pre-edit content; keep
+    # it as the historical snapshot of `version`, then bump.
+    now = datetime.now(timezone.utc).isoformat()
+    shadow = _shadow_path(art_dir, filename, version)
+    versions = entry.get("versions", [])
+    if not versions and version >= 1:
+        versions.append({
+            "version": 1,
+            "created": entry.get("created", now),
+            "size": entry.get("size", 0),
+        })
+    if not any(v.get("version") == version for v in versions):
+        versions.append({
+            "version": version,
+            "created": entry.get("updated", now),
+            "size": shadow.stat().st_size if shadow.exists() else entry.get("size", 0),
+        })
+    entry["versions"] = versions
+    entry["version"] = version + 1
+    entry["updated"] = now
+    entry["size"] = target.stat().st_size
+    entry["content_hash"] = cur_hash
+    try:
+        shutil.copy2(str(target), str(_shadow_path(art_dir, filename, version + 1)))
+    except OSError:
+        pass
+    return True
+
+
+def _reconcile_manifest(request: Request, session_id: str, entries: list[dict]) -> bool:
+    """Reconcile every artifact, persisting the manifest if anything changed."""
+    art_dir = _artifacts_dir(request, session_id)
+    changed = False
+    for entry in entries:
+        if _reconcile_artifact(art_dir, entry):
+            changed = True
+    if changed:
+        _write_manifest(request, session_id, entries)
+    return changed
+
+
 class ArtifactRegister(BaseModel):
     title: str
     description: str = ""
@@ -631,6 +767,7 @@ class ArtifactRegister(BaseModel):
 async def list_artifacts(request: Request, session_id: str):
     """List all registered artifacts, most recent first."""
     entries = _read_manifest(request, session_id)
+    _reconcile_manifest(request, session_id, entries)
     entries.sort(key=lambda e: e.get("created", ""), reverse=True)
     return entries
 
@@ -711,9 +848,6 @@ class ArtifactSave(BaseModel):
     base_version: int | None = None
 
 
-_EDITABLE_EXTS = (".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log")
-
-
 @router.put("/{session_id}/artifacts/{filename:path}/content")
 async def save_artifact_content(
     request: Request, session_id: str, filename: str, body: ArtifactSave,
@@ -742,6 +876,9 @@ async def save_artifact_content(
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
 
     entries = _read_manifest(request, session_id)
+    # Fold in any out-of-band agent edits first so the version check below sees
+    # the true current version (and a stale base_version is correctly rejected).
+    _reconcile_manifest(request, session_id, entries)
     existing = next((e for e in entries if e["filename"] == filename), None)
     if existing is None:
         raise HTTPException(status_code=404, detail="Artifact not registered")
@@ -791,7 +928,14 @@ async def save_artifact_content(
         "version": version + 1,
         "updated": now,
         "size": target.stat().st_size,
+        # Account for this content so reconciliation doesn't re-version it, and
+        # refresh the shadow for the new current version.
+        "content_hash": _file_sha256(target),
     })
+    try:
+        shutil.copy2(str(target), str(_shadow_path(art_dir, filename, version + 1)))
+    except OSError:
+        pass
     _write_manifest(request, session_id, entries)
     return {
         "filename": filename,
@@ -805,6 +949,7 @@ async def save_artifact_content(
 async def get_artifact_versions(request: Request, session_id: str, filename: str):
     """List version history for an artifact."""
     entries = _read_manifest(request, session_id)
+    _reconcile_manifest(request, session_id, entries)
     entry = next((e for e in entries if e["filename"] == filename), None)
     if not entry:
         raise HTTPException(status_code=404, detail="Artifact not found")
@@ -828,6 +973,7 @@ async def get_artifact_diff(request: Request, session_id: str, filename: str, v1
 
     art_dir = _artifacts_dir(request, session_id)
     entries = _read_manifest(request, session_id)
+    _reconcile_manifest(request, session_id, entries)
     entry = next((e for e in entries if e["filename"] == filename), None)
     if not entry:
         raise HTTPException(status_code=404, detail="Artifact not found")

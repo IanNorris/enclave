@@ -151,6 +151,7 @@
     </nav>
     <main class="content">
       <SessionTabBar v-if="isSessionRoute" @toggle-sidebar="sidebarOpen = !sidebarOpen" />
+      <SpecProgressBar v-if="isSessionRoute" />
       <div class="content-body" :class="{ 'content-flush': isChatRoute }">
         <router-view />
       </div>
@@ -164,6 +165,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from './stores/session.js'
 import { api } from './api.js'
 import SessionTabBar from './components/SessionTabBar.vue'
+import SpecProgressBar from './components/SpecProgressBar.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -242,7 +244,7 @@ function onSettingsNav() {
 
 // Routes that operate on the selected session (show the session tab bar).
 const SESSION_ROUTE_NAMES = new Set([
-  'chat', 'bugs', 'bug-detail', 'artifacts', 'artifact-preview', 'timeline', 'session-settings',
+  'chat', 'bugs', 'bug-detail', 'artifacts', 'artifact-preview', 'specs', 'timeline', 'session-settings',
 ])
 const isSessionRoute = computed(() => SESSION_ROUTE_NAMES.has(route.name))
 const isChatRoute = computed(() => route.name === 'chat')
@@ -326,12 +328,22 @@ async function togglePush() {
   }
 }
 
+async function seedActivity() {
+  // Snapshot current per-session activity so sidebar indicators are correct on
+  // load/reconnect, not just after the next streamed session_activity event.
+  try {
+    const resp = await api.getActivity()
+    if (resp && resp.states) activityState.value = { ...activityState.value, ...resp.states }
+  } catch { /* ignore */ }
+}
+
 function connectNotifWs() {
   if (!hasToken.value) return
   const token = localStorage.getItem('enclave_token')
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   try {
     notifWs = new WebSocket(`${proto}//${location.host}/api/notifications/stream?token=${token}`)
+    notifWs.onopen = () => { seedActivity() }
     notifWs.onmessage = (ev) => {
       let msg = null
       try { msg = JSON.parse(ev.data) } catch { /* ignore */ }

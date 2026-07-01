@@ -59,6 +59,11 @@ const routes = [
     component: () => import('./views/Artifacts.vue'),
   },
   {
+    path: '/specs',
+    name: 'specs',
+    component: () => import('./views/Specs.vue'),
+  },
+  {
     path: '/preview/:session/:filename(.*)',
     name: 'artifact-preview',
     component: () => import('./views/ArtifactPreview.vue'),
