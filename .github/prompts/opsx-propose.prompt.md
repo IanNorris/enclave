@@ -1,5 +1,8 @@
 ---
 description: Propose a new change - create it and generate all artifacts in one step
+license: MIT
+author: openspec
+generatedBy: openspec 1.5.0
 ---
 
 Propose a new change - create the change and generate all artifacts in one step.

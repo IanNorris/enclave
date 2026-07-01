@@ -1,5 +1,8 @@
 ---
 description: Archive a completed change in the experimental workflow
+license: MIT
+author: openspec
+generatedBy: openspec 1.5.0
 ---
 
 Archive a completed change in the experimental workflow.

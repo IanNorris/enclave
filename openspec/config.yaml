@@ -1,3 +1,6 @@
+# This OpenSpec workspace was scaffolded by `openspec init` (OpenSpec 1.5.0,
+# MIT, (c) 2024 OpenSpec Contributors — https://github.com/Fission-AI/OpenSpec).
+# See THIRD_PARTY_NOTICES.md at the repo root for full attribution.
 schema: spec-driven
 
 # Project context (optional)

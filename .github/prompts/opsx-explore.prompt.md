@@ -1,5 +1,8 @@
 ---
 description: Enter explore mode - think through ideas, investigate problems, clarify requirements
+license: MIT
+author: openspec
+generatedBy: openspec 1.5.0
 ---
 
 Enter explore mode. Think deeply. Visualize freely. Follow the conversation wherever it goes.

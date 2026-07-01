@@ -1,5 +1,8 @@
 ---
 description: Sync delta specs from a change to main specs
+license: MIT
+author: openspec
+generatedBy: openspec 1.5.0
 ---
 
 Sync delta specs from a change to main specs.

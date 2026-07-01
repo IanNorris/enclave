@@ -1,5 +1,8 @@
 ---
 description: Implement tasks from an OpenSpec change (Experimental)
+license: MIT
+author: openspec
+generatedBy: openspec 1.5.0
 ---
 
 Implement tasks from an OpenSpec change.
