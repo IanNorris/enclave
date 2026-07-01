@@ -127,7 +127,27 @@ def _review_state(change_dir: Path) -> dict | None:
 
 
 
-def _change_summary(session_id: str, change_dir: Path) -> dict:
+def _lifecycle(task_progress: dict, review: dict | None, archived: bool) -> str:
+    """Derived terminal presentation state for a change (pure, no persistence).
+
+    - archived: it lives under changes/archive/
+    - done: all tasks complete AND the latest review approved
+    - needs_approval: all tasks complete but not yet approved
+    - active: everything else (falls back to the review state in the UI)
+    """
+    if archived:
+        return "archived"
+    total = task_progress.get("total", 0)
+    complete = total > 0 and task_progress.get("done", 0) == total
+    approved = bool(review and review.get("state") == "approved")
+    if complete and approved:
+        return "done"
+    if complete and not approved:
+        return "needs_approval"
+    return "active"
+
+
+def _change_summary(session_id: str, change_dir: Path, archived: bool = False) -> dict:
     name = change_dir.name
     rel = lambda p: str(p.relative_to(_openspec_root(session_id)))  # noqa: E731
     proposal = change_dir / "proposal.md"
@@ -136,21 +156,26 @@ def _change_summary(session_id: str, change_dir: Path) -> dict:
     spec_paths = sorted(
         rel(p) for p in (change_dir / "specs").rglob("*.md")
     ) if (change_dir / "specs").is_dir() else []
+    task_progress = _task_progress(_read_text(tasks))
+    review = None if archived else _review_state(change_dir)
     return {
         "id": name,
         "proposalPath": rel(proposal) if proposal.is_file() else None,
         "designPath": rel(design) if design.is_file() else None,
         "tasksPath": rel(tasks) if tasks.is_file() else None,
         "specPaths": spec_paths,
-        "taskProgress": _task_progress(_read_text(tasks)),
-        "review": _review_state(change_dir),
+        "taskProgress": task_progress,
+        "review": review,
+        "archived": archived,
+        "lifecycle": _lifecycle(task_progress, review, archived),
     }
 
 
 @router.get("/{session_id}/openspec/changes")
 async def list_changes(request: Request, session_id: str):
-    """List active OpenSpec changes (excludes the archive), most-recently-edited
-    first so the change the user is actively working on is at the top."""
+    """List OpenSpec changes, most-recently-edited first so the change the user
+    is actively working on is at the top. Archived changes are included with
+    ``archived: true`` so the UI can show them in a collapsed section."""
     changes_dir = _changes_dir(session_id)
     if not changes_dir.is_dir():
         return {"exists": False, "changes": []}
@@ -159,6 +184,13 @@ async def list_changes(request: Request, session_id: str):
         if not entry.is_dir() or entry.name == "archive":
             continue
         changes.append((_change_mtime(entry), _change_summary(session_id, entry)))
+    # Archived changes (read-only) from changes/archive/<date>-<name>/
+    archive_dir = changes_dir / "archive"
+    if archive_dir.is_dir():
+        for entry in sorted(archive_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            changes.append((_change_mtime(entry), _change_summary(session_id, entry, archived=True)))
     # Newest edit first; the review-log workflow file is ignored by _change_mtime
     # so approving/commenting doesn't reorder the list.
     changes.sort(key=lambda t: t[0], reverse=True)
@@ -183,10 +215,15 @@ def _change_mtime(change_dir: Path) -> float:
 
 @router.get("/{session_id}/openspec/changes/{name}")
 async def get_change(request: Request, session_id: str, name: str):
-    """Return the markdown artifacts + specs map for one change."""
+    """Return the markdown artifacts + specs map for one change (active or archived)."""
     change_dir = _safe_change_dir(session_id, name)
     if not change_dir.is_dir():
-        raise HTTPException(status_code=404, detail="Change not found")
+        # Fall back to the archive (id of an archived change is <date>-<name>).
+        archived = _safe_change_dir(session_id, f"archive/{name}")
+        if archived.is_dir():
+            change_dir = archived
+        else:
+            raise HTTPException(status_code=404, detail="Change not found")
     specs: dict[str, str] = {}
     specs_dir = change_dir / "specs"
     if specs_dir.is_dir():
