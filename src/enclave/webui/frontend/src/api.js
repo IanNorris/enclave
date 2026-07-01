@@ -125,6 +125,7 @@ export const api = {
   getOpenSpecChanges: (id) => request(`/sessions/${id}/openspec/changes`),
   getOpenSpecChange: (id, name) => request(`/sessions/${id}/openspec/changes/${name}`),
   getOpenSpecState: (id, name) => request(`/sessions/${id}/openspec/changes/${name}/state`),
+  getOpenSpecDiff: (id, name) => request(`/sessions/${id}/openspec/changes/${name}/diff`),
   postOpenSpecReview: (id, name, state, note = '', comments = []) =>
     request(`/sessions/${id}/openspec/changes/${name}/review`, {
       method: 'POST',

@@ -33,6 +33,10 @@
 
 ## 6. Wrap up
 
-- [ ] 6.1 Gitignore the review-log files
-- [ ] 6.2 Build the frontend and restart the web UI
-- [ ] 6.3 Verify end-to-end: comment → submit → agent revision + resolutions → highlight → re-approve
+- [x] 6.1 Gitignore the review-log files
+- [x] 6.2 Build the frontend and restart the web UI
+- [x] 6.3 Verify end-to-end: comment → submit → agent revision + resolutions → highlight → re-approve
+
+> Note (added per review comment c_mr1ce8oeat0g): edit highlighting is now
+> implemented — this very note is the edit whose highlight you should see, shown
+> as a green marker on the changed lines when "Show changes" is on.

@@ -40,6 +40,9 @@
           <h3>{{ selected.id }}</h3>
           <div class="detail-actions">
             <span class="state-badge" :class="stateClass">{{ stateLabel }}</span>
+            <button v-if="hasChanges" class="btn-sm" :class="{ pinned: showChanges }" @click="toggleChanges">
+              {{ showChanges ? '🟩 Changes on' : '🟩 Show changes' }}
+            </button>
             <button class="btn-sm" @click="pin(selected)" :class="{ pinned: isPinned(selected.id) }">
               {{ isPinned(selected.id) ? '📌 Pinned' : '📌 Pin' }}
             </button>
@@ -109,6 +112,11 @@ const derivedState = ref('none')
 const sectionsEl = ref(null)
 const ceInput = ref(null)
 
+// Edit highlighting: {path: [changedLine,...]} since the user's last review.
+const changedLines = ref({})
+const showChanges = ref(true)
+const hasChanges = computed(() => Object.keys(changedLines.value).length > 0)
+
 // Draft inline comments (per session+change), plus overall note.
 const draft = ref([])
 const overallNote = ref('')
@@ -118,6 +126,7 @@ const activeComment = ref(null)
 // be mapped back to its section source for the frozen quote.
 const sectionList = computed(() => {
   const d = detail.value
+  const hasChg = (p) => showChanges.value && (changedLines.value[p]?.length > 0)
   const list = [
     { key: 'proposal', label: 'Proposal', path: selected.value?.proposalPath || 'proposal.md', source: d.proposal, open: true },
     { key: 'design', label: 'Design', path: selected.value?.designPath || 'design.md', source: d.design, open: false },
@@ -126,7 +135,8 @@ const sectionList = computed(() => {
   for (const [path, content] of Object.entries(d.specs || {})) {
     list.push({ key: `spec:${path}`, label: `Spec — ${path}`, path, source: content, open: false })
   }
-  return list.filter(s => s.source != null)
+  // Auto-open any section that has changes to show, so highlights aren't hidden.
+  return list.filter(s => s.source != null).map(s => ({ ...s, open: s.open || hasChg(s.path) }))
 })
 
 const STATE_META = {
@@ -167,12 +177,14 @@ function persistDraft() {
 
 async function select(id) {
   activeComment.value = null
+  changedLines.value = {}
   try {
     detail.value = await api.getOpenSpecChange(selectedSession.value, id)
     selected.value = changes.value.find(c => c.id === id) || { id }
     loadDraft(id)
     await refreshState(id)
-    nextTick(applyBadges)
+    await refreshDiff(id)
+    nextTick(decorate)
   } catch { /* ignore */ }
 }
 
@@ -181,6 +193,21 @@ async function refreshState(id) {
     const s = await api.getOpenSpecState(selectedSession.value, id)
     derivedState.value = s.state || 'none'
   } catch { derivedState.value = 'none' }
+}
+
+async function refreshDiff(id) {
+  try {
+    const d = await api.getOpenSpecDiff(selectedSession.value, id)
+    changedLines.value = d.changed || {}
+    // Default the highlight on when there are changes and the change is pending
+    // re-approval (that's when "what changed since I reviewed" matters most).
+    showChanges.value = hasChanges.value
+  } catch { changedLines.value = {} }
+}
+
+function toggleChanges() {
+  showChanges.value = !showChanges.value
+  nextTick(decorate)
 }
 
 // ─── Inline commenting via event delegation on the sections container ───
@@ -207,26 +234,50 @@ function addComment() {
   draft.value.push({ ...activeComment.value, comment: activeComment.value.comment.trim() })
   activeComment.value = null
   persistDraft()
-  nextTick(applyBadges)
+  nextTick(decorate)
 }
 function clearDraft() {
   draft.value = []
   overallNote.value = ''
   if (selected.value) localStorage.removeItem(draftKey(selected.value.id))
-  nextTick(applyBadges)
+  nextTick(decorate)
 }
 
-// Post-render decoration: mark commented blocks. Re-applied after every render
-// (v-html re-render wipes injected classes), keyed off data-line + data-section.
-function applyBadges() {
+// Post-render decoration: mark draft-commented blocks AND agent-changed blocks.
+// Re-applied after every render (v-html re-render wipes injected classes), keyed
+// off data-line + data-section. Changed-line numbers are relative to the current
+// (rendered) version, so they map straight onto data-line.
+function decorate() {
   const root = sectionsEl.value
   if (!root) return
-  root.querySelectorAll('.has-draft-comment').forEach(el => el.classList.remove('has-draft-comment'))
+  root.querySelectorAll('.has-draft-comment, .changed-block')
+    .forEach(el => el.classList.remove('has-draft-comment', 'changed-block'))
+  // Draft comment badges
   for (const c of draft.value) {
     const container = root.querySelector(`[data-section="${cssEsc(c.section)}"]`)
-    if (!container) continue
-    const block = container.querySelector(`[data-line="${c.start_line}"]`)
+    const block = container?.querySelector(`[data-line="${c.start_line}"]`)
     if (block) block.classList.add('has-draft-comment')
+  }
+  // Agent edit highlights (by file path → changed lines)
+  if (showChanges.value) {
+    for (const sec of sectionList.value) {
+      const lines = changedLines.value[sec.path]
+      if (!lines || !lines.length) continue
+      const container = root.querySelector(`[data-section="${cssEsc(sec.key)}"]`)
+      if (!container) continue
+      const blocks = Array.from(container.querySelectorAll('[data-line]'))
+        .map(el => [parseInt(el.getAttribute('data-line'), 10), el])
+        .sort((a, b) => a[0] - b[0])
+      const lineSet = new Set(lines)
+      // A block "owns" source lines from its data-line up to the next block's.
+      for (let i = 0; i < blocks.length; i++) {
+        const start = blocks[i][0]
+        const end = i + 1 < blocks.length ? blocks[i + 1][0] : Infinity
+        for (const ln of lineSet) {
+          if (ln >= start && ln < end) { blocks[i][1].classList.add('changed-block'); break }
+        }
+      }
+    }
   }
 }
 function cssEsc(s) { return (s || '').replace(/["\\]/g, '\\$&') }
@@ -281,6 +332,9 @@ function pin(ch) {
 
 onMounted(load)
 watch(selectedSession, () => { selected.value = null; draft.value = []; load() })
+// Re-run decoration whenever the change set or toggle changes (DOM re-renders
+// via sectionList auto-open, so defer to nextTick).
+watch([changedLines, showChanges], () => nextTick(decorate))
 </script>
 
 <style scoped>
@@ -346,6 +400,7 @@ watch(selectedSession, () => { selected.value = null; draft.value = []; load() }
 .md :deep([data-line]) { position: relative; border-radius: 4px; transition: background 0.12s; cursor: pointer; }
 .md :deep([data-line]:hover) { background: rgba(124,158,255,0.08); box-shadow: -6px 0 0 rgba(124,158,255,0.25); }
 .md :deep([data-line].has-draft-comment) { background: rgba(251,146,60,0.10); box-shadow: -6px 0 0 #fb923c; }
+.md :deep([data-line].changed-block) { background: rgba(74,222,128,0.12); box-shadow: -6px 0 0 #4ade80; }
 .comment-editor {
   position: fixed; left: 50%; transform: translateX(-50%); bottom: 12px; z-index: 60;
   width: min(680px, 94vw);

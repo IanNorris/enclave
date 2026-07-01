@@ -115,11 +115,18 @@ def _write_log_atomic(change_dir: Path, doc: dict) -> None:
     os.replace(str(tmp), str(target))
 
 
-def _append_event(change_dir: Path, event: dict) -> dict:
-    """Append one event to the log (idempotent on event id) and return the doc."""
+def _append_event(change_dir: Path, event: dict, blobs: dict[str, str] | None = None) -> dict:
+    """Append one event to the log (idempotent on event id) and return the doc.
+
+    ``blobs`` (hash -> content) are merged into the doc's content-addressed blob
+    store so snapshots referenced by the event can be reconstructed for diffing.
+    """
     doc = _read_log(change_dir)
     if event.get("id") and any(e.get("id") == event["id"] for e in doc["events"]):
         return doc  # idempotent: duplicate append is a no-op
+    if blobs:
+        store = doc.setdefault("blobs", {})
+        store.update(blobs)
     doc["events"].append(event)
     # Keep the top-level badge fields in sync for the change list (latest review).
     if event.get("type") == "review":
@@ -130,16 +137,29 @@ def _append_event(change_dir: Path, event: dict) -> dict:
     return doc
 
 
-def _snapshot_files(change_dir: Path, root: Path) -> dict[str, str]:
-    """Content-hash snapshot of a change's markdown files (store-by-hash)."""
+def _hash(content: str) -> str:
+    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _snapshot_files(change_dir: Path, root: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Snapshot a change's markdown files.
+
+    Returns ``(snapshot, blobs)`` where ``snapshot`` maps each file path to a
+    content hash and ``blobs`` maps that hash to the content. Blobs are stored
+    content-addressed in the log (deduped across cycles) so an edit diff can be
+    computed against the exact reviewed content.
+    """
     snap: dict[str, str] = {}
+    blobs: dict[str, str] = {}
     for p in sorted(change_dir.rglob("*.md")):
         content = _read_text(p)
         if content is None:
             continue
         rel = str(p.relative_to(root))
-        snap[rel] = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
-    return snap
+        h = _hash(content)
+        snap[rel] = h
+        blobs[h] = content
+    return snap, blobs
 
 
 def _review_state(change_dir: Path) -> dict | None:
@@ -176,7 +196,8 @@ def _change_summary(session_id: str, change_dir: Path) -> dict:
 
 @router.get("/{session_id}/openspec/changes")
 async def list_changes(request: Request, session_id: str):
-    """List active OpenSpec changes (excludes the archive)."""
+    """List active OpenSpec changes (excludes the archive), most-recently-edited
+    first so the change the user is actively working on is at the top."""
     changes_dir = _changes_dir(session_id)
     if not changes_dir.is_dir():
         return {"exists": False, "changes": []}
@@ -184,8 +205,27 @@ async def list_changes(request: Request, session_id: str):
     for entry in sorted(changes_dir.iterdir()):
         if not entry.is_dir() or entry.name == "archive":
             continue
-        changes.append(_change_summary(session_id, entry))
-    return {"exists": True, "changes": changes}
+        changes.append((_change_mtime(entry), _change_summary(session_id, entry)))
+    # Newest edit first; the review-log workflow file is ignored by _change_mtime
+    # so approving/commenting doesn't reorder the list.
+    changes.sort(key=lambda t: t[0], reverse=True)
+    return {"exists": True, "changes": [c for _, c in changes]}
+
+
+def _change_mtime(change_dir: Path) -> float:
+    """Most recent mtime among a change's spec markdown files.
+
+    Only the spec content (``*.md``) counts — the ``.enclave-review.json``
+    workflow file is deliberately excluded so a review action does not bump a
+    change to the top of the list.
+    """
+    latest = 0.0
+    for p in change_dir.rglob("*.md"):
+        try:
+            latest = max(latest, p.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
 
 
 @router.get("/{session_id}/openspec/changes/{name}")
@@ -244,6 +284,7 @@ async def post_review(request: Request, session_id: str, name: str, body: Review
         raise HTTPException(status_code=404, detail="Change not found")
 
     now = datetime.now(timezone.utc).isoformat()
+    snapshot, blobs = _snapshot_files(change_dir, _openspec_root(session_id))
     event = {
         "id": f"rev_{int(time.time() * 1000)}",
         "type": "review",
@@ -252,9 +293,9 @@ async def post_review(request: Request, session_id: str, name: str, body: Review
         "state": body.state,
         "overall_note": body.note,
         "comments": [c.model_dump() for c in body.comments],
-        "snapshot_at_review": _snapshot_files(change_dir, _openspec_root(session_id)),
+        "snapshot_at_review": snapshot,
     }
-    _append_event(change_dir, event)
+    _append_event(change_dir, event, blobs)
     return {"ok": True, "review_id": event["id"], "state": derive_state(_read_log(change_dir)["events"])}
 
 
@@ -271,6 +312,80 @@ async def get_state(request: Request, session_id: str, name: str):
         "comment_statuses": statuses,
         "events": events,
     }
+
+
+@router.get("/{session_id}/openspec/changes/{name}/diff")
+async def get_diff(request: Request, session_id: str, name: str):
+    """Changed source lines per file since the user's last review.
+
+    Baseline = the latest review's ``snapshot_at_review`` content; "after" = the
+    current file content (what the UI renders). Changed line numbers are 0-based
+    and relative to the CURRENT version, so they map directly onto the rendered
+    ``data-line`` blocks. Returns ``{path: [changed_line, ...]}``.
+
+    Lazily backfills a missing baseline blob from the current file when the hash
+    still matches (covers reviews recorded before blobs were stored).
+    """
+    import difflib
+
+    change_dir = _safe_change_dir(session_id, name)
+    if not change_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Change not found")
+    root = _openspec_root(session_id)
+    doc = _read_log(change_dir)
+    events = doc.get("events", [])
+    blobs = doc.get("blobs", {})
+
+    reviews = [e for e in events if e.get("type") == "review"]
+    if not reviews:
+        return {"changed": {}}
+    baseline = sorted(reviews, key=lambda e: e.get("at", ""))[-1]
+    snap = baseline.get("snapshot_at_review", {}) or {}
+
+    changed: dict[str, list[int]] = {}
+    backfilled = False
+    for rel, base_hash in snap.items():
+        current = _read_text(root / rel)
+        if current is None:
+            continue
+        # Backfill baseline content if we only have the hash and the file is
+        # still unchanged since the review (hash matches current content).
+        base_content = blobs.get(base_hash)
+        if base_content is None:
+            if _hash(current) == base_hash:
+                blobs[base_hash] = current
+                base_content = current
+                backfilled = True
+            else:
+                continue  # can't reconstruct baseline; skip this file
+        if base_content == current:
+            continue
+        lines = _changed_after_lines(base_content, current, difflib)
+        if lines:
+            changed[rel] = lines
+    if backfilled:
+        doc["blobs"] = blobs
+        _write_log_atomic(change_dir, doc)
+    return {"changed": changed}
+
+
+def _changed_after_lines(before: str, after: str, difflib) -> list[int]:
+    """0-based line numbers in ``after`` that differ from ``before``.
+
+    Uses SequenceMatcher opcodes; 'replace'/'insert' mark the after-range, and a
+    'delete' marks the line where content was removed so the surrounding block is
+    still flagged. Trailing whitespace is normalized so pure reflow doesn't flag.
+    """
+    b = [ln.rstrip() for ln in before.split("\n")]
+    a = [ln.rstrip() for ln in after.split("\n")]
+    sm = difflib.SequenceMatcher(a=b, b=a, autojunk=False)
+    out: set[int] = set()
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("replace", "insert"):
+            out.update(range(j1, j2))
+        elif tag == "delete":
+            out.add(min(j1, max(len(a) - 1, 0)))
+    return sorted(out)
 
 
 class RevisionBody(BaseModel):
@@ -293,6 +408,7 @@ async def post_revision(request: Request, session_id: str, name: str, body: Revi
     if not change_dir.is_dir():
         raise HTTPException(status_code=404, detail="Change not found")
     now = datetime.now(timezone.utc).isoformat()
+    snapshot, blobs = _snapshot_files(change_dir, _openspec_root(session_id))
     event = {
         "id": f"arev_{int(time.time() * 1000)}",
         "type": "agent_revision",
@@ -303,8 +419,8 @@ async def post_revision(request: Request, session_id: str, name: str, body: Revi
         "why": body.why,
         "related_comment_ids": body.related_comment_ids,
         "files_changed": body.files_changed,
-        "snapshot_after": _snapshot_files(change_dir, _openspec_root(session_id)),
+        "snapshot_after": snapshot,
     }
-    _append_event(change_dir, event)
+    _append_event(change_dir, event, blobs)
     return {"ok": True, "revision_id": event["id"], "state": derive_state(_read_log(change_dir)["events"])}
 
