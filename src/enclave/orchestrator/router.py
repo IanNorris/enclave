@@ -20,6 +20,7 @@ from enclave.common.config import UserMapping
 from enclave.common.cost_tracker import CostTracker
 from enclave.common.logging import get_logger
 from enclave.common import panel as panel_mod
+from enclave.common import fusion as fusion_mod
 from enclave.common.protocol import Message, MessageType
 from enclave.orchestrator.approval import ApprovalManager
 from enclave.orchestrator.commands import (
@@ -416,6 +417,22 @@ class MessageRouter:
                 socket_path = await self.ipc.create_socket(session.id)
                 session.socket_path = str(socket_path)
 
+                # Re-seed the panel + fusion definitions so restored sessions
+                # pick up the current host config (custom presets/models) on
+                # resume, matching fresh-start behaviour.
+                try:
+                    panel_mod.write_workspace_panel(
+                        session.workspace_path, panel_mod.load_panel(self._data_dir),
+                    )
+                except Exception as e:
+                    log.warning("Failed to re-seed panel for %s: %s", session.id, e)
+                try:
+                    fusion_mod.write_workspace_fusion(
+                        session.workspace_path, fusion_mod.load_fusion(self._data_dir),
+                    )
+                except Exception as e:
+                    log.warning("Failed to re-seed fusion for %s: %s", session.id, e)
+
                 # Start the container
                 started, error = await self.containers.start_session(session.id)
                 if started:
@@ -521,12 +538,17 @@ class MessageRouter:
             log.error("Failed to restore concierge: %s", e)
 
     def _seed_concierge_workspace(self, session: Session) -> None:
-        """Seed the concierge workspace with the panel definition."""
+        """Seed the concierge workspace with the panel + fusion definitions."""
         try:
             panel_doc = panel_mod.load_panel(self._data_dir)
             panel_mod.write_workspace_panel(session.workspace_path, panel_doc)
         except Exception as e:
             log.warning("Failed to seed concierge panel: %s", e)
+        try:
+            fusion_doc = fusion_mod.load_fusion(self._data_dir)
+            fusion_mod.write_workspace_fusion(session.workspace_path, fusion_doc)
+        except Exception as e:
+            log.warning("Failed to seed concierge fusion: %s", e)
 
     # ------------------------------------------------------------------
     # Periodic health monitoring
@@ -1105,6 +1127,53 @@ class MessageRouter:
                         "session": session_credits or {},
                     },
                 )
+        elif msg.type == MessageType.FUSION_EVENT:
+            kind = msg.payload.get("kind", "")
+            if kind == "grade":
+                # Persist the complexity grade and broadcast it live.
+                score = msg.payload.get("score", 0)
+                tier = msg.payload.get("tier", "base")
+                reason = msg.payload.get("reason", "")
+                task = msg.payload.get("task", "")
+                try:
+                    self._cost.record_complexity(
+                        session_id=session.id, score=score, tier=tier,
+                        used_fusion=False, reason=reason, task=task,
+                    )
+                except Exception as e:
+                    log.warning("Failed to record complexity: %s", e)
+                if self._control:
+                    self._control.notify_fusion(session.id, {
+                        "kind": "grade", "score": score, "tier": tier,
+                        "reason": reason,
+                    })
+            elif kind == "fusion":
+                # A fusion run completed — record that fusion was used (update
+                # the latest grade if present) and broadcast the trace.
+                preset = msg.payload.get("preset", "")
+                models = msg.payload.get("models", [])
+                try:
+                    self._cost.record_complexity(
+                        session_id=session.id,
+                        score=msg.payload.get("score", 4),
+                        tier="fusion", used_fusion=True, preset=preset,
+                        reason=msg.payload.get("reason", "fusion run"),
+                        task=(msg.payload.get("prompt", "") or "")[:1000],
+                    )
+                except Exception as e:
+                    log.warning("Failed to record fusion use: %s", e)
+                if self._control:
+                    self._control.notify_fusion(session.id, {
+                        "kind": "fusion",
+                        "preset": preset,
+                        "preset_name": msg.payload.get("preset_name", ""),
+                        "models": models,
+                        "judge_model": msg.payload.get("judge_model", ""),
+                        "synthesizer_model": msg.payload.get("synthesizer_model", ""),
+                        "participants": msg.payload.get("participants", []),
+                        "judge_analysis": msg.payload.get("judge_analysis", ""),
+                        "final": msg.payload.get("final", ""),
+                    })
         elif msg.type == MessageType.NIX_SHELL_REQUEST:
             await self._handle_nix_shell_request(session, msg)
         elif msg.type == MessageType.PORT_REQUEST:
@@ -3088,6 +3157,13 @@ class MessageRouter:
             panel_mod.write_workspace_panel(session.workspace_path, panel_doc)
         except Exception as e:
             log.warning("[project:%s] Failed to seed panel: %s", project_name, e)
+
+        # Seed the Fusion presets (same rationale as the panel).
+        try:
+            fusion_doc = fusion_mod.load_fusion(self._data_dir)
+            fusion_mod.write_workspace_fusion(session.workspace_path, fusion_doc)
+        except Exception as e:
+            log.warning("[project:%s] Failed to seed fusion: %s", project_name, e)
 
         log.info("[project:%s] Starting container...", project_name)
         started, error = await self.containers.start_session(session.id)

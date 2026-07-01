@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from enclave.webui.event_store import PERSIST_TYPES, persist_event
 from enclave.common import panel as panel_mod
+from enclave.common import fusion as fusion_mod
 from enclave.orchestrator.session_manager import is_concierge
 
 if TYPE_CHECKING:
@@ -200,6 +201,28 @@ class ControlServer:
         header refreshes without a reload.
         """
         self._emit(session_id, {"ok": True, "type": "credits", **payload})
+
+    def notify_fusion(self, session_id: str, payload: dict) -> None:
+        """Called by the router on Auto Fusion grade + fusion events.
+
+        - kind="grade": live complexity update (1-5) + recommended tier. Pushed
+          to the chat stream so the UI shows current complexity, and broadcast
+          on the global channel for the sidebar. Persisted (in PERSIST_TYPES)
+          so the per-message complexity badge survives reloads.
+        - kind="fusion": a completed fusion run with the model combo + trace
+          (participant outcomes + judge analysis). Persisted (in PERSIST_TYPES)
+          so the tappable trace survives reloads.
+        """
+        kind = payload.get("kind", "")
+        if kind == "grade":
+            self._emit(session_id, {"ok": True, "type": "complexity", **payload})
+            self._emit_notification({
+                "type": "complexity", "session_id": session_id,
+                "score": payload.get("score"), "tier": payload.get("tier"),
+                "reason": payload.get("reason", ""),
+            })
+        elif kind == "fusion":
+            self._emit(session_id, {"ok": True, "type": "fusion", **payload})
 
     def _emit_notification(self, event: dict) -> None:
         """Push a cross-session notification event to all global subscribers."""
@@ -366,12 +389,18 @@ class ControlServer:
                 await self._handle_models(req, writer)
             elif action == "credits":
                 await self._handle_credits(req, writer)
+            elif action == "complexity":
+                await self._handle_complexity(req, writer)
             elif action == "profiles":
                 await self._handle_profiles(writer)
             elif action == "panel_get":
                 await self._handle_panel_get(writer)
             elif action == "panel_set":
                 await self._handle_panel_set(req, writer)
+            elif action == "fusion_get":
+                await self._handle_fusion_get(writer)
+            elif action == "fusion_set":
+                await self._handle_fusion_set(req, writer)
             elif action == "create":
                 await self._handle_create(req, writer)
             elif action == "schedule_list":
@@ -582,6 +611,21 @@ class ControlServer:
         payload["session"] = session_credits or {}
         await self._write(writer, payload)
 
+    async def _handle_complexity(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Return recorded Auto Fusion complexity grades for the graph.
+
+        Pass ``session`` for one session's scores, or omit for global.
+        """
+        session_id = req.get("session", "")
+        try:
+            scores = self._router._cost.complexity_scores(
+                session_id or None, limit=int(req.get("limit", 500)),
+            )
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        await self._write(writer, {"ok": True, "type": "complexity", "scores": scores})
+
     async def _handle_profiles(self, writer: asyncio.StreamWriter) -> None:
         """Return the configured container profiles for project creation."""
         try:
@@ -637,6 +681,46 @@ class ControlServer:
 
         await self._write(
             writer, {"ok": True, "type": "panel", "panel": panel, "pushed": pushed},
+        )
+
+    async def _handle_fusion_get(self, writer: asyncio.StreamWriter) -> None:
+        """Return the editable Fusion config (presets + auto routing) from host."""
+        try:
+            data_dir = self._router._data_dir
+            doc = fusion_mod.load_fusion(data_dir)
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        await self._write(writer, {"ok": True, "type": "fusion", "fusion": doc})
+
+    async def _handle_fusion_set(
+        self, req: dict, writer: asyncio.StreamWriter,
+    ) -> None:
+        """Persist a new Fusion config and push it to active workspaces."""
+        try:
+            data_dir = self._router._data_dir
+            doc = fusion_mod.save_fusion(data_dir, req.get("fusion"))
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+
+        # Propagate to every known session workspace so running agents pick up
+        # the change on their next fusion call (no restart required).
+        pushed = 0
+        try:
+            for session in self._router.containers.list_sessions():
+                ws = getattr(session, "workspace_path", "")
+                if ws and Path(ws).is_dir():
+                    try:
+                        fusion_mod.write_workspace_fusion(ws, doc)
+                        pushed += 1
+                    except Exception as e:
+                        log.warning("Failed to push fusion to %s: %s", ws, e)
+        except Exception as e:
+            log.warning("Fusion propagation failed: %s", e)
+
+        await self._write(
+            writer, {"ok": True, "type": "fusion", "fusion": doc, "pushed": pushed},
         )
 
     async def _handle_create(self, req: dict, writer: asyncio.StreamWriter) -> None:

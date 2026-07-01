@@ -45,6 +45,7 @@ class MimirLibrarianWorker:
         max_retries: int = 2,
         sidecar_enabled: bool = True,
         sidecar_model: str = "claude-haiku-4.5",
+        sweep_interval_secs: float = 300.0,
     ) -> None:
         self._librarian_bin = librarian_bin
         self._canonical_log = Path(canonical_log)
@@ -53,6 +54,13 @@ class MimirLibrarianWorker:
         self._run_timeout_secs = run_timeout_secs
         self._llm_timeout_secs = llm_timeout_secs
         self._max_retries = max_retries
+        # Periodic safety-net sweep interval. The worker is otherwise purely
+        # event-driven (triggered by mimir_record / compaction_complete); if no
+        # triggers arrive while drafts are pending — e.g. a quiet period, or the
+        # orchestrator started with a standing backlog — the queue would never
+        # drain. A periodic wake runs a drain whenever pending/ is non-empty so
+        # the backlog can't silently grow without bound. 0 disables the sweep.
+        self._sweep_interval_secs = sweep_interval_secs
         self._event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
@@ -163,23 +171,44 @@ class MimirLibrarianWorker:
     async def _loop(self) -> None:
         while not self._stopping:
             try:
-                await self._event.wait()
-                if self._stopping:
-                    break
-                # Debounce: wait a quiet period; if more triggers arrive
-                # we keep extending. This batches 9-compactions-in-a-row
-                # into a single librarian run.
-                while not self._stopping:
-                    self._event.clear()
+                # Wait for a trigger, but wake periodically to sweep: if drafts
+                # are pending and no trigger arrived, drain anyway. This is the
+                # safety net against the worker being purely event-driven.
+                triggered = True
+                if self._sweep_interval_secs and self._sweep_interval_secs > 0:
                     try:
                         await asyncio.wait_for(
-                            self._event.wait(),
-                            timeout=self._debounce_secs,
+                            self._event.wait(), timeout=self._sweep_interval_secs,
                         )
                     except asyncio.TimeoutError:
-                        break
+                        triggered = False
+                else:
+                    await self._event.wait()
                 if self._stopping:
                     break
+                if not triggered:
+                    # Periodic wake. Only run if there's actually a backlog;
+                    # _run_once also guards on this, but checking here avoids the
+                    # debounce wait + log noise on an empty queue.
+                    if not self._has_pending():
+                        continue
+                    log.info("Mimir librarian: periodic sweep — draining pending backlog")
+                else:
+                    # Debounce: wait a quiet period; if more triggers arrive
+                    # we keep extending. This batches 9-compactions-in-a-row
+                    # into a single librarian run.
+                    while not self._stopping:
+                        self._event.clear()
+                        try:
+                            await asyncio.wait_for(
+                                self._event.wait(),
+                                timeout=self._debounce_secs,
+                            )
+                        except asyncio.TimeoutError:
+                            break
+                    if self._stopping:
+                        break
+                self._event.clear()
                 await self._run_once()
             except asyncio.CancelledError:
                 break
@@ -187,6 +216,14 @@ class MimirLibrarianWorker:
                 log.exception("Mimir librarian worker loop iteration failed")
                 # Avoid hot-spin on persistent failure
                 await asyncio.sleep(5)
+
+    def _has_pending(self) -> bool:
+        """Whether the pending/ drafts dir has at least one entry."""
+        pending = self._drafts_dir / "pending"
+        try:
+            return pending.is_dir() and any(pending.iterdir())
+        except OSError:
+            return False
 
     def _break_stale_lock(self) -> None:
         """Remove the workspace write lock iff its owner process is dead.

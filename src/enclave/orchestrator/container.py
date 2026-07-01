@@ -131,6 +131,10 @@ class ContainerManager:
         if session.id == "__concierge__":
             cmd.extend(["-e", "ENCLAVE_CONCIERGE=1"])
 
+        # Auto Fusion mode (self-grade complexity + escalate to fusion).
+        if getattr(profile, "auto_fusion", False):
+            cmd.extend(["-e", "ENCLAVE_AUTO_FUSION=1"])
+
         # Persistent HOME: bind-mount a workspace-backed directory over the
         # container's $HOME so dotfile caches (.m2, .gradle, .cargo, .cache, …)
         # survive restarts. The container is started with --rm, so $HOME
@@ -494,6 +498,8 @@ class ContainerManager:
         env["ENCLAVE_HOST_MOUNTS"] = "0"
         env["ENCLAVE_YOLO"] = "1" if profile.yolo else "0"
         env["ENCLAVE_HOST_MODE"] = "1"
+        if getattr(profile, "auto_fusion", False):
+            env["ENCLAVE_AUTO_FUSION"] = "1"
 
         # Concierge: the always-on control-room agent gets fleet-management tools.
         if session.id == "__concierge__":

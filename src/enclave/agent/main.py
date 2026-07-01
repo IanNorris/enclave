@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from enclave.agent.ipc_client import IPCClient
 from enclave.common import panel as _panel_mod
+from enclave.common import fusion as _fusion_mod
 from enclave.common.protocol import Message, MessageType
 
 if TYPE_CHECKING:
@@ -972,6 +973,33 @@ async def handle_user_message(
     if timestamp:
         content = f"<current_datetime>{timestamp}</current_datetime>\n\n{content}"
 
+    # Per-turn Fusion routing: when the user has picked a fusion mode from the
+    # model list, inject a one-line directive so the choice takes effect at
+    # runtime (no session restart). Read fresh each turn so toggling is live.
+    try:
+        fusion_mode = _fusion_mod.read_fusion_mode(_workspace_root())
+    except Exception:
+        fusion_mode = ""
+    if fusion_mode and content.strip():
+        if fusion_mode == _fusion_mod.AUTO_FUSION_MODEL_ID:
+            content = (
+                "<auto_fusion>For this message, if it is a substantive unit of "
+                "work (planning, design, a tricky algorithm, an architectural or "
+                "high-risk change), FIRST call `grade_complexity`; on tier "
+                "**fusion** (4-5) call the `fusion` tool and base your answer on "
+                "its synthesized result. Skip grading for trivial chatter or "
+                "obvious one-liners.</auto_fusion>\n\n"
+            ) + content
+        elif fusion_mode.startswith(_fusion_mod.FUSION_MODEL_PREFIX):
+            preset_id = fusion_mode[len(_fusion_mod.FUSION_MODEL_PREFIX):]
+            content = (
+                f"<fusion_mode>For this message, answer by calling the `fusion` "
+                f"tool with preset \"{preset_id}\" (pass the user's full request "
+                f"as the prompt), then base your final answer on its synthesized "
+                f"result. Skip only if the request is trivial chatter or a simple "
+                f"one-liner.</fusion_mode>\n\n"
+            ) + content
+
     if state.sdk_session is None:
         await state.ipc.send(Message(
             type=MessageType.AGENT_RESPONSE,
@@ -1272,6 +1300,12 @@ _NO_REASONING_EFFORT_MODELS: frozenset[str] = frozenset()
 # Populated at startup by _configure_model(); shared with consult_panel.
 _AVAILABLE_MODEL_IDS: set[str] = set()
 
+# model id → list of supported reasoning-effort levels, from each model's
+# capabilities.supports.reasoning_effort (the authoritative per-model list; the
+# flat supportedReasoningEfforts field is understated for some models). Used to
+# clamp a requested effort down to what a model actually allows.
+_MODEL_REASONING_EFFORTS: dict[str, list[str]] = {}
+
 
 def _resolve_model(preferences: tuple[str, ...]) -> str:
     """Pick the first model from preferences that's actually available.
@@ -1289,6 +1323,216 @@ def _resolve_model(preferences: tuple[str, ...]) -> str:
     return preferences[0]
 
 
+def _copilot_cli_bin() -> str:
+    """Resolve the bundled copilot CLI binary (for one-shot model calls)."""
+    try:
+        import copilot as _copilot_pkg
+        cli_dir = os.path.dirname(_copilot_pkg.__file__)
+        return os.path.join(cli_dir, "bin", "copilot")
+    except Exception:
+        return "copilot"
+
+
+async def _run_oneshot_warm(
+    client: object, model: str, prompt: str, *, timeout: float = 180.0,
+    reasoning_effort: str = "",
+) -> str:
+    """Run a single prompt against a warm CopilotClient via a throwaway session.
+
+    Creates a fresh, tool-disabled session on the already-running ACP client
+    (state cleared between calls), sends the prompt, waits for the assistant's
+    final message, then deletes the session. This is the same warm-ACP +
+    fresh-session pattern as the Mimir sidecar, applied in-process: it avoids
+    the cold-start cost and the nested-subprocess fragility of spawning
+    ``copilot -p`` from inside a live tool handler. Never raises; returns a
+    bracketed marker on failure so callers can degrade gracefully.
+
+    When *reasoning_effort* is set, it's clamped to the model's supported levels
+    and applied via set_model after creation; rejection falls back to the
+    model's default effort rather than failing the call.
+    """
+    from copilot.generated.session_events import AssistantMessageData
+
+    async def _deny(_req: object) -> object:
+        return None  # tools disabled — no permission request should arrive
+
+    sid = None
+    try:
+        session = await client.create_session(  # type: ignore[attr-defined]
+            on_permission_request=_deny,
+            model=model,
+            available_tools=[],
+        )
+        sid = getattr(session, "session_id", None)
+        effort = _fusion_mod.clamp_effort(
+            reasoning_effort, _MODEL_REASONING_EFFORTS.get(model),
+        )
+        if effort:
+            try:
+                await session.set_model(model, reasoning_effort=effort)
+            except Exception as e:
+                # Model rejected the effort despite the catalog — run at default.
+                print(
+                    f"[agent] _run_oneshot_warm: {model} rejected effort "
+                    f"'{effort}' ({e}); using default",
+                    file=sys.stderr,
+                )
+        resp = await session.send_and_wait(prompt, timeout=timeout)
+        if resp is not None and isinstance(resp.data, AssistantMessageData):
+            return (resp.data.content or "").strip()
+        return "[No response]"
+    except asyncio.TimeoutError:
+        return f"[Timed out after {int(timeout)}s]"
+    except Exception as e:
+        print(f"[agent] _run_oneshot_warm Exception: {type(e).__name__}: {e}", file=sys.stderr)
+        return f"[Error: {e}]"
+    except BaseException as e:
+        print(f"[agent] _run_oneshot_warm BaseException: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+    finally:
+        if sid is not None:
+            try:
+                await client.delete_session(sid)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+
+async def _run_copilot_oneshot(
+    model: str, prompt: str, *, timeout: float = 180.0, client: object | None = None,
+    reasoning_effort: str = "",
+) -> str:
+    """Run a single non-interactive model call with a specific model.
+
+    Shared by consult_panel and Fusion. When *client* (a warm CopilotClient) is
+    provided, runs against a throwaway session on it — fast and robust from
+    inside a live tool handler. Otherwise falls back to cold-spawning the
+    bundled ``copilot -p`` CLI. Returns cleaned text (or a bracketed
+    error/empty marker). Never raises.
+    """
+    if client is not None:
+        return await _run_oneshot_warm(
+            client, model, prompt, timeout=timeout, reasoning_effort=reasoning_effort,
+        )
+    cli_bin = _copilot_cli_bin()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli_bin, "-p", prompt,
+            "--model", model,
+            "--no-auto-update",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+        text = stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            return f"[No response. stderr: {err[:300]}]"
+        # Strip CLI decoration lines (status bullets, tool JSON echoes).
+        lines = text.split("\n")
+        cleaned = [
+            ln for ln in lines
+            if not ln.startswith("●") and not ln.strip().startswith("└ {")
+        ]
+        return "\n".join(cleaned).strip() or text
+    except asyncio.TimeoutError:
+        return f"[Timed out after {int(timeout)}s]"
+    except Exception as e:
+        return f"[Error: {e}]"
+
+
+async def _run_fusion(preset: dict, prompt: str, *, client: object | None = None) -> dict:
+    """Run the Fusion pipeline for one preset.
+
+    Stages: fan out the prompt to each participant model in parallel → judge
+    extracts structure → synthesizer writes the final answer. Returns a dict
+    with the final answer plus the full trace (participant responses, judge
+    analysis, resolved models) so the caller can both render it and emit a
+    structured FUSION_EVENT for the UI.
+
+    When *client* (a warm CopilotClient) is provided, every model call runs
+    against a throwaway session on it instead of cold-spawning copilot — fast
+    and safe from inside a live tool handler.
+    """
+    participants: list[list[str]] = preset.get("participants") or []
+    judge_prefs = tuple(preset.get("judge") or ()) or _MODEL_PREFERENCES
+    synth_prefs = tuple(preset.get("synthesizer") or ()) or _MODEL_PREFERENCES
+    effort = str(preset.get("reasoning_effort") or "")
+
+    seats: list[str] = []
+    for prefs in participants:
+        model = _resolve_model(tuple(prefs)) if prefs else _resolve_model(_MODEL_PREFERENCES)
+        seats.append(model)
+    if not seats:
+        return {"error": "preset has no participants"}
+
+    print(
+        "[agent] fusion[%s]: %d participants (%s) effort=%s" % (
+            preset.get("id", "?"), len(seats), ", ".join(seats), effort or "default",
+        ),
+        file=sys.stderr,
+    )
+
+    # Stage 1 — fan out (parallel).
+    part_prompt = _fusion_mod.build_participant_prompt(prompt)
+    responses_raw = await asyncio.gather(*(
+        _run_copilot_oneshot(model, part_prompt, client=client, reasoning_effort=effort)
+        for model in seats
+    ))
+    responses = list(zip(seats, responses_raw))
+
+    # Stage 2 — judge.
+    judge_model = _resolve_model(judge_prefs)
+    judge_prompt = _fusion_mod.build_judge_prompt(prompt, responses)
+    print(f"[agent] fusion: judging with {judge_model}", file=sys.stderr)
+    judge_analysis = await _run_copilot_oneshot(
+        judge_model, judge_prompt, timeout=240.0, client=client, reasoning_effort=effort,
+    )
+
+    # Stage 3 — synthesize.
+    synth_model = _resolve_model(synth_prefs)
+    synth_prompt = _fusion_mod.build_synthesizer_prompt(prompt, judge_analysis, responses)
+    print(f"[agent] fusion: synthesizing with {synth_model}", file=sys.stderr)
+    final = await _run_copilot_oneshot(
+        synth_model, synth_prompt, timeout=240.0, client=client, reasoning_effort=effort,
+    )
+
+    return {
+        "preset_id": preset.get("id", ""),
+        "preset_name": preset.get("name", preset.get("id", "fusion")),
+        "participants": [
+            {"model": label, "response": text} for label, text in responses
+        ],
+        "judge_model": judge_model,
+        "judge_analysis": judge_analysis,
+        "synthesizer_model": synth_model,
+        "final": final,
+    }
+
+
+def _format_fusion_result(result: dict) -> str:
+    """Render a fusion result dict as markdown: final answer + foldable trace."""
+    final = result.get("final", "")
+    judge_model = result.get("judge_model", "")
+    synth_model = result.get("synthesizer_model", "")
+    name = result.get("preset_name", "fusion")
+    trace_parts = [
+        f"### {p['model']}\n\n{p['response']}"
+        for p in result.get("participants", [])
+    ]
+    trace = "\n\n".join(trace_parts)
+    return (
+        f"{final}\n\n"
+        "<details>\n<summary>Fusion trace "
+        f"(preset: {name}, judge: {judge_model}, synthesizer: {synth_model})"
+        "</summary>\n\n"
+        f"#### Judge analysis\n\n{result.get('judge_analysis', '')}\n\n"
+        f"#### Participant responses\n\n{trace}\n</details>"
+    )
+
+
 async def _configure_model(
     session: _CopilotSession, client: _CopilotClient | None = None,
 ) -> None:
@@ -1303,15 +1547,23 @@ async def _configure_model(
     global _AVAILABLE_MODEL_IDS
     # Try to discover available models via the client.
     target = _MODEL_PREFERENCES[0]
+    global _MODEL_REASONING_EFFORTS
     try:
         if client is not None:
             try:
                 models = await client.list_models()
                 _AVAILABLE_MODEL_IDS = {m.id for m in models}
+                _MODEL_REASONING_EFFORTS = {
+                    m.id: list(
+                        getattr(getattr(m.capabilities, "supports", None), "reasoning_effort", None)
+                        or []
+                    )
+                    for m in models
+                }
             except Exception as e:
                 # Newer CLI releases may return models with null `supports`/`limits`
                 # fields that trip the SDK's pydantic parser. Fall back to a raw
-                # JSON-RPC call and extract just the ids we need.
+                # JSON-RPC call and extract the ids + per-model effort lists.
                 print(
                     f"[agent] list_models parse failed ({e}); trying raw RPC",
                     file=sys.stderr,
@@ -1319,6 +1571,13 @@ async def _configure_model(
                 raw = await client._client.request("models.list", {})
                 _AVAILABLE_MODEL_IDS = {
                     m.get("id") for m in raw.get("models", []) if m.get("id")
+                }
+                _MODEL_REASONING_EFFORTS = {
+                    m["id"]: list(
+                        ((m.get("capabilities") or {}).get("supports") or {})
+                        .get("reasoning_effort") or []
+                    )
+                    for m in raw.get("models", []) if m.get("id")
                 }
             chosen = next(
                 (m for m in _MODEL_PREFERENCES if m in _AVAILABLE_MODEL_IDS),
@@ -1641,6 +1900,29 @@ async def try_init_copilot(
                     + instructions_text
                 )
                 print(f"[agent] Loaded workspace instructions ({len(instructions_text)} chars)", file=sys.stderr)
+
+        # Auto Fusion mode: when enabled for the session, instruct the agent to
+        # self-grade complexity and escalate hard work to the fusion pipeline.
+        if os.environ.get("ENCLAVE_AUTO_FUSION", "").strip() in ("1", "true", "yes"):
+            prompt_parts.append(
+                "# Auto Fusion mode (ENABLED)\n\n"
+                "This session runs in **Auto Fusion**: use a cheaper model for "
+                "routine work, and escalate to a panel of models (Fusion) for "
+                "high-complexity work — automatically.\n\n"
+                "**At the start of any substantive task** (planning, design, a "
+                "tricky algorithm, an architectural choice, or a high-risk "
+                "change), FIRST call `grade_complexity` with a short description "
+                "of what you're about to do. It returns a 1-5 score and a tier:\n"
+                "- tier **base** (1-3): just do the work yourself as normal.\n"
+                "- tier **fusion** (4-5): call the `fusion` tool with the task "
+                "as the prompt, then base your answer/implementation on its "
+                "synthesized result.\n\n"
+                "Do NOT grade trivial chatter, obvious one-liners, or simple "
+                "follow-ups — only grade genuine units of work. Never grade more "
+                "than once for the same unit of work. The grade is shown to the "
+                "user live, so be honest, not inflationary."
+            )
+            print("[agent] Auto Fusion mode enabled", file=sys.stderr)
 
         # Load session-specific prompt (.enclave-session-prompt)
         session_prompt_path = Path(working_directory) / ".enclave-session-prompt"
@@ -4572,13 +4854,6 @@ async def try_init_copilot(
                 )
 
             # Launch every enabled panelist in parallel via copilot -p subprocesses.
-            try:
-                import copilot as _copilot_pkg
-                cli_dir = os.path.dirname(_copilot_pkg.__file__)
-                cli_bin = os.path.join(cli_dir, "bin", "copilot")
-            except Exception:
-                cli_bin = "copilot"
-
             panelists = []
             for member in members:
                 prefs = tuple(member.get("models") or ())
@@ -4590,33 +4865,7 @@ async def try_init_copilot(
                 name: str, model: str, prompt: str,
             ) -> tuple[str, str]:
                 """Run a single panelist and return (name, response)."""
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        cli_bin, "-p", prompt,
-                        "--model", model,
-                        "--no-auto-update",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env={**os.environ, "NO_COLOR": "1"},
-                    )
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=180.0,
-                    )
-                    text = stdout.decode("utf-8", errors="replace").strip()
-                    if not text:
-                        err = stderr.decode("utf-8", errors="replace").strip()
-                        return (name, f"[No response. stderr: {err[:300]}]")
-                    # Strip CLI decoration lines
-                    lines = text.split("\n")
-                    cleaned = [
-                        ln for ln in lines
-                        if not ln.startswith("●") and not ln.strip().startswith("└ {")
-                    ]
-                    return (name, "\n".join(cleaned).strip() or text)
-                except asyncio.TimeoutError:
-                    return (name, "[Timed out after 180s]")
-                except Exception as e:
-                    return (name, f"[Error: {e}]")
+                return (name, await _run_copilot_oneshot(model, prompt))
 
             print(
                 "[agent] consult_panel: launching %d panelists (%s)" % (
@@ -4690,6 +4939,214 @@ async def try_init_copilot(
             },
         )
         custom_tools.append(consult_panel_tool)
+
+        # ── Custom tool: fusion — transparent compound model ──
+        # Fan a prompt out to a panel of DIVERSE models in parallel, have a
+        # judge extract the structure of their responses, then a synthesizer
+        # write the final grounded answer. Unlike consult_panel (archetype
+        # personas; caller synthesizes), fusion uses model diversity and
+        # synthesizes for you — the "transparent consult_panel".
+        async def _fusion_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            prompt = (args.get("prompt") or "").strip()
+            preset_id = (args.get("preset") or "").strip()
+            if not prompt:
+                return ToolResult(
+                    text_result_for_llm="Error: provide a 'prompt' to fuse.",
+                    result_type="error",
+                )
+
+            fusion_doc = _fusion_mod.load_workspace_fusion(working_directory)
+            presets = _fusion_mod.enabled_presets(fusion_doc)
+            if not presets:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: no Fusion presets are enabled. Configure at "
+                        "least one preset (participants + judge + synthesizer)."
+                    ),
+                    result_type="error",
+                )
+            preset = (
+                _fusion_mod.get_preset(fusion_doc, preset_id)
+                if preset_id else presets[0]
+            )
+            if preset is None:
+                avail = ", ".join(p["id"] for p in presets)
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Error: unknown Fusion preset '{preset_id}'. "
+                        f"Available: {avail}."
+                    ),
+                    result_type="error",
+                )
+
+            try:
+                result = await _run_fusion(
+                    preset, prompt,
+                    client=(agent_state.sdk_client if agent_state else None),
+                )
+            except Exception as e:
+                return ToolResult(
+                    text_result_for_llm=f"Fusion failed: {e}",
+                    result_type="error",
+                )
+            if result.get("error"):
+                return ToolResult(
+                    text_result_for_llm=f"Fusion error: {result['error']}",
+                    result_type="error",
+                )
+
+            # Emit a structured FUSION_EVENT so the UI can show the model combo
+            # and a tappable trace (participant outcomes + judge decision).
+            if ipc is not None:
+                models = [p["model"] for p in result.get("participants", [])]
+                await ipc.send(Message(
+                    type=MessageType.FUSION_EVENT,
+                    payload={
+                        "kind": "fusion",
+                        "preset": result.get("preset_id", ""),
+                        "preset_name": result.get("preset_name", ""),
+                        "models": models,
+                        "judge_model": result.get("judge_model", ""),
+                        "synthesizer_model": result.get("synthesizer_model", ""),
+                        "participants": result.get("participants", []),
+                        "judge_analysis": result.get("judge_analysis", ""),
+                        "final": result.get("final", ""),
+                        "prompt": prompt[:2000],
+                    },
+                ))
+            return ToolResult(text_result_for_llm=_format_fusion_result(result))
+
+        fusion_tool = Tool(
+            name="fusion",
+            description=(
+                "Fusion — a transparent compound model. Fans your prompt out to "
+                "a panel of DIVERSE models in parallel, a judge extracts the "
+                "structure of their answers (consensus, contradictions, blind "
+                "spots), and a synthesizer writes the single best final answer. "
+                "Use for hard one-shot questions where model diversity helps: "
+                "complex planning, tricky design/algorithm decisions, research "
+                "questions, or high-risk calls. (consult_panel is the archetype "
+                "variant where YOU synthesize; fusion synthesizes for you.) "
+                "Pick a preset by cost/quality: 'frontier', 'balanced', or "
+                "'budget' (default: the first enabled preset)."
+            ),
+            handler=_fusion_handler,
+            skip_permission=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The full question/task to fuse. Include all "
+                            "relevant context and constraints — each model "
+                            "answers this independently."
+                        ),
+                    },
+                    "preset": {
+                        "type": "string",
+                        "description": (
+                            "Which fusion preset to use (e.g. 'frontier', "
+                            "'balanced', 'budget'). Omit for the default."
+                        ),
+                    },
+                },
+                "required": ["prompt"],
+            },
+        )
+        custom_tools.append(fusion_tool)
+
+        # ── Custom tool: grade_complexity — Auto Fusion router ──
+        # Scores the current task 1-5 and records it so Auto Fusion can route
+        # cheap tasks to the base model and escalate hard ones to fusion. The
+        # grade is emitted to the UI (live complexity + recommended tier).
+        async def _grade_complexity_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            task = (args.get("task") or "").strip()
+            if not task:
+                return ToolResult(
+                    text_result_for_llm="Error: provide a 'task' to grade.",
+                    result_type="error",
+                )
+            fusion_doc = _fusion_mod.load_workspace_fusion(working_directory)
+            threshold = int(fusion_doc.get("auto_threshold", 4))
+            grader_model = _resolve_model(
+                tuple(fusion_doc.get("base_model", "") and [fusion_doc["base_model"]] or [])
+                or _MODEL_PREFERENCES
+            )
+            grade_prompt = _fusion_mod.build_complexity_prompt(task)
+            raw = await _run_copilot_oneshot(
+                grader_model, grade_prompt, timeout=90.0,
+                client=(agent_state.sdk_client if agent_state else None),
+                reasoning_effort=str(fusion_doc.get("base_reasoning_effort") or ""),
+            )
+            graded = _fusion_mod.parse_complexity(raw, threshold=threshold)
+            score = graded["score"]
+            tier = graded["tier"]
+            reason = graded["reason"]
+
+            # Emit + record (orchestrator persists to the complexity DB).
+            if ipc is not None:
+                await ipc.send(Message(
+                    type=MessageType.FUSION_EVENT,
+                    payload={
+                        "kind": "grade",
+                        "score": score,
+                        "tier": tier,
+                        "reason": reason,
+                        "threshold": threshold,
+                        "task": task[:1000],
+                    },
+                ))
+
+            preset_hint = ""
+            if tier == "fusion":
+                presets = _fusion_mod.enabled_presets(fusion_doc)
+                if presets:
+                    preset_hint = (
+                        f" Use the `fusion` tool (preset '{presets[0]['id']}') "
+                        "for this task."
+                    )
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Complexity: {score}/5 → tier '{tier}' "
+                    f"(threshold {threshold}). {reason}{preset_hint}"
+                ),
+            )
+
+        grade_complexity_tool = Tool(
+            name="grade_complexity",
+            description=(
+                "Auto Fusion: grade the complexity (1-5) of the task you're "
+                "about to do, to decide whether to answer with the base model "
+                "or escalate to `fusion`. Call this at the START of substantive "
+                "work — planning, design, tricky implementation, or anything "
+                "high-stakes. 1-2 = trivial/simple, 3 = moderate, 4-5 = complex "
+                "(use fusion). When the result says tier 'fusion', call the "
+                "`fusion` tool for the actual work. Skip this for routine "
+                "chatter and obvious one-liners."
+            ),
+            handler=_grade_complexity_handler,
+            skip_permission=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "A short description of the task/turn you're about "
+                            "to tackle, with enough context to judge its "
+                            "complexity."
+                        ),
+                    },
+                },
+                "required": ["task"],
+            },
+        )
+        custom_tools.append(grade_complexity_tool)
+
+
 
         # ── Custom tool: web_search ──
         async def _web_search_handler(invocation: object) -> ToolResult:

@@ -22,6 +22,19 @@ RUN pip install --no-cache-dir /build && rm -rf /build
 # Mimir memory binaries (see Containerfile for rationale).
 COPY container/mimir-bin/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/mimir-* 2>/dev/null || true
+# Repoint the NixOS-built binaries' ELF interpreter to the standard Debian
+# loader (see Containerfile for the full rationale).
+RUN if ls /usr/local/bin/mimir-* >/dev/null 2>&1; then \
+        apt-get update && apt-get install -y --no-install-recommends patchelf && \
+        for b in /usr/local/bin/mimir-cli /usr/local/bin/mimir-librarian /usr/local/bin/mimir-mcp; do \
+            [ -f "$b" ] || continue; \
+            case "$(patchelf --print-interpreter "$b" 2>/dev/null)" in \
+                /nix/*) patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
+                                 --set-rpath /lib/x86_64-linux-gnu "$b" ;; \
+            esac; \
+        done && \
+        apt-get purge -y patchelf && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Patch the bundled Copilot CLI's Ice() permission-response handler at start.
 # github-copilot-sdk 0.3.0 bundles CLI 1.0.36-0, which carries the 1.0.35 Ice()
