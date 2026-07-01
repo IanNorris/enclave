@@ -68,3 +68,12 @@ feedback that drove it is recorded in this change's review history.
 - Threaded replies, editing/deleting sent comments, comment re-opening on
   regression, multi-reviewer identity, per-file approval scope, server-side
   draft sync.
+
+## Deferred consumers (phase 2)
+
+- **Panel/fusion consult as a review document:** attach the agent's panel
+  consult (synthesized doc + judge analysis) to a change as a review artifact,
+  and have the agent surface trajectory-altering decision forks. The "surface
+  decision forks" part is a consumer of `add-decision-fork-menu` (its own
+  change); the "attach consult doc" part extends this change's event log +
+  `publish_artifact`. Neither is a standalone spec.
