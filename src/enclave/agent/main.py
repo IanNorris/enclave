@@ -3807,6 +3807,95 @@ async def try_init_copilot(
         )
         custom_tools.append(openspec_revision_log_tool)
 
+        # Custom tool: openspec_archive — archive a completed OpenSpec change by
+        # running the real `openspec archive` CLI (which moves the change to
+        # openspec/changes/archive/ and merges its delta specs into the canonical
+        # openspec/specs/). Kept as an agent tool so the web process never invokes
+        # the CLI; the agent commits the resulting spec changes.
+        async def _openspec_archive_handler(invocation: object) -> ToolResult:
+            args = getattr(invocation, "arguments", {}) or {}
+            change = (args.get("change") or "").strip()
+            if not change:
+                return ToolResult(
+                    text_result_for_llm="Error: 'change' is required.",
+                    result_type="error",
+                )
+            skip_specs = bool(args.get("skip_specs", False))
+            # Resolve the openspec root (same logic as openspec_revision_log).
+            root = os.environ.get("ENCLAVE_OPENSPEC_ROOT")
+            root_path = Path(root) if root else None
+            if root_path is None:
+                probe = Path(working_directory).resolve()
+                for cand in [probe, *probe.parents]:
+                    if (cand / "openspec" / "changes" / change).is_dir():
+                        root_path = cand
+                        break
+            if root_path is None:
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Error: could not locate openspec/changes/{change} from "
+                        f"{working_directory}. Set ENCLAVE_OPENSPEC_ROOT."
+                    ),
+                    result_type="error",
+                )
+            cmd = ["openspec", "archive", change, "--json", "-y"]
+            if skip_specs:
+                cmd.append("--skip-specs")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, cwd=str(root_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+            except FileNotFoundError:
+                return ToolResult(
+                    text_result_for_llm=(
+                        "Error: the 'openspec' CLI is not available in this "
+                        "environment. It must be installed (npm i -g @fission-ai/openspec)."
+                    ),
+                    result_type="error",
+                )
+            out = (stdout or b"").decode("utf-8", "replace")
+            err = (stderr or b"").decode("utf-8", "replace")
+            # Surface validation failures rather than swallowing them.
+            if proc.returncode != 0:
+                detail = out.strip() or err.strip() or f"exit {proc.returncode}"
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"openspec archive failed for '{change}':\n{detail[:1500]}"
+                    ),
+                    result_type="error",
+                )
+            return ToolResult(
+                text_result_for_llm=(
+                    f"Archived '{change}'. It has moved to openspec/changes/archive/ "
+                    "and its specs merged into openspec/specs/. Commit the resulting "
+                    "changes to record the archive."
+                ),
+            )
+
+        openspec_archive_tool = Tool(
+            name="openspec_archive",
+            description=(
+                "Archive a COMPLETED OpenSpec change: runs `openspec archive`, "
+                "which moves it to openspec/changes/archive/ and merges its delta "
+                "specs into the canonical openspec/specs/. Use only when the change "
+                "is done and approved. Commit the resulting spec changes afterward."
+            ),
+            handler=_openspec_archive_handler,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "change": {"type": "string", "description": "The change name (folder under openspec/changes/)."},
+                    "skip_specs": {"type": "boolean", "description": "Skip spec merge (only for tooling/doc-only changes with no spec deltas)."},
+                },
+                "required": ["change"],
+            },
+            skip_permission=True,
+        )
+        custom_tools.append(openspec_archive_tool)
+
         # Custom tool: ask_user — ask the user a question (optionally as a poll)
         async def _ask_user_handler(invocation: object) -> ToolResult:
             args = getattr(invocation, "arguments", {}) or {}

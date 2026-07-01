@@ -14,7 +14,9 @@ FROM python:3.12-slim
 # not, it's harmless dead weight (~1MB).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    git curl jq xz-utils fuse3 && \
+    git curl jq xz-utils fuse3 nodejs npm && \
+    npm install -g @fission-ai/openspec && \
+    npm cache clean --force && \
     rm -rf /var/lib/apt/lists/* && \
     useradd -m -u 1000 -s /bin/bash agent
 

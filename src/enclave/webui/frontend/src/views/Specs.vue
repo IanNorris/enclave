@@ -16,8 +16,9 @@
     <div v-else class="specs-grid">
       <!-- Change list -->
       <div class="card change-list">
+        <!-- Active + needs-approval -->
         <div
-          v-for="ch in changes"
+          v-for="ch in activeChanges"
           :key="ch.id"
           class="change-item"
           :class="{ active: selected && selected.id === ch.id }"
@@ -25,13 +26,47 @@
         >
           <div class="change-top">
             <span class="change-name">{{ ch.id }}</span>
-            <span v-if="ch.review && ch.review.state && ch.review.state !== 'none'" class="review-badge" :class="ch.review.state">{{ badgeLabel(ch.review.state) }}</span>
+            <span class="lifecycle-badge" :class="ch.lifecycle">{{ lifecycleLabel(ch) }}</span>
           </div>
           <div class="mini-progress">
             <div class="mini-bar"><div class="mini-fill" :style="{ width: ch.taskProgress.percent + '%' }"></div></div>
             <span class="mini-pct">{{ ch.taskProgress.done }}/{{ ch.taskProgress.total }}</span>
           </div>
         </div>
+
+        <!-- Done (collapsed) -->
+        <details v-if="doneChanges.length" class="group">
+          <summary>✅ Done ({{ doneChanges.length }})</summary>
+          <div
+            v-for="ch in doneChanges"
+            :key="ch.id"
+            class="change-item"
+            :class="{ active: selected && selected.id === ch.id }"
+            @click="select(ch.id)"
+          >
+            <div class="change-top">
+              <span class="change-name">{{ ch.id }}</span>
+              <span class="lifecycle-badge done">✅ Done</span>
+            </div>
+          </div>
+        </details>
+
+        <!-- Archived (collapsed, read-only) -->
+        <details v-if="archivedChanges.length" class="group">
+          <summary>🗄️ Archived ({{ archivedChanges.length }})</summary>
+          <div
+            v-for="ch in archivedChanges"
+            :key="ch.id"
+            class="change-item archived"
+            :class="{ active: selected && selected.id === ch.id }"
+            @click="select(ch.id)"
+          >
+            <div class="change-top">
+              <span class="change-name">{{ archivedName(ch.id) }}</span>
+              <span class="lifecycle-badge archived">🗄️</span>
+            </div>
+          </div>
+        </details>
       </div>
 
       <!-- Detail -->
@@ -47,7 +82,9 @@
               {{ isPinned(selected.id) ? '📌 Pinned' : '📌 Pin' }}
             </button>
             <span v-if="awaitingAgent" class="await-note">⏳ Awaiting agent</span>
-            <button v-if="canApprove" class="btn-sm approve" @click="submitReview('approved')">✅ Approve</button>
+            <button v-if="canApprove && !isArchivedSel" class="btn-sm approve" @click="submitReview('approved')">✅ Approve</button>
+            <button v-if="selected.lifecycle === 'done'" class="btn-sm" @click="archiveChange">🗄️ Archive</button>
+            <span v-if="isArchivedSel" class="await-note">🗄️ Archived (read-only)</span>
           </div>
         </div>
 
@@ -188,9 +225,32 @@ const stateLabel = computed(() => STATE_META[derivedState.value]?.label || '')
 const stateClass = computed(() => STATE_META[derivedState.value]?.cls || '')
 function badgeLabel(state) { return STATE_META[state]?.label || '' }
 
+// Lifecycle grouping (derived server-side): active | needs_approval | done | archived.
+const activeChanges = computed(() => changes.value.filter(c => c.lifecycle === 'active' || c.lifecycle === 'needs_approval'))
+const doneChanges = computed(() => changes.value.filter(c => c.lifecycle === 'done'))
+const archivedChanges = computed(() => changes.value.filter(c => c.lifecycle === 'archived'))
+function lifecycleLabel(ch) {
+  if (ch.lifecycle === 'needs_approval') return '⏳ Needs approval'
+  if (ch.lifecycle === 'done') return '✅ Done'
+  const s = ch.review && ch.review.state
+  return s && s !== 'none' ? badgeLabel(s) : ''
+}
+function archivedName(id) { return id.replace(/^\d{4}-\d{2}-\d{2}-/, '') }
+
 // State-driven CTA: what actions make sense right now.
 const canApprove = computed(() => ['none', 'commented', 'revised_pending_review'].includes(derivedState.value))
 const awaitingAgent = computed(() => derivedState.value === 'changes_requested')
+const isArchivedSel = computed(() => selected.value?.lifecycle === 'archived')
+
+// Archive is agent-mediated: send a tagged message the agent acts on with its
+// openspec_archive tool (the web process never runs the openspec CLI).
+function archiveChange() {
+  if (!selected.value) return
+  const name = selected.value.id
+  const msg = `[OpenSpec] Please archive the change '${name}' (it is done and approved). Run openspec_archive(change='${name}') and commit the resulting spec changes.`
+  localStorage.setItem(`enclave:${selectedSession.value}:pendingFeedback`, msg)
+  router.push('/chat')
+}
 
 // Resolution lookup: comment id -> {resolution_note, actionable_intent} from the
 // latest agent_revision that resolved it.
@@ -233,7 +293,10 @@ async function load() {
   try {
     const data = await api.getOpenSpecChanges(selectedSession.value)
     changes.value = data.changes || []
-    if (changes.value.length && !selected.value) await select(changes.value[0].id)
+    if (changes.value.length && !selected.value) {
+      const first = (activeChanges.value[0] || changes.value[0])
+      await select(first.id)
+    }
   } catch { changes.value = [] } finally { loading.value = false }
 }
 
@@ -434,6 +497,13 @@ watch([changedLines, showChanges], () => nextTick(decorate))
 .review-badge.approved { background: #14532d; color: #4ade80; }
 .review-badge.changes_requested { background: #5a2a14; color: #fb923c; }
 .review-badge.commented { background: #1e3a5f; color: #7c9eff; }
+.lifecycle-badge { font-size: 0.62rem; padding: 1px 6px; border-radius: 10px; white-space: nowrap; }
+.lifecycle-badge.done { background: #14532d; color: #4ade80; }
+.lifecycle-badge.needs_approval { background: #5a4a14; color: #fbbf24; }
+.lifecycle-badge.archived { background: #2a2a36; color: #9090a8; }
+.group { margin-top: 0.5rem; border-top: 1px solid var(--border, #2a2a36); padding-top: 0.3rem; }
+.group > summary { cursor: pointer; font-size: 0.78rem; color: var(--text-muted, #999); padding: 0.3rem 0; }
+.change-item.archived .change-name { color: var(--text-muted, #999); }
 .mini-progress { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem; }
 .mini-bar { flex: 1; height: 5px; background: #12121a; border-radius: 3px; overflow: hidden; }
 .mini-fill { height: 100%; background: linear-gradient(90deg, var(--accent, #7c9eff), #4ade80); }

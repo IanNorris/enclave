@@ -149,6 +149,11 @@ comment (or a `resolution_note` explaining a decline). This records why the spec
 changed and returns it to the reviewer for re-approval — locate each block by its
 quoted text, since line numbers may have shifted.
 
+When asked to archive a completed change, **call `openspec_archive`** with the
+change name — it runs `openspec archive` (moving the change to
+`openspec/changes/archive/` and merging its specs into `openspec/specs/`) — then
+commit the resulting changes.
+
 ## Artifacts
 
 Use `publish_artifact` when the user asks for a report, investigation,
