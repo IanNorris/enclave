@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from enclave.common.protocol import Message, MessageType
+from enclave.common.protocol import Message, MessageType, IPC_STREAM_LIMIT
 from enclave.orchestrator.ipc import IPCServer
 from enclave.agent.ipc_client import IPCClient
 
@@ -81,6 +81,70 @@ class TestIPCRoundTrip:
             assert len(received) == 1
             assert received[0].payload["content"] == "hello from agent"
             assert response.payload["echo"] == "hello from agent"
+        finally:
+            await client.disconnect()
+
+    async def test_oversized_message_survives(self, ipc_server: IPCServer) -> None:
+        """A message larger than asyncio's default 64 KiB reader limit must
+        round-trip, not tear down the session (regression: ENC-004, where a
+        frontier fusion trace on a blog task crashed the agent container)."""
+        received: list[Message] = []
+
+        async def handler(session_id: str, msg: Message) -> Message | None:
+            received.append(msg)
+            return Message(
+                type=MessageType.AGENT_RESPONSE,
+                payload={"ok": True},
+                reply_to=msg.id,
+            )
+
+        ipc_server.set_handler(handler)
+        sock_path = await ipc_server.create_socket("big-msg")
+
+        client = IPCClient(str(sock_path))
+        await client.connect()
+        try:
+            # ~256 KiB payload — comfortably over the 64 KiB default, well under
+            # the 16 MiB IPC_STREAM_LIMIT.
+            big = "x" * (256 * 1024)
+            assert len(big.encode()) > 64 * 1024
+            response = await client.request(
+                Message(type=MessageType.AGENT_RESPONSE, payload={"content": big}),
+                timeout=5.0,
+            )
+            assert len(received) == 1
+            assert received[0].payload["content"] == big
+            assert response.payload["ok"] is True
+            # The connection must still be alive after the big message.
+            assert ipc_server.is_connected("big-msg")
+        finally:
+            await client.disconnect()
+
+    async def test_oversized_server_push_survives(self, ipc_server: IPCServer) -> None:
+        """The agent's reader must also accept an oversized push from the
+        orchestrator (same limit bug in reverse: e.g. a long user message)."""
+        received: list[Message] = []
+
+        sock_path = await ipc_server.create_socket("big-push")
+        client = IPCClient(str(sock_path))
+
+        async def on_user_message(msg: Message) -> Message | None:
+            received.append(msg)
+            return None
+
+        client.on_message(MessageType.USER_MESSAGE, on_user_message)
+        await client.connect()
+        try:
+            await asyncio.sleep(0.1)
+            big = "y" * (256 * 1024)
+            sent = await ipc_server.send_to(
+                "big-push",
+                Message(type=MessageType.USER_MESSAGE, payload={"content": big}),
+            )
+            assert sent is True
+            await asyncio.sleep(0.3)
+            assert len(received) == 1
+            assert received[0].payload["content"] == big
         finally:
             await client.disconnect()
 

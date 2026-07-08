@@ -9,6 +9,16 @@ import json
 import uuid
 
 
+# Max size of a single newline-delimited IPC message, in bytes. asyncio's
+# StreamReader defaults to 64 KiB, but this is a content-carrying protocol: a
+# fusion trace bundles several full model responses + the judge analysis, and a
+# long agent_response (e.g. a full blog post) is a single message too. A message
+# over the reader's limit raises LimitOverrunError, which tore the socket down
+# and killed the session. 16 MiB is far above any realistic model-content
+# message yet still bounds per-connection buffering.
+IPC_STREAM_LIMIT = 16 * 1024 * 1024
+
+
 class MessageType(str, Enum):
     """Message types for orchestrator <-> agent communication."""
 

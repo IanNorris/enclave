@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Awaitable
 
-from enclave.common.protocol import Message, MessageType
+from enclave.common.protocol import IPC_STREAM_LIMIT, Message, MessageType
 
 
 # Type for incoming message handler
@@ -30,7 +30,9 @@ class IPCClient:
 
     async def connect(self) -> None:
         """Connect to the orchestrator socket."""
-        self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
+        self.reader, self.writer = await asyncio.open_unix_connection(
+            self.socket_path, limit=IPC_STREAM_LIMIT
+        )
         self._connected = True
         self._listen_task = asyncio.create_task(self._listen_loop())
 

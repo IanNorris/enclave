@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Awaitable
 
 from enclave.common.logging import get_logger
-from enclave.common.protocol import Message, MessageType
+from enclave.common.protocol import IPC_STREAM_LIMIT, Message, MessageType
 
 log = get_logger("ipc")
 
@@ -56,6 +56,16 @@ class IPCConnection:
                 return None
             return Message.from_json(line.decode().strip())
         except asyncio.TimeoutError:
+            return None
+        except asyncio.LimitOverrunError as e:
+            # A single message exceeded IPC_STREAM_LIMIT. The oversized bytes
+            # can't be cleanly drained from the buffer, so we drop the
+            # connection (the session recovers/reconnects). Log loudly and
+            # distinctly so this never again looks like a benign disconnect.
+            log.error(
+                "Oversized IPC message from %s (>%d bytes): %s — dropping connection",
+                self.session_id, IPC_STREAM_LIMIT, e,
+            )
             return None
         except Exception as e:
             log.error("Error receiving from %s: %s", self.session_id, e)
@@ -123,6 +133,7 @@ class IPCServer:
         server = await asyncio.start_unix_server(
             lambda r, w: self._handle_connection(session_id, r, w),
             path=str(path),
+            limit=IPC_STREAM_LIMIT,
         )
         os.chmod(str(path), 0o660)
 
