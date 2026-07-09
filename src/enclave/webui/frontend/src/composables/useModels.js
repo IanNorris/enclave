@@ -9,6 +9,27 @@ const models = ref({ current: null, available: [], preferences: [] })
 const currentModel = ref('')
 const modelsRefreshing = ref(false)
 const aiCredits = ref(null)
+// Tracks which session `models` currently reflects, so a merge is only applied
+// on same-session reloads (not on a switch, which must replace outright).
+let _lastModelsSession = null
+
+// Real (non-fusion) models from a models payload.
+function realModels(data) {
+  const fusion = new Set(data?.fusion_models || [])
+  return (data?.available || []).filter(m => !fusion.has(m))
+}
+
+// Merge a freshly-fetched models payload over the current one WITHOUT letting a
+// transient empty result collapse the picker to fusion-only. If the new payload
+// has no real models but we already had some, keep the known-good real list and
+// only adopt the new fusion ids + current. (A crashed/busy/fresh session can
+// briefly report no real models; that must not wipe the list — regression for
+// the blog session showing only fusion models.)
+function mergeModels(prev, next) {
+  if (realModels(next).length > 0 || realModels(prev).length === 0) return next
+  const nextFusion = (next.available || []).filter(m => (new Set(next.fusion_models || [])).has(m))
+  return { ...next, available: [...nextFusion, ...realModels(prev)] }
+}
 
 // Pick the account "AI Credits" snapshot (premium request quota) from the SDK's
 // quota snapshots, tolerating naming differences across SDK versions.
@@ -72,11 +93,16 @@ async function loadModels(sessionId) {
   if (!sessionId) {
     models.value = { current: null, available: [], preferences: [] }
     currentModel.value = ''
+    _lastModelsSession = null
     return
   }
   try {
     const data = await api.getModels(sessionId)
-    models.value = data
+    // Merge only when reloading the SAME session (guards against a transient
+    // empty list wiping the picker). On a session switch, replace outright so
+    // one session's models can't bleed into another.
+    models.value = sessionId === _lastModelsSession ? mergeModels(models.value, data) : data
+    _lastModelsSession = sessionId
     currentModel.value = data.current || ''
   } catch (e) {
     console.error('Failed to load models:', e)
@@ -88,7 +114,10 @@ async function refreshModels(sessionId) {
   modelsRefreshing.value = true
   try {
     const data = await api.getModels(sessionId, true)
-    models.value = data
+    // Same-session refresh: never let a transient empty result collapse the
+    // picker to fusion-only.
+    models.value = sessionId === _lastModelsSession ? mergeModels(models.value, data) : data
+    _lastModelsSession = sessionId
     currentModel.value = data.current || currentModel.value || ''
   } catch (e) {
     console.error('Failed to refresh models:', e)
