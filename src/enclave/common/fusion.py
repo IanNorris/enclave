@@ -412,7 +412,11 @@ def build_judge_prompt(problem: str, responses: list[tuple[str, str]]) -> str:
     unresolved answer to a human.
     """
     blocks = []
-    for i, (label, text) in enumerate(responses, 1):
+    # The model label is deliberately dropped from the block header: the judge
+    # must stay blind to model identity so it can't self-prefer its own family.
+    # Do NOT re-add "(from {label})" here — that reintroduces the self-preference
+    # bug this blinding exists to prevent (see the fusion-blind-judge change).
+    for i, (_label, text) in enumerate(responses, 1):
         blocks.append(f"### Response {i}\n{text}")
     joined = "\n\n".join(blocks)
     return (
@@ -459,7 +463,10 @@ def build_synthesizer_prompt(
     answer.
     """
     blocks = []
-    for i, (label, text) in enumerate(responses, 1):
+    # Blind to model identity here too — same reason as the judge. Keep the
+    # label out of the header so the synthesizer can't weight a response by which
+    # model produced it.
+    for i, (_label, text) in enumerate(responses, 1):
         blocks.append(f"### Response {i}\n{text}")
     joined = "\n\n".join(blocks)
     return (
