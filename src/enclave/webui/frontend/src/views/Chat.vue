@@ -166,11 +166,11 @@
               <span class="sender">Agent</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
               <ComplexityBadge
-                v-if="turnMeta[turn.turn_index]?.complexity"
+                v-if="turnComplexity(turn)"
                 class="meta-cx"
-                :score="turnMeta[turn.turn_index].complexity.score"
-                :tier="turnMeta[turn.turn_index].complexity.tier"
-                :reason="turnMeta[turn.turn_index].complexity.reason"
+                :score="turnComplexity(turn).score"
+                :tier="turnComplexity(turn).tier"
+                :reason="turnComplexity(turn).reason"
               />
             </div>
           </div>
@@ -181,11 +181,11 @@
               <span class="sender">Agent</span>
               <span class="time">{{ formatTime(turn.timestamp) }}</span>
               <ComplexityBadge
-                v-if="turnMeta[turn.turn_index]?.complexity"
+                v-if="turnComplexity(turn)"
                 class="meta-cx"
-                :score="turnMeta[turn.turn_index].complexity.score"
-                :tier="turnMeta[turn.turn_index].complexity.tier"
-                :reason="turnMeta[turn.turn_index].complexity.reason"
+                :score="turnComplexity(turn).score"
+                :tier="turnComplexity(turn).tier"
+                :reason="turnComplexity(turn).reason"
               />
             </div>
             <div class="message-body" v-html="renderMarkdown(turn.assistant_response)"></div>
@@ -194,7 +194,7 @@
           <!-- Auto Fusion model traces for this turn: tap to see each model's
                outcome + the judge's decision that produced the answer. -->
           <div
-            v-for="(run, ri) in (turnMeta[turn.turn_index]?.fusions || [])"
+            v-for="(run, ri) in turnFusions(turn)"
             :key="'fz-' + ri"
             class="fusion-block card-fusion"
           >
@@ -721,6 +721,17 @@ const expandedFusion = ref({})
 // it finalizes, at which point they're attached to turnMeta[turn_index].
 let pendingComplexity = null
 let pendingFusions = []
+
+// Carry the Auto Fusion trace (complexity grade + fusion runs) accumulated this
+// turn onto the first agent output bubble. The live WS flow has no durable
+// `turn` event to populate turnMeta, so without this the trace is cleared with
+// liveEvents when the response lands and only returns on a full reload. Cleared
+// after attaching so later bubbles in the same turn don't duplicate it; the
+// reload path rebinds via turnMeta by timestamp.
+function attachPendingMeta(liveTurn) {
+  if (pendingFusions.length) { liveTurn.fusions = pendingFusions.slice(); pendingFusions = [] }
+  if (pendingComplexity) { liveTurn.complexity = pendingComplexity; pendingComplexity = null }
+}
 let currentThinkingIdx = -1
 const liveEventsExpanded = ref(false)
 const LIVE_EVENTS_VISIBLE = 5
@@ -1273,14 +1284,16 @@ function handleStreamEvent(msg) {
       // Remove any existing live-source turn with the same content
       const existIdx = turns.value.findIndex(t => t.source === 'live' && t.assistant_response === msg.content)
       if (existIdx < 0) {
-        turns.value.push({
+        const liveTurn = {
           turn_index: null,
           user_message: null,
           assistant_response: msg.content,
           timestamp: new Date().toISOString(),
           source: 'live',
           is_major: true,
-        })
+        }
+        attachPendingMeta(liveTurn)
+        turns.value.push(liveTurn)
       }
       streamingText.value = ''
     }
@@ -1298,7 +1311,7 @@ function handleStreamEvent(msg) {
     setAgentState('responding')
     const summary = msg.summary || ''
     if (summary) {
-      turns.value.push({
+      const liveTurn = {
         turn_index: null,
         user_message: null,
         assistant_response: summary,
@@ -1312,7 +1325,9 @@ function handleStreamEvent(msg) {
           actions: msg.actions || [],
           images: msg.images || [],
         },
-      })
+      }
+      attachPendingMeta(liveTurn)
+      turns.value.push(liveTurn)
       streamingText.value = ''
     }
     activityText.value = ''
@@ -1755,6 +1770,17 @@ function isCardFusionOpen(ti, ri) {
 function toggleCardFusion(ti, ri) {
   const k = `${ti}:${ri}`
   expandedFusion.value[k] = !expandedFusion.value[k]
+}
+
+// Auto Fusion trace for a rendered turn. The durable reload path binds it into
+// turnMeta[turn_index] (by timestamp); the live WS flow has no `turn` event, so
+// it's carried inline on the response bubble (turn.fusions / turn.complexity).
+// Prefer turnMeta when present so a reload's canonical binding wins.
+function turnFusions(turn) {
+  return turnMeta.value[turn?.turn_index]?.fusions || turn?.fusions || []
+}
+function turnComplexity(turn) {
+  return turnMeta.value[turn?.turn_index]?.complexity || turn?.complexity || null
 }
 </script>
 
