@@ -162,7 +162,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, computed, nextTick } from 'vue'
+import { ref, watch, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSessionStore } from '../stores/session.js'
 import { api } from '../api.js'
@@ -300,6 +300,31 @@ async function load() {
   } catch { changes.value = [] } finally { loading.value = false }
 }
 
+// Non-destructive refresh: the Specs tab is otherwise load-once, so while it
+// stays open it drifts from disk as reviews / agent revisions / new changes
+// land. This re-fetches the list and the open change's detail+state+diff WITHOUT
+// touching the user's working state (selected change, in-progress draft comments,
+// the comment currently being typed, or scroll). Triggered on tab focus /
+// visibility and a light poll while visible.
+let _refreshing = false
+async function refresh() {
+  if (!selectedSession.value || _refreshing) return
+  _refreshing = true
+  try {
+    const data = await api.getOpenSpecChanges(selectedSession.value)
+    changes.value = data.changes || []
+    const curId = selected.value?.id
+    if (curId && changes.value.some(c => c.id === curId)) {
+      await loadDetail(curId, { resetDraft: false })
+    } else if (!selected.value && changes.value.length) {
+      await select((activeChanges.value[0] || changes.value[0]).id)
+    }
+    // If the selected change vanished (archived/renamed), keep the current view;
+    // the user can reselect from the list rather than have it yanked away.
+  } catch { /* keep the existing view on a transient error */ }
+  finally { _refreshing = false }
+}
+
 function draftKey(id) { return `enclave:${selectedSession.value}:specdraft:${id}` }
 function loadDraft(id) {
   try {
@@ -316,16 +341,24 @@ function persistDraft() {
 }
 
 async function select(id) {
-  activeComment.value = null
   changedLines.value = {}
-  try {
-    detail.value = await api.getOpenSpecChange(selectedSession.value, id)
-    selected.value = changes.value.find(c => c.id === id) || { id }
+  try { await loadDetail(id, { resetDraft: true }) } catch { /* ignore */ }
+}
+
+// Shared detail loader. resetDraft=true (explicit selection) clears the comment
+// being typed and reloads the saved draft for the newly-opened change;
+// resetDraft=false (background refresh) leaves the user's in-progress state alone.
+async function loadDetail(id, { resetDraft = false } = {}) {
+  const d = await api.getOpenSpecChange(selectedSession.value, id)
+  detail.value = d
+  selected.value = changes.value.find(c => c.id === id) || { id }
+  if (resetDraft) {
+    activeComment.value = null
     loadDraft(id)
-    await refreshState(id)
-    await refreshDiff(id)
-    nextTick(decorate)
-  } catch { /* ignore */ }
+  }
+  await refreshState(id)
+  await refreshDiff(id)
+  nextTick(decorate)
 }
 
 async function refreshState(id) {
@@ -474,6 +507,24 @@ function pin(ch) {
 
 onMounted(load)
 watch(selectedSession, () => { selected.value = null; draft.value = []; load() })
+
+// Keep the tab live without a full reload. The common flow is: tab over to Chat
+// to talk to the agent (which edits specs / records revisions), then tab back —
+// visibilitychange + focus catch that. A slow poll covers staying on the tab.
+function onVisible() { if (document.visibilityState === 'visible') refresh() }
+let _pollTimer = null
+onMounted(() => {
+  document.addEventListener('visibilitychange', onVisible)
+  window.addEventListener('focus', refresh)
+  _pollTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') refresh()
+  }, 20000)
+})
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', onVisible)
+  window.removeEventListener('focus', refresh)
+  if (_pollTimer) clearInterval(_pollTimer)
+})
 // Re-run decoration whenever the change set or toggle changes (DOM re-renders
 // via sectionList auto-open, so defer to nextTick).
 watch([changedLines, showChanges], () => nextTick(decorate))
