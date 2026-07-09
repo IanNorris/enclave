@@ -20,6 +20,13 @@ because correlated models can agree on wrong answers.
 - **THEN** it contains a section that treats disagreement between strong models
   as the highest-signal part of the analysis
 
+#### Scenario: Findings are ordered by priority, not origin
+
+- **WHEN** the synthesizer prompt is built
+- **THEN** it instructs ordering points by priority/severity
+- **AND** it does not instruct grouping by which response raised a point or
+  leading by agreement-bucket (consensus-first)
+
 ### Requirement: Fusion emits a verdict that can escalate to a human
 
 The judge SHALL produce a verdict of settled, contested, or unresolved, and the
