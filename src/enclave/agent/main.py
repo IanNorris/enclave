@@ -1640,6 +1640,39 @@ async def _configure_model(
         print(f"[agent] Failed to write models info: {e}", file=sys.stderr)
 
 
+def _resolve_openspec_root(change: str, working_directory: str) -> Path | None:
+    """Resolve the directory whose ``openspec/`` holds ``change``.
+
+    Mirrors the webui read path (routes/openspec.py) so host-mode sessions —
+    whose project is an external repo, not the workspace — resolve the same way:
+
+    1. ``ENCLAVE_OPENSPEC_ROOT`` env — explicit override.
+    2. A ``.openspec_root`` pointer file in the working directory naming an
+       external project dir (host-mode sessions working on a repo outside the
+       workspace).
+    3. Walk up from the working directory for an ``openspec/changes/<change>``
+       dir — container sessions, where the workspace IS the project.
+
+    Returns the root dir, or ``None`` if the change can't be located.
+    """
+    env = os.environ.get("ENCLAVE_OPENSPEC_ROOT")
+    if env:
+        return Path(env)
+    ptr = Path(working_directory) / ".openspec_root"
+    if ptr.is_file():
+        try:
+            target = Path(ptr.read_text(encoding="utf-8").strip()).expanduser()
+            if (target / "openspec" / "changes" / change).is_dir():
+                return target
+        except OSError:
+            pass  # stale/unreadable pointer → fall through to the walk-up
+    probe = Path(working_directory).resolve()
+    for cand in [probe, *probe.parents]:
+        if (cand / "openspec" / "changes" / change).is_dir():
+            return cand
+    return None
+
+
 def _configure_graphify_mcp(working_directory: str, state_dir: str) -> None:
     """Wire graphify's MCP server into the in-container copilot config.
 
@@ -3711,16 +3744,9 @@ async def try_init_copilot(
                     text_result_for_llm=f"Error: openspec log module unavailable: {e}",
                     result_type="error",
                 )
-            # Resolve the openspec root: explicit env override, else search upward
-            # from the working directory for an openspec/changes/<change> dir.
-            root = os.environ.get("ENCLAVE_OPENSPEC_ROOT")
-            root_path = Path(root) if root else None
-            if root_path is None:
-                probe = Path(working_directory).resolve()
-                for cand in [probe, *probe.parents]:
-                    if (cand / "openspec" / "changes" / change).is_dir():
-                        root_path = cand
-                        break
+            # Resolve the openspec root: env override → .openspec_root pointer →
+            # walk up from the working dir (see _resolve_openspec_root).
+            root_path = _resolve_openspec_root(change, working_directory)
             if root_path is None:
                 return ToolResult(
                     text_result_for_llm=(
@@ -3822,14 +3848,7 @@ async def try_init_copilot(
                 )
             skip_specs = bool(args.get("skip_specs", False))
             # Resolve the openspec root (same logic as openspec_revision_log).
-            root = os.environ.get("ENCLAVE_OPENSPEC_ROOT")
-            root_path = Path(root) if root else None
-            if root_path is None:
-                probe = Path(working_directory).resolve()
-                for cand in [probe, *probe.parents]:
-                    if (cand / "openspec" / "changes" / change).is_dir():
-                        root_path = cand
-                        break
+            root_path = _resolve_openspec_root(change, working_directory)
             if root_path is None:
                 return ToolResult(
                     text_result_for_llm=(
