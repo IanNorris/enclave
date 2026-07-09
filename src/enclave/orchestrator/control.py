@@ -576,6 +576,14 @@ class ControlServer:
             )
             if result.returncode == 0 and result.stdout.strip():
                 available = json.loads(result.stdout.strip())
+                # A successful RPC that yields an empty list means the SDK wasn't
+                # ready (fresh/busy/saturated session). Do NOT clobber a good
+                # cache with it — treat as a failure so the caller falls back to
+                # the last known-good cached list.
+                if not available:
+                    log.warning("Models query for %s returned empty; keeping cache", session_id)
+                    await self._write(writer, {"ok": False, "error": "Empty model list from agent"})
+                    return
                 # Read current model from workspace file if it exists
                 ws_base = Path(self._router.sessions.config.workspace_base) / session_id
                 models_path = ws_base / ".enclave-models.json"
