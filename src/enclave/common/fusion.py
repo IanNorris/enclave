@@ -402,10 +402,18 @@ def build_participant_prompt(problem: str) -> str:
 
 
 def build_judge_prompt(problem: str, responses: list[tuple[str, str]]) -> str:
-    """Prompt for the judge model: extract structure from the panel responses."""
+    """Prompt for the judge model: extract structure from the panel responses.
+
+    The judge is BLIND to which model produced each response (responses are
+    labelled by position only) so it can't self-prefer its own family. Consensus
+    is framed as agreement, NOT confidence — correlated models can agree on wrong
+    answers — and disagreement between strong models is treated as the highest-
+    signal part of the analysis. The judge emits a Verdict that can escalate an
+    unresolved answer to a human.
+    """
     blocks = []
     for i, (label, text) in enumerate(responses, 1):
-        blocks.append(f"### Response {i} (from {label})\n{text}")
+        blocks.append(f"### Response {i}\n{text}")
     joined = "\n\n".join(blocks)
     return (
         "You are the JUDGE in a compound-model system. Several AI models "
@@ -413,16 +421,27 @@ def build_judge_prompt(problem: str, responses: list[tuple[str, str]]) -> str:
         "extract the structure of their collective reasoning. Do NOT write a "
         "final answer — your job is analysis that a synthesizer will ground "
         "its answer in.\n\n"
+        "These models share training lineage, so agreement is NOT proof of "
+        "correctness — they can be confidently wrong together. Weigh the "
+        "strength of the reasoning, not the size of the majority.\n\n"
         "Produce a concise structured analysis with these sections:\n"
-        "1. **Consensus** — points (most/all) agree on; treat as high-confidence.\n"
-        "2. **Contradictions** — where they directly disagree, and which side "
-        "is better supported (say why).\n"
+        "1. **Agreement** — points (most/all) converged on. Note them, but do "
+        "NOT treat agreement alone as strong evidence of correctness; flag any "
+        "that look like shared assumptions rather than independently-reasoned "
+        "conclusions.\n"
+        "2. **Disagreement (highest-signal)** — where they diverge, especially "
+        "where strong reasoning collides. This is the most valuable part: name "
+        "each fault line, which side is better supported, and why. Order these "
+        "strongest/highest-stakes first.\n"
         "3. **Partial coverage** — important points only some raised.\n"
         "4. **Unique insights** — a single model's non-obvious correct point "
         "worth keeping.\n"
         "5. **Blind spots** — what they ALL missed or got wrong (use your own "
         "knowledge here).\n"
-        "6. **Confidence** — overall, how settled is the answer (low/med/high)?\n\n"
+        "6. **Verdict** — one of: `settled` (well supported, not meaningfully "
+        "contested), `contested` (real disagreement but resolvable on the "
+        "evidence — say how), or `unresolved` (genuinely unsettled; needs human "
+        "judgement). State the verdict word explicitly and one line of why.\n\n"
         f"--- Original question ---\n{problem}\n\n"
         f"--- Panel responses ---\n{joined}"
     )
@@ -431,18 +450,32 @@ def build_judge_prompt(problem: str, responses: list[tuple[str, str]]) -> str:
 def build_synthesizer_prompt(
     problem: str, judge_analysis: str, responses: list[tuple[str, str]],
 ) -> str:
-    """Prompt for the synthesizer: write the final answer from the judge analysis."""
+    """Prompt for the synthesizer: write the final answer from the judge analysis.
+
+    Blind to model identity (responses labelled by position). Orders findings by
+    priority/importance rather than by agreement-bucket or which model raised
+    them, and honours the judge's Verdict: an ``unresolved`` verdict is
+    surfaced for human judgement rather than smoothed into a false-confident
+    answer.
+    """
     blocks = []
     for i, (label, text) in enumerate(responses, 1):
-        blocks.append(f"### Response {i} (from {label})\n{text}")
+        blocks.append(f"### Response {i}\n{text}")
     joined = "\n\n".join(blocks)
     return (
         "You are the SYNTHESIZER in a compound-model system. A judge has "
         "analyzed several models' independent answers to a question. Write the "
         "single best final answer, grounded in the judge's analysis:\n"
-        "- Lead with the consensus (high-confidence) content.\n"
-        "- Resolve contradictions in favour of the better-supported side; if "
-        "genuinely unsettled, say so briefly and give the safest course.\n"
+        "- Order what you say by IMPORTANCE, not by how many models agreed or "
+        "which one said it. The most decision-relevant point leads — that may "
+        "be a disagreement or a single model's insight, not the consensus.\n"
+        "- Agreement is not proof: don't present consensus as settled just "
+        "because the models converged; they can be wrong together.\n"
+        "- Resolve contradictions in favour of the better-supported side. "
+        "Honour the judge's Verdict: if it is `unresolved`, do NOT manufacture "
+        "a confident answer — lay out the contested options and their "
+        "trade-offs, give the safest default, and state plainly that this needs "
+        "human judgement.\n"
         "- Fold in the unique insights and cover the blind spots the judge "
         "flagged.\n"
         "- Be direct and complete; answer the question as if it were asked of "
