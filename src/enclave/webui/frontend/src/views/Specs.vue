@@ -168,12 +168,14 @@ import { useSessionStore } from '../stores/session.js'
 import { api } from '../api.js'
 import MarkdownIt from 'markdown-it'
 import { dataLinePlugin, sliceBlock } from '../lib/dataLine.js'
+import mathPlugin from '../lib/mathPlugin.js'
 
 const { selectedSessionId } = useSessionStore()
 const selectedSession = selectedSessionId
 const router = useRouter()
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+md.use(mathPlugin)
 md.use(dataLinePlugin)
 function renderMarkdown(text) { return text ? md.render(text) : '<p class="muted">— empty —</p>' }
 

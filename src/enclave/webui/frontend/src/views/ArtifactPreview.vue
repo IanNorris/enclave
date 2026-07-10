@@ -26,6 +26,7 @@ import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api.js'
 import MarkdownIt from 'markdown-it'
+import mathPlugin from '../lib/mathPlugin.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -47,7 +48,7 @@ const rawUrl = computed(() => {
   return `${api.rawArtifactUrl(session.value, filename.value)}&token=${encodeURIComponent(token)}`
 })
 
-const md = new MarkdownIt({ html: true, linkify: true, breaks: true })
+const md = new MarkdownIt({ html: true, linkify: true, breaks: true }).use(mathPlugin)
 const defaultFence = md.renderer.rules.fence?.bind(md.renderer.rules) ||
   ((tokens, idx, opts, env, self) => self.renderToken(tokens, idx, opts))
 md.renderer.rules.fence = (tokens, idx, options, env, self) => {
