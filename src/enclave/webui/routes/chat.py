@@ -842,15 +842,36 @@ async def proxy_workspace_file(
                 workspace = d
                 break
 
-    # Resolve and sanitize — must stay within workspace. Use relative_to rather
-    # than a string startswith, which would treat a sibling like
-    # "<workspace>-evil" as inside the workspace (security review L1).
-    resolved = (workspace / file_path).resolve()
-    try:
-        resolved.relative_to(workspace.resolve())
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Path traversal denied")
-    if not resolved.is_file():
+    # The path can arrive two ways:
+    #  - container-relative ("shots/x.png", after the /workspace/ strip above) —
+    #    the normal container-session case;
+    #  - a host-absolute path ("/data/.../<session>/shots/x.png") — host-mode
+    #    sessions (and send_file) reference real host paths, whose leading slash
+    #    the frontend strips, leaving "data/.../<session>/shots/x.png". Joining
+    #    that onto the workspace doubles the prefix and 404s.
+    # Try the relative interpretation first; if that isn't a file, fall back to
+    # treating it as an absolute path. Both are bounded by the relative_to check.
+    ws_resolved = workspace.resolve()
+    candidates = [(workspace / file_path).resolve()]
+    if not file_path.startswith("/"):
+        candidates.append(Path("/" + file_path).resolve())
+    resolved = None
+    for cand in candidates:
+        try:
+            cand.relative_to(ws_resolved)
+        except ValueError:
+            continue  # outside the workspace — reject (path traversal guard)
+        if cand.is_file():
+            resolved = cand
+            break
+    if resolved is None:
+        # Nothing valid landed inside the workspace. Distinguish traversal from
+        # a genuine miss for a clearer error, using the primary candidate.
+        primary = candidates[0]
+        try:
+            primary.relative_to(ws_resolved)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Path traversal denied")
         raise HTTPException(status_code=404, detail="File not found")
 
     content = resolved.read_bytes()
