@@ -470,8 +470,9 @@ import { useFusion } from '../composables/useFusion.js'
 import DocumentPane from '../components/DocumentPane.vue'
 import ComplexityBadge from '../components/ComplexityBadge.vue'
 import MarkdownIt from 'markdown-it'
+import mathPlugin from '../lib/mathPlugin.js'
 
-const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+const md = new MarkdownIt({ html: false, linkify: true, breaks: true }).use(mathPlugin)
 
 // Render ```mermaid fenced code blocks as diagram containers; everything else
 // falls through to the default fenced-code renderer. The raw source is HTML

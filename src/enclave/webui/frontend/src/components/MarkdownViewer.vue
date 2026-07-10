@@ -5,6 +5,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import MarkdownIt from 'markdown-it'
+import mathPlugin from '../lib/mathPlugin.js'
 
 const props = defineProps({
   source: { type: String, default: '' },
@@ -17,7 +18,7 @@ const props = defineProps({
 
 const renderedEl = ref(null)
 
-const md = new MarkdownIt({ html: true, linkify: true, breaks: true })
+const md = new MarkdownIt({ html: true, linkify: true, breaks: true }).use(mathPlugin)
 
 // Resolve a possibly-relative image src to something the browser can load.
 // Absolute URLs, root-relative paths and data: URIs pass through untouched;
