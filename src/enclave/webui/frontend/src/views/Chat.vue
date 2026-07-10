@@ -1299,9 +1299,10 @@ function handleStreamEvent(msg) {
     }
     activityText.value = ''
     // Flush the live tool/thinking blocks — they belong to the segment we just
-    // finalized into a turn above, and leaving them here pins them to the
-    // bottom while later segments render above (only cleared on reload before).
-    liveEvents.value = []
+    // finalized into a turn above. Keep file_send events: they're durable/major
+    // artifacts (they also route to Matrix) and are otherwise wiped here, only
+    // reappearing on reload when rebuilt from the event store.
+    liveEvents.value = liveEvents.value.filter(e => e.type === 'file_send')
     currentThinkingIdx = -1
     nextTick(() => scrollToBottom())
     return
@@ -1331,7 +1332,8 @@ function handleStreamEvent(msg) {
       streamingText.value = ''
     }
     activityText.value = ''
-    liveEvents.value = []
+    // Keep file_send events (durable/major); flush ephemeral tool/thinking.
+    liveEvents.value = liveEvents.value.filter(e => e.type === 'file_send')
     currentThinkingIdx = -1
     nextTick(() => scrollToBottom())
     return
