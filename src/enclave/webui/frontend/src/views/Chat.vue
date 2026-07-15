@@ -358,8 +358,10 @@
           </div>
         </div>
 
-        <!-- Sending indicator -->
-        <div v-if="sending && !streamingText && !activityText" class="message assistant-message typing">
+        <!-- Agent working indicator (driven by agent state, not the send
+             round-trip, so it persists for the whole turn and the composer
+             stays usable for queuing a follow-up). -->
+        <div v-if="agentWorking && !streamingText && !activityText" class="message assistant-message typing">
           <span class="typing-indicator">●●●</span>
         </div>
       </div>
@@ -806,6 +808,13 @@ const agentStateLabel = computed(() => {
 })
 
 const agentStateClass = computed(() => agentState.value)
+
+// The agent is actively working this turn (show the ●●● indicator). Also true
+// briefly while a send is in flight, so the indicator appears immediately on
+// send before the first agent event arrives. Excludes idle/waiting_user/unknown.
+const agentWorking = computed(() =>
+  sending.value || ['thinking', 'tool', 'responding'].includes(agentState.value)
+)
 
 // Persisted events per turn (turn_index → events array)
 const turnEvents = ref({})
@@ -1507,6 +1516,12 @@ async function send() {
     // Remove the queued message on failure
     const idx = turns.value.findIndex(t => t.source === 'queued' && t.user_message === content)
     if (idx >= 0) turns.value.splice(idx, 1)
+  } finally {
+    // `sending` guards only the delivery round-trip (upload/POST), NOT the
+    // agent's turn — the agent buffers messages sent while it's busy
+    // (pending_messages / check_messages), so the composer must re-enable as
+    // soon as delivery completes to allow queuing a follow-up. The "agent is
+    // working" indicator is driven by agentState, not by `sending`.
     sending.value = false
   }
 }
@@ -2612,6 +2627,13 @@ function turnComplexity(turn) {
 .input-bar button {
   align-self: flex-end;
   padding: 0.6rem 1.5rem;
+}
+/* Visible disabled state for the composer buttons (Send + attach) so a briefly
+   disabled Send during delivery, or an empty draft, reads as inactive rather
+   than looking clickable-but-inert. */
+.input-bar button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .pending-files {
