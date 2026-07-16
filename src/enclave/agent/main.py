@@ -1837,11 +1837,26 @@ async def try_init_copilot(
             if is_yolo:
                 return PermissionRequestResult(kind="approve-once")
 
-            # Host mode (non-YOLO): screen for restricted operations
-            kind = getattr(_req, "kind", "")
+            # Host mode (non-YOLO): screen for restricted operations.
+            #
+            # The SDK delivers `kind` as a PermissionPromptRequestKind ENUM, not
+            # a string — its shell value is 'commands' (there is no 'shell'), and
+            # file ops are 'read'/'write'/'path'. Comparing the enum to bare
+            # strings ("shell"/"read"/"write") silently never matched, so every
+            # host request fell through to auto-approve and the gate was dead
+            # (ENC-006). Coerce to the string value and match the real kinds.
+            kind_raw = getattr(_req, "kind", "")
+            kind = getattr(kind_raw, "value", kind_raw)  # enum → 'commands' etc.
 
-            if kind == "shell":
+            def _outside_scratch(paths: list[str]) -> list[str]:
+                return [p for p in paths if p and not _is_in_scratch(p, working_directory)]
+
+            if kind == "commands":
                 cmd_text = getattr(_req, "full_command_text", "") or ""
+                # Fall back to the parsed identifiers if the full text is absent.
+                if not cmd_text:
+                    ids = getattr(_req, "command_identifiers", None) or []
+                    cmd_text = " ".join(ids)
                 # Check if the command uses restricted system tools
                 if _is_restricted_command(cmd_text):
                     reason = getattr(_req, "intention", "") or f"Run: {cmd_text[:100]}"
@@ -1849,8 +1864,7 @@ async def try_init_copilot(
                         ipc, "command", cmd_text, reason,
                     )
                 # Check if the command touches paths outside the scratch space
-                paths = getattr(_req, "possible_paths", []) or []
-                outside = [p for p in paths if not _is_in_scratch(p, working_directory)]
+                outside = _outside_scratch(getattr(_req, "paths", None) or [])
                 if outside:
                     reason = getattr(_req, "intention", "") or f"Access: {', '.join(outside[:3])}"
                     return _request_permission_sync(
@@ -1859,7 +1873,7 @@ async def try_init_copilot(
                 return PermissionRequestResult(kind="approve-once")
 
             if kind == "read":
-                path = getattr(_req, "path", "") or ""
+                path = getattr(_req, "path", "") or getattr(_req, "file_name", "") or ""
                 if not _is_in_scratch(path, working_directory):
                     reason = getattr(_req, "intention", "") or f"Read: {path}"
                     return _request_permission_sync(
@@ -1868,11 +1882,26 @@ async def try_init_copilot(
                 return PermissionRequestResult(kind="approve-once")
 
             if kind == "write":
-                path = getattr(_req, "file_name", "") or ""
+                path = getattr(_req, "file_name", "") or getattr(_req, "path", "") or ""
                 if not _is_in_scratch(path, working_directory):
                     reason = getattr(_req, "intention", "") or f"Write: {path}"
                     return _request_permission_sync(
                         ipc, "filesystem", path, reason,
+                    )
+                return PermissionRequestResult(kind="approve-once")
+
+            if kind == "path":
+                # Generic path access; access_kind is read|write|shell. Gate any
+                # target outside the scratch space regardless of direction.
+                access = getattr(_req, "access_kind", "")
+                access = getattr(access, "value", access) or "access"
+                candidates = [getattr(_req, "path", "") or "", getattr(_req, "file_name", "") or ""]
+                candidates += getattr(_req, "paths", None) or []
+                outside = _outside_scratch(candidates)
+                if outside:
+                    reason = getattr(_req, "intention", "") or f"{access.title()}: {outside[0]}"
+                    return _request_permission_sync(
+                        ipc, "filesystem", outside[0], reason,
                     )
                 return PermissionRequestResult(kind="approve-once")
 
