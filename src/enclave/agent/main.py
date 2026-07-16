@@ -4470,6 +4470,16 @@ async def try_init_copilot(
         # runs). The sync submit is just file I/O — it writes a v2 envelope
         # to drafts/pending/. Skipped silently when Mimir is disabled or
         # the killswitch has tripped.
+        # Source surfaces the mimir-librarian binary accepts for `submit`.
+        # An out-of-allowlist value returns rc=64; guarding here turns that into
+        # a caught, non-killswitch-counting error instead of a repeated failure
+        # that disables all of Mimir over a fixed config bug.
+        _MIMIR_SUBMIT_SURFACES = frozenset({
+            "cli", "claude-memory", "codex-memory", "mcp", "directory",
+            "repo-handoff", "agent-export", "consensus-quorum",
+            "copilot-session-store",
+        })
+
         async def _mimir_submit_draft(
             *,
             prose: str,
@@ -4484,6 +4494,18 @@ async def try_init_copilot(
             """
             if not agent_state:
                 return (False, "agent_state unavailable")
+            # Reject an out-of-allowlist surface up front: it would fail every
+            # call with rc=64 and, without this guard, three such calls would
+            # trip the killswitch and disable Mimir over a caller bug. This is a
+            # programming error, not a Mimir outage — surface it without counting
+            # it toward the transient-failure budget.
+            if source_surface not in _MIMIR_SUBMIT_SURFACES:
+                print(
+                    f"[agent] Mimir submit skipped: invalid source_surface "
+                    f"'{source_surface}' (not in librarian allowlist)",
+                    file=sys.stderr,
+                )
+                return (False, f"invalid source_surface '{source_surface}'")
             librarian_bin = agent_state.mimir_librarian_bin
             drafts_dir = f"{agent_state.mimir_workspace}/drafts"
             agent_name = os.environ.get("ENCLAVE_MIMIR_AGENT_NAME", "brook")
@@ -4693,7 +4715,14 @@ async def try_init_copilot(
                     prose=prose,
                     durability="permanent",
                     tags=[f"bug:{bug.id}", f"bug-status:{bug.status}", "bug-tracker"],
-                    source_surface="agent-tool:bug_tracker",
+                    # Must be a value from the librarian's --source-surface
+                    # allowlist (cli|claude-memory|codex-memory|mcp|directory|
+                    # repo-handoff|agent-export|consensus-quorum|
+                    # copilot-session-store). The tool identity lives in the
+                    # "bug-tracker" tag above, NOT the surface — passing an
+                    # ad-hoc "agent-tool:bug_tracker" surface returns rc=64 and
+                    # (via the 3-strike counter) trips the Mimir killswitch.
+                    source_surface="agent-export",
                 )
             )
 
