@@ -30,7 +30,7 @@
       </div>
 
       <!-- Messages -->
-      <div class="messages" ref="messagesEl" @scroll="onMessagesScroll" @click="onMessagesClick">
+      <div class="messages" ref="messagesEl" @scroll="onMessagesScroll" @click="onMessagesClick" @mouseover="showBugHover" @mouseout="hideBugHover">
         <!-- Load earlier button -->
         <div v-if="hasMore" class="load-earlier">
           <button class="secondary" @click="loadEarlier" :disabled="loadingMore">
@@ -457,6 +457,32 @@
         </div>
       </transition>
     </teleport>
+
+    <!-- Bug reference preview card (hover on desktop, tap on mobile) -->
+    <teleport to="body">
+      <transition name="bugcard-fade">
+        <div
+          v-if="bugCard"
+          class="bug-card"
+          :class="{ pinned: bugCard.pinned }"
+          :style="{ left: bugCard.x + 'px', top: bugCard.y + 'px' }"
+          @mouseover.stop
+          @mouseout.stop
+        >
+          <div class="bug-card-head">
+            <span class="bug-card-id">{{ bugCard.id }}</span>
+            <span class="bug-card-badges">
+              <span class="bug-badge status" :class="bugCard.status">{{ bugCard.status }}</span>
+              <span class="bug-badge sev" :class="bugCard.severity">{{ bugCard.severity }}</span>
+            </span>
+            <button v-if="bugCard.pinned" class="bug-card-close" @click="closeBugCard" title="Close">✕</button>
+          </div>
+          <div class="bug-card-title">{{ bugCard.title }}</div>
+          <div v-if="bugCard.preview" class="bug-card-preview">{{ bugCard.preview }}</div>
+          <button class="bug-card-link" @click="openBugDetail(bugCard.id)">View full bug →</button>
+        </div>
+      </transition>
+    </teleport>
   </div>
 </template>
 
@@ -471,8 +497,18 @@ import DocumentPane from '../components/DocumentPane.vue'
 import ComplexityBadge from '../components/ComplexityBadge.vue'
 import MarkdownIt from 'markdown-it'
 import mathPlugin from '../lib/mathPlugin.js'
+import bugRefPlugin from '../lib/bugRefPlugin.js'
 
-const md = new MarkdownIt({ html: false, linkify: true, breaks: true }).use(mathPlugin)
+// Live map of this session's bugs (id -> {title,status,severity,body}), used to
+// resolve BRO-123-style ids into hoverable/clickable references and to populate
+// the preview card. Populated by loadBugs() on session change.
+const bugMap = ref({})
+function resolveBug(id) { return bugMap.value[id] || null }
+
+const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+  .use(mathPlugin)
+  .use(bugRefPlugin, { resolve: resolveBug })
+
 
 // Render ```mermaid fenced code blocks as diagram containers; everything else
 // falls through to the default fenced-code renderer. The raw source is HTML
@@ -819,7 +855,19 @@ onMounted(async () => {
   nextTick(autoGrow)
   window.addEventListener('keydown', onLightboxKey)
   window.addEventListener('keydown', onTypeToFocus)
+  window.addEventListener('click', onOutsideBugCard, true)
+  window.addEventListener('keydown', onBugCardEsc)
 })
+
+// Dismiss a pinned bug card on an outside click or Escape.
+function onOutsideBugCard(e) {
+  if (!bugCard.value || !bugCard.value.pinned) return
+  if (e.target.closest('.bug-card') || e.target.closest('.bug-ref')) return
+  bugCard.value = null
+}
+function onBugCardEsc(e) {
+  if (e.key === 'Escape' && bugCard.value) bugCard.value = null
+}
 
 // Start typing anywhere (no field focused) to jump straight into the composer,
 // so the keystroke lands in the message box without a manual click.
@@ -855,6 +903,8 @@ onUnmounted(() => {
   pendingFiles.value.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview) })
   window.removeEventListener('keydown', onLightboxKey)
   window.removeEventListener('keydown', onTypeToFocus)
+  window.removeEventListener('click', onOutsideBugCard, true)
+  window.removeEventListener('keydown', onBugCardEsc)
   if (_mqlPortrait && _mqlPortrait._handler) {
     _mqlPortrait.removeEventListener('change', _mqlPortrait._handler)
     _mqlPortrait = null
@@ -923,8 +973,26 @@ async function loadHistory() {
     connectWebSocket()
     loadModels(selectedSession.value)
     loadCredits(selectedSession.value)
+    loadBugs(selectedSession.value)
   } catch (e) {
     console.error('Failed to load history:', e)
+  }
+}
+
+// Load this session's bugs into bugMap so bug ids in messages resolve to
+// hoverable/clickable references. Refreshed on each history load; a failure
+// just leaves ids as plain text.
+async function loadBugs(sessionId) {
+  if (!sessionId) { bugMap.value = {}; return }
+  try {
+    const bugs = await api.getBugs(sessionId)
+    const map = {}
+    for (const b of (bugs || [])) {
+      if (b && b.id) map[b.id] = b
+    }
+    bugMap.value = map
+  } catch {
+    bugMap.value = {}
   }
 }
 
@@ -1529,12 +1597,86 @@ function onDrop(event) {
 }
 
 function onMessagesClick(event) {
+  // A bug reference (BRO-123) was tapped/clicked → open the preview popup.
+  // Works on mobile where hover is unavailable; desktop also gets a hover card.
+  const bugEl = event.target.closest('.bug-ref')
+  if (bugEl) {
+    event.preventDefault()
+    openBugCard(bugEl.getAttribute('data-bug-id'), bugEl)
+    return
+  }
   // Delegate click on any <img> inside rendered markdown to open lightbox
   const img = event.target.closest('.message-body img')
   if (img && img.src) {
     event.preventDefault()
     openLightbox(img.src)
   }
+}
+
+// ─── Bug reference preview card ──────────────────────────────────────────────
+// Hover (desktop) or click/tap (all, esp. mobile) shows a small card with the
+// bug's title, status, severity, and a description preview + a link to the full
+// bug detail page.
+const bugCard = ref(null) // { id, title, status, severity, preview, x, y } | null
+
+function bugPreviewText(body) {
+  if (!body) return ''
+  // Strip the markdown section headers / frontmatter noise; take the first
+  // meaningful lines of the description.
+  const cleaned = body
+    .replace(/^#+\s.*$/gm, '')
+    .replace(/^\s*[-*]\s/gm, '')
+    .trim()
+  return cleaned.length > 240 ? cleaned.slice(0, 240) + '…' : cleaned
+}
+
+function openBugCard(id, anchorEl) {
+  const bug = bugMap.value[id]
+  if (!bug) return
+  const rect = anchorEl.getBoundingClientRect()
+  bugCard.value = {
+    id,
+    title: bug.title || id,
+    status: bug.status || 'open',
+    severity: bug.severity || 'medium',
+    preview: bugPreviewText(bug.body),
+    // Position below the ref, clamped to the viewport in the template style.
+    x: Math.min(rect.left, window.innerWidth - 340),
+    y: rect.bottom + 6,
+    pinned: true, // opened by click — stays until dismissed
+  }
+}
+
+function showBugHover(event) {
+  // Desktop hover: only when not already pinned by a click.
+  const bugEl = event.target.closest?.('.bug-ref')
+  if (!bugEl || (bugCard.value && bugCard.value.pinned)) return
+  const id = bugEl.getAttribute('data-bug-id')
+  const bug = bugMap.value[id]
+  if (!bug) return
+  const rect = bugEl.getBoundingClientRect()
+  bugCard.value = {
+    id,
+    title: bug.title || id,
+    status: bug.status || 'open',
+    severity: bug.severity || 'medium',
+    preview: bugPreviewText(bug.body),
+    x: Math.min(rect.left, window.innerWidth - 340),
+    y: rect.bottom + 6,
+    pinned: false,
+  }
+}
+
+function hideBugHover(event) {
+  // Leave a pinned (clicked) card open; dismiss a hover card.
+  if (bugCard.value && !bugCard.value.pinned) bugCard.value = null
+}
+
+function closeBugCard() { bugCard.value = null }
+
+function openBugDetail(id) {
+  closeBugCard()
+  router.push(`/bugs/${selectedSession.value}/${id}`)
 }
 
 function formatSize(bytes) {
@@ -2944,6 +3086,72 @@ function turnComplexity(turn) {
 </style>
 
 <style>
+/* Bug reference chips (injected via v-html; needs unscoped styles) */
+.bug-ref {
+  color: var(--accent, #7c9eff);
+  background: rgba(124, 158, 255, 0.12);
+  border: 1px solid rgba(124, 158, 255, 0.35);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-weight: 600;
+  font-size: 0.92em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bug-ref:hover { background: rgba(124, 158, 255, 0.22); }
+
+/* Bug preview card (teleported to body) */
+.bug-card {
+  position: fixed;
+  z-index: 10000;
+  width: 320px;
+  max-width: calc(100vw - 20px);
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  padding: 10px 12px;
+  color: #e6edf3;
+  font-size: 0.85rem;
+}
+.bug-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.bug-card-id { font-weight: 700; color: var(--accent, #7c9eff); font-family: monospace; }
+.bug-card-badges { display: flex; gap: 5px; margin-left: auto; }
+.bug-card-close {
+  background: none; border: none; color: #8b949e; cursor: pointer;
+  font-size: 0.9rem; padding: 0 2px; line-height: 1;
+}
+.bug-card-close:hover { color: #e6edf3; }
+.bug-badge {
+  font-size: 0.68rem; padding: 1px 6px; border-radius: 9px;
+  text-transform: capitalize; white-space: nowrap;
+}
+.bug-badge.status { background: #1e3a5f; color: #7c9eff; }
+.bug-badge.status.resolved, .bug-badge.status.wontfix { background: #14532d; color: #4ade80; }
+.bug-badge.status.in_progress { background: #5a3a14; color: #fbbf24; }
+.bug-badge.sev { background: #30363d; color: #adbac7; }
+.bug-badge.sev.high, .bug-badge.sev.critical { background: #5a1e1e; color: #f87171; }
+.bug-badge.sev.low { background: #21402b; color: #6ee7a8; }
+.bug-card-title { font-weight: 600; margin-bottom: 5px; line-height: 1.3; }
+.bug-card-preview {
+  color: #adbac7; line-height: 1.4; margin-bottom: 8px;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 6.5em; overflow: hidden;
+}
+.bug-card-link {
+  background: none; border: none; color: var(--accent, #7c9eff);
+  cursor: pointer; padding: 0; font-size: 0.82rem; font-weight: 600;
+}
+.bug-card-link:hover { text-decoration: underline; }
+.bugcard-fade-enter-active { transition: opacity 0.12s ease; }
+.bugcard-fade-leave-active { transition: opacity 0.1s ease; }
+.bugcard-fade-enter-from, .bugcard-fade-leave-to { opacity: 0; }
+
 .lightbox-overlay {
   position: fixed;
   inset: 0;
