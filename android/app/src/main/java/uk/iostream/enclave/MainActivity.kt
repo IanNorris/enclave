@@ -107,9 +107,16 @@ class MainActivity : Activity() {
                 fileCallback = filePathCallback
                 val intent = fileChooserParams?.createIntent()
                 return try {
+                    // Launching the system file picker will trigger onResume when
+                    // we return — which normally reloads the WebView (for the
+                    // background→foreground reconnect case). That reload would wipe
+                    // the just-picked file (and the composer draft) before the web
+                    // UI can use it, so suppress it for this round-trip.
+                    skipNextResumeReload = true
                     startActivityForResult(intent, fileChooserCode)
                     true
                 } catch (e: Exception) {
+                    skipNextResumeReload = false
                     fileCallback = null
                     false
                 }
