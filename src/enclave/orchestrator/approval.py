@@ -85,6 +85,11 @@ class ApprovalManager:
         self.send_poll = send_poll
         self.end_poll = end_poll
         self.timeout = timeout
+        # Optional async callback to surface a pending request in the web UI
+        # (and to clear it on resolve). Set by the router. Signature:
+        #   async on_ui_request(event: dict) -> None
+        # where event is {"kind": "request"|"resolved", "session_id", ...}.
+        self.on_ui_request: Callable[[dict], Awaitable[None]] | None = None
 
         # Map: poll_event_id → (request_id, suggested_pattern)
         self._pending: dict[str, tuple[int, str]] = {}
@@ -95,6 +100,9 @@ class ApprovalManager:
         # Requests awaiting custom pattern text input
         # request_id → (room_id, suggested_pattern)
         self._awaiting_pattern: dict[int, tuple[str, str]] = {}
+        # Map: request_id → the suggested pattern, so a web-UI response (keyed by
+        # request_id, not poll_event_id) can resolve a pattern grant.
+        self._request_pattern: dict[int, str] = {}
 
     async def request_permission(
         self,
@@ -123,10 +131,6 @@ class ApprovalManager:
         if existing:
             self.db.use_grant(existing.id)
             return RequestStatus.APPROVED, existing.scope, None
-
-        if not room_id:
-            log.error("No room_id for approval request")
-            return RequestStatus.EXPIRED, None, None
 
         # Create request in DB
         request_id = self.db.add_request(
@@ -173,45 +177,110 @@ class ApprovalManager:
             (ANSWER_DENY_PROJECT, "❌ Deny for project"),
         ])
 
-        poll_event_id = await self.send_poll(room_id, question, answers)
-
-        if poll_event_id is None:
-            self.db.resolve_request(request_id, RequestStatus.EXPIRED, "system")
-            return RequestStatus.EXPIRED, None, None
-
-        # Update request with event ID
-        self.db._conn.execute(
-            "UPDATE requests SET matrix_event_id = ? WHERE id = ?",
-            (poll_event_id, request_id),
-        )
-        self.db._conn.commit()
-
-        # Register pending
-        self._pending[poll_event_id] = (request_id, pattern)
+        # Register the waiter + per-request metadata BEFORE surfacing the request
+        # anywhere, so a fast web-UI response can't race ahead of registration.
         wait_event = asyncio.Event()
         self._events[request_id] = wait_event
+        self._request_pattern[request_id] = pattern
 
-        # Wait for response
-        try:
-            await asyncio.wait_for(wait_event.wait(), timeout=self.timeout)
-        except asyncio.TimeoutError:
+        # Surface the request to the web UI (the primary, Matrix-independent
+        # channel). A browser resolves it by request_id via resolve_external.
+        if self.on_ui_request is not None:
+            try:
+                await self.on_ui_request({
+                    "kind": "request",
+                    "session_id": session_id,
+                    "request_id": request_id,
+                    "perm_type": perm_type.value,
+                    "target": target,
+                    "reason": reason,
+                    "pattern": pattern if allow_pattern else "",
+                    "allow_pattern": allow_pattern,
+                    "timeout": self.timeout,
+                })
+            except Exception as e:
+                log.warning("on_ui_request(request) failed: %s", e)
+
+        # Additionally post a Matrix poll when a room is available (Matrix on).
+        poll_event_id = None
+        if room_id and self.send_poll is not None:
+            poll_event_id = await self.send_poll(room_id, question, answers)
+            if poll_event_id is not None:
+                self.db._conn.execute(
+                    "UPDATE requests SET matrix_event_id = ? WHERE id = ?",
+                    (poll_event_id, request_id),
+                )
+                self.db._conn.commit()
+                self._pending[poll_event_id] = (request_id, pattern)
+
+        # With neither a web-UI channel nor a Matrix poll, nobody can answer;
+        # fail closed immediately rather than blocking for the full timeout.
+        if self.on_ui_request is None and poll_event_id is None:
+            log.error("No approval channel (no web UI, no Matrix room) — denying")
             self.db.resolve_request(request_id, RequestStatus.EXPIRED, "system")
             self._cleanup(poll_event_id, request_id)
             return RequestStatus.EXPIRED, None, None
 
-        # Close the poll
+        # Wait for a response from either channel.
         try:
-            await self.end_poll(room_id, poll_event_id)
-        except Exception:
-            pass
+            await asyncio.wait_for(wait_event.wait(), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            self.db.resolve_request(request_id, RequestStatus.EXPIRED, "system")
+            await self._notify_ui_resolved(session_id, request_id, "expired")
+            self._cleanup(poll_event_id, request_id)
+            return RequestStatus.EXPIRED, None, None
+
+        # Close the Matrix poll if one was posted.
+        if poll_event_id is not None and room_id:
+            try:
+                await self.end_poll(room_id, poll_event_id)
+            except Exception:
+                pass
 
         # Get result
         result = self._results.pop(request_id, None)
+        await self._notify_ui_resolved(session_id, request_id, "resolved")
         self._cleanup(poll_event_id, request_id)
 
         if result:
             return result
         return RequestStatus.DENIED, None, None
+
+    async def _notify_ui_resolved(self, session_id: str, request_id: int, why: str) -> None:
+        """Tell the web UI to clear a request card (answered elsewhere/expired)."""
+        if self.on_ui_request is None:
+            return
+        try:
+            await self.on_ui_request({
+                "kind": "resolved",
+                "session_id": session_id,
+                "request_id": request_id,
+                "why": why,
+            })
+        except Exception as e:
+            log.warning("on_ui_request(resolved) failed: %s", e)
+
+    def resolve_external(
+        self, request_id: int, answer_id: str, sender: str,
+    ) -> bool:
+        """Resolve a pending request by request_id (web-UI response path).
+
+        Returns True if a waiting request was resolved. Mirrors
+        ``handle_poll_response`` but is keyed on request_id rather than a Matrix
+        poll event, so it works with Matrix disabled.
+        """
+        if request_id not in self._events:
+            return False
+        mapping = ANSWER_MAP.get(answer_id)
+        if mapping is None:
+            return False
+        status, scope = mapping
+        pattern = self._request_pattern.get(request_id, "")
+        result_pattern = pattern if answer_id == ANSWER_APPROVE_PATTERN else None
+        self.db.resolve_request(request_id, status, sender)
+        self._results[request_id] = (status, scope, result_pattern)
+        self._events[request_id].set()
+        return True
 
     def handle_poll_response(
         self,
@@ -300,3 +369,4 @@ class ApprovalManager:
         self._pending.pop(event_id, None)
         self._events.pop(request_id, None)
         self._results.pop(request_id, None)
+        self._request_pattern.pop(request_id, None)

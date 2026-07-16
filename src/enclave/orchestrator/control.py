@@ -187,6 +187,38 @@ class ControlServer:
         """Whether the session's last turn ended with the agent awaiting input."""
         return self._awaiting_input.get(session_id, False)
 
+    def emit_permission_request(self, session_id: str, event: dict) -> None:
+        """Push a pending permission request to subscribed web UI clients.
+
+        The browser renders an approve/deny card and responds via the
+        ``permission_respond`` action. Also broadcast to the notification stream
+        so a push/badge can surface it when the session isn't focused.
+        """
+        self._emit(session_id, {
+            "ok": True, "type": "permission_request",
+            "request_id": event.get("request_id"),
+            "perm_type": event.get("perm_type", ""),
+            "target": event.get("target", ""),
+            "reason": event.get("reason", ""),
+            "pattern": event.get("pattern", ""),
+            "allow_pattern": bool(event.get("allow_pattern")),
+            "timeout": event.get("timeout"),
+        })
+        self._emit_notification({
+            "type": "notification",
+            "reason": "permission_request",
+            "session_id": session_id,
+            "target": event.get("target", ""),
+        })
+
+    def emit_permission_resolved(self, session_id: str, event: dict) -> None:
+        """Tell web UI clients to clear a permission card (answered/expired)."""
+        self._emit(session_id, {
+            "ok": True, "type": "permission_resolved",
+            "request_id": event.get("request_id"),
+            "why": event.get("why", "resolved"),
+        })
+
     def clear_awaiting_input(self, session_id: str) -> None:
         """Clear the awaiting-input flag (e.g. after the user dismisses it)."""
         self._awaiting_input.pop(session_id, None)
@@ -421,6 +453,8 @@ class ControlServer:
                 await self._handle_schedule_cancel(req, writer)
             elif action == "clear_awaiting":
                 await self._handle_clear_awaiting(req, writer)
+            elif action == "permission_respond":
+                await self._handle_permission_respond(req, writer)
             else:
                 await self._write(writer, {"ok": False, "error": f"Unknown action: {action}"})
         except asyncio.TimeoutError:
@@ -879,6 +913,21 @@ class ControlServer:
             return
         self.clear_awaiting_input(session_id)
         await self._write(writer, {"ok": True, "type": "awaiting_cleared", "session": session_id})
+
+    async def _handle_permission_respond(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Resolve a pending permission request answered from the web UI."""
+        request_id = req.get("request_id")
+        answer_id = req.get("answer_id", "")
+        sender = req.get("sender", "web")
+        if request_id is None or not answer_id:
+            await self._write(writer, {"ok": False, "error": "Missing request_id or answer_id"})
+            return
+        try:
+            resolved = self._router.resolve_web_approval(int(request_id), answer_id, sender)
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        await self._write(writer, {"ok": True, "type": "permission_responded", "resolved": resolved})
 
     async def _handle_subscribe_notifications(self, writer: asyncio.StreamWriter) -> None:
         """Subscribe to the global cross-session notification stream."""
