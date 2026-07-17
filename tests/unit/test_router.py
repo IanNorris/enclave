@@ -1404,3 +1404,87 @@ class TestHostApprovalGate:
     def test_no_config_fails_closed_to_gate(self) -> None:
         # Missing config must gate (safe default), never silently allow.
         assert self._check(None, "brook-8c7de217") is False
+
+
+class TestGuiLaunchGrantPersistence:
+    """Regression tests for ENC-007: GUI-launch approvals must persist a
+    durable grant for session/project scopes, and must NOT persist a ONCE
+    grant (which would silently approve the next launch).
+    """
+
+    @staticmethod
+    def _make_stub(perm_db, scope):
+        from enclave.orchestrator.permissions import RequestStatus
+        stub = MagicMock()
+        stub._perm_db = perm_db
+        stub._audit = MagicMock()
+        stub._display = MagicMock()
+        stub._display.is_available = True
+        stub._display.launch_app = AsyncMock(return_value=True)
+        stub._approval = MagicMock()
+        stub._approval.request_permission = AsyncMock(
+            return_value=(RequestStatus.APPROVED, scope, None)
+        )
+        stub._resolve_missing_libs = AsyncMock(return_value=[])
+        stub.ipc = MagicMock()
+        stub.ipc.send_to = AsyncMock()
+        return stub
+
+    @staticmethod
+    def _session():
+        session = MagicMock()
+        session.id = "host-utilities-e6a949bc"
+        session.name = "Host utilities"
+        session.room_id = "!r:test"
+        session.workspace_path = "/data/ws"
+        return session
+
+    @pytest.mark.asyncio
+    async def test_project_scope_creates_grant(self, tmp_path) -> None:
+        from enclave.orchestrator.permissions import (
+            PermissionDB, PermissionScope, PermissionType,
+        )
+        db = PermissionDB(tmp_path / "p.db")
+        try:
+            stub = self._make_stub(db, PermissionScope.PROJECT)
+            session = self._session()
+            msg = Message(
+                type=MessageType.GUI_LAUNCH_REQUEST,
+                payload={"command": "gnome-calculator", "reason": "test"},
+            )
+            await MessageRouter._handle_gui_launch(stub, session, msg)
+
+            # A subsequent identical launch must now be auto-approved by the
+            # stored grant (exact-target match on "GUI: <command>").
+            grant = db.check_permission(
+                session.id, session.name, PermissionType.FILESYSTEM,
+                "GUI: gnome-calculator",
+            )
+            assert grant is not None
+            assert grant.scope == PermissionScope.PROJECT
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_once_scope_creates_no_grant(self, tmp_path) -> None:
+        from enclave.orchestrator.permissions import (
+            PermissionDB, PermissionScope, PermissionType,
+        )
+        db = PermissionDB(tmp_path / "p.db")
+        try:
+            stub = self._make_stub(db, PermissionScope.ONCE)
+            session = self._session()
+            msg = Message(
+                type=MessageType.GUI_LAUNCH_REQUEST,
+                payload={"command": "gnome-calculator", "reason": "test"},
+            )
+            await MessageRouter._handle_gui_launch(stub, session, msg)
+
+            # ONCE must not persist — the next launch should re-prompt.
+            grant = db.check_permission(
+                session.id, session.name, PermissionType.FILESYSTEM,
+                "GUI: gnome-calculator",
+            )
+            assert grant is None
+        finally:
+            db.close()

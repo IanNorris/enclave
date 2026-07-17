@@ -3687,6 +3687,30 @@ class MessageRouter:
             ))
             return
 
+        # Persist a durable grant so "approve for project"/"approve for session"
+        # actually sticks — without this the GUI handler (unlike the filesystem
+        # and mount handlers) never recorded a grant, so every launch re-prompted
+        # even after the user picked a project scope (ENC-007). GUI launches are
+        # exact-target only (allow_pattern=False), so the grant matches the same
+        # command string on future launches. ONCE is deliberately excluded: a
+        # once-grant would be consumed by the *next* identical launch, silently
+        # approving a second op the user only okayed once.
+        if scope in (PermissionScope.SESSION, PermissionScope.PROJECT):
+            self._perm_db.add_grant(
+                session_id=session.id,
+                project_name=session.name,
+                perm_type=PermissionType.FILESYSTEM,
+                target=f"GUI: {command}",
+                scope=scope,
+                granted_by="approval",
+                pattern=None,
+            )
+            self._audit.log(
+                "permission_granted", session_id=session.id,
+                perm_type=PermissionType.FILESYSTEM.value,
+                target=f"GUI: {command}", scope=scope.value,
+            )
+
         # Approved: now it's safe to inspect the binary. Container-built
         # binaries may need libraries from the container's nix store or system
         # libs — resolve missing shared libs on the host.
