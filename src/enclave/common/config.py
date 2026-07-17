@@ -212,6 +212,29 @@ class ConciergeConfig:
 
 
 @dataclass
+class HostApprovalConfig:
+    """Controls the host-mode restricted-operation approval gate.
+
+    Host-profile sessions run with the operator's full user privileges (no
+    container sandbox), so restricted operations (system tools, paths outside
+    the scratch space) are screened by an approval gate that surfaces a card
+    in the web UI. This config governs that gate.
+
+    `gate` is the master switch. When False the gate is bypassed entirely and
+    all host requests auto-approve instantly — the emergency escape hatch that
+    prevents a lockout if the approval UI is ever unreachable. It can also be
+    flipped at runtime with the `ENCLAVE_HOST_APPROVAL=off` env override.
+
+    `bypass_sessions` lists session ids that always bypass the gate even when
+    it is on — for trusted operator/control sessions that must never be
+    blocked (e.g. the operator agent and the always-on system session).
+    """
+
+    gate: bool = True
+    bypass_sessions: list[str] = field(default_factory=list)
+
+
+@dataclass
 class EnclaveConfig:
     """Top-level Enclave configuration."""
 
@@ -220,6 +243,7 @@ class EnclaveConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     mimir: MimirConfig = field(default_factory=MimirConfig)
     concierge: "ConciergeConfig" = field(default_factory=lambda: ConciergeConfig())
+    host_approval: HostApprovalConfig = field(default_factory=HostApprovalConfig)
     approval_timeout: float = 300.0  # 5 minute approval timeout
     users: list[UserMapping] = field(default_factory=list)
     log_level: str = "INFO"
@@ -273,6 +297,13 @@ def _apply_env_overrides(config: EnclaveConfig) -> None:
     enabled = os.environ.get("ENCLAVE_MIMIR_ENABLED")
     if enabled is not None:
         config.mimir.enabled = _coerce_bool(enabled)
+
+    # Emergency escape hatch: ENCLAVE_HOST_APPROVAL=off disables the host
+    # approval gate globally (allow-all) without editing the config file, so
+    # we can recover instantly if the approval UI is ever unreachable.
+    host_gate = os.environ.get("ENCLAVE_HOST_APPROVAL")
+    if host_gate is not None:
+        config.host_approval.gate = _coerce_bool(host_gate)
 
 
 def _parse_user_mapping(data: dict[str, Any]) -> UserMapping:
@@ -405,6 +436,15 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
             config.concierge = ConciergeConfig(
                 enabled=cc.get("enabled", config.concierge.enabled),
                 profile=cc.get("profile", config.concierge.profile),
+            )
+
+        if "host_approval" in data:
+            ha = data["host_approval"] or {}
+            config.host_approval = HostApprovalConfig(
+                gate=ha.get("gate", config.host_approval.gate),
+                bypass_sessions=ha.get(
+                    "bypass_sessions", config.host_approval.bypass_sessions,
+                ),
             )
 
     _apply_env_overrides(config)

@@ -151,6 +151,7 @@ async def run() -> None:
         memory_config=config.memory,
         mimir_config=config.mimir,
         concierge_config=config.concierge,
+        host_approval_config=config.host_approval,
     )
     await router.start()
 
