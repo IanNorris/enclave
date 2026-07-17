@@ -52,3 +52,21 @@ memory:
 # processes are stopped after this duration. Default: 7200 (2 hours).
 # Set to 0 to disable.
 idle_timeout: 7200
+
+# Host approval gate
+#
+# Host-profile sessions run with your full user privileges (no container
+# sandbox), so restricted operations (system tools, paths outside the
+# session scratch space) are screened by an approval gate that surfaces a
+# card in the web UI for you to approve or deny. Container sessions are
+# sandboxed and are unaffected by this gate.
+host_approval:
+  # Master switch. true = restricted host ops require approval; false =
+  # allow-all (the gate is bypassed entirely). The emergency escape hatch
+  # ENCLAVE_HOST_APPROVAL=off overrides this to false at runtime, so you can
+  # never get locked out if the approval UI is unreachable.
+  gate: true
+  # Session ids that always bypass the gate even when it is on — for trusted
+  # operator/control sessions that must never be blocked. Bypasses are still
+  # written to the audit log.
+  bypass_sessions: []

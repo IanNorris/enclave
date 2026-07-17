@@ -7,6 +7,7 @@ import pytest
 
 from enclave.common.config import (
     EnclaveConfig,
+    HostApprovalConfig,
     MatrixConfig,
     UserMapping,
     load_config,
@@ -97,6 +98,46 @@ class TestEnvOverrides:
         monkeypatch.setenv("ENCLAVE_LOG_LEVEL", "DEBUG")
         config = load_config()
         assert config.log_level == "DEBUG"
+
+
+class TestHostApprovalConfig:
+    """Test the host-mode approval gate configuration."""
+
+    def test_default_gate_on(self) -> None:
+        config = EnclaveConfig()
+        assert config.host_approval.gate is True
+        assert config.host_approval.bypass_sessions == []
+
+    def test_load_from_yaml(self, tmp_path: Path) -> None:
+        p = tmp_path / "c.yaml"
+        p.write_text(
+            "host_approval:\n"
+            "  gate: false\n"
+            "  bypass_sessions:\n"
+            "    - enclave-1366790d\n"
+            "    - khione-system-51942e91\n"
+        )
+        config = load_config(p)
+        assert config.host_approval.gate is False
+        assert config.host_approval.bypass_sessions == [
+            "enclave-1366790d",
+            "khione-system-51942e91",
+        ]
+
+    def test_env_escape_hatch_off(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # YAML enables the gate; the env escape hatch must force it off.
+        p = tmp_path / "c.yaml"
+        p.write_text("host_approval:\n  gate: true\n")
+        monkeypatch.setenv("ENCLAVE_HOST_APPROVAL", "off")
+        config = load_config(p)
+        assert config.host_approval.gate is False
+
+    def test_env_escape_hatch_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ENCLAVE_HOST_APPROVAL", "on")
+        config = load_config()
+        assert config.host_approval.gate is True
 
 
 class TestUserMapping:
