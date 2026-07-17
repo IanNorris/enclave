@@ -626,6 +626,40 @@ async def send_message(request: Request, session_id: str, body: SendMessage):
     return {"sent": True, "event_id": event_id, "via": "matrix"}
 
 
+class PermissionResponse(BaseModel):
+    request_id: int
+    answer_id: str  # approve_once | approve_project | approve_pattern | deny_once | deny_project
+
+
+@router.post("/{session_id}/permission")
+async def respond_permission(request: Request, session_id: str, body: PermissionResponse):
+    """Answer a pending agent permission request from the web UI."""
+    data_dir = Path(request.app.state.config.data_dir)
+    sock_path = data_dir / "control.sock"
+    if not sock_path.exists():
+        raise HTTPException(status_code=503, detail="Orchestrator control socket unavailable")
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        req = json.dumps({
+            "action": "permission_respond",
+            "session": session_id,
+            "request_id": body.request_id,
+            "answer_id": body.answer_id,
+            "sender": "WebUI",
+        })
+        writer.write(req.encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        writer.close()
+        await writer.wait_closed()
+        resp = json.loads(line.decode()) if line else {}
+    except (OSError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=502, detail=f"Control socket error: {e}")
+    if not resp.get("ok"):
+        raise HTTPException(status_code=400, detail=resp.get("error", "Failed to respond"))
+    return {"resolved": bool(resp.get("resolved"))}
+
+
 @router.get("/{session_id}/models")
 async def get_models(request: Request, session_id: str, refresh: bool = False):
     """Get available models for a session.

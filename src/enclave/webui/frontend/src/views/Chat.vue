@@ -358,6 +358,26 @@
           </div>
         </div>
 
+        <!-- Agent permission requests (host-mode approvals) -->
+        <div v-for="req in permissionRequests" :key="req.request_id" class="message assistant-message permission-block">
+          <div class="message-meta">
+            <span class="sender">Agent</span>
+            <span class="perm-badge">permission</span>
+          </div>
+          <div class="perm-target">
+            <span class="perm-icon">{{ permTypeIcon(req.perm_type) }}</span>
+            <span class="perm-type">{{ req.perm_type }}</span>
+            <code class="perm-code">{{ req.target }}</code>
+          </div>
+          <div v-if="req.reason" class="perm-reason">💬 {{ req.reason }}</div>
+          <div class="perm-actions">
+            <button class="secondary perm-approve" :disabled="req.answering" @click="respondPermission(req, 'approve_once')">✅ Approve once</button>
+            <button class="secondary perm-approve" :disabled="req.answering" @click="respondPermission(req, 'approve_project')">✅ Approve for project</button>
+            <button v-if="req.allow_pattern && req.pattern" class="secondary perm-approve" :disabled="req.answering" @click="respondPermission(req, 'approve_pattern')" :title="'Pattern: ' + req.pattern">✅ Approve pattern</button>
+            <button class="secondary perm-deny" :disabled="req.answering" @click="respondPermission(req, 'deny_once')">❌ Deny</button>
+          </div>
+        </div>
+
         <!-- Agent working indicator (driven by agent state, not the send
              round-trip, so it persists for the whole turn and the composer
              stays usable for queuing a follow-up). -->
@@ -749,6 +769,9 @@ const streamingText = ref('')
 const activityText = ref('')
 const askUserPrompt = ref(null)
 const askUserAnswer = ref('')
+// Pending agent permission requests (host-mode approvals), keyed by request_id.
+// Rendered as approve/deny cards; answered via POST /permission.
+const permissionRequests = ref([])
 // Auto Fusion: latest complexity grade (1-5) + recommended tier, shown live.
 const complexity = ref(null)
 const { applyComplexity, applyFusion, resetFusion } = useFusion()
@@ -1337,6 +1360,30 @@ function handleStreamEvent(msg) {
     return
   }
 
+  if (type === 'permission_request') {
+    // Agent is blocked awaiting approval for a restricted op. Show a card.
+    if (!permissionRequests.value.some(p => p.request_id === msg.request_id)) {
+      permissionRequests.value.push({
+        request_id: msg.request_id,
+        perm_type: msg.perm_type || '',
+        target: msg.target || '',
+        reason: msg.reason || '',
+        pattern: msg.pattern || '',
+        allow_pattern: !!msg.allow_pattern,
+        answering: false,
+      })
+    }
+    setAgentState('waiting_user')
+    nextTick(() => scrollToBottom())
+    return
+  }
+
+  if (type === 'permission_resolved') {
+    // Answered here or elsewhere (Matrix / another client) or expired — clear it.
+    permissionRequests.value = permissionRequests.value.filter(p => p.request_id !== msg.request_id)
+    return
+  }
+
   if (type === 'file_send') {
     // Agent sent a file — show it as a live event
     const filename = msg.filename || 'file'
@@ -1546,6 +1593,27 @@ async function answerAskUser(answer) {
   } catch (e) {
     console.error('Failed to send answer:', e)
   }
+}
+
+// Answer an agent permission request. answerId is one of the ANSWER_* ids the
+// orchestrator's ApprovalManager understands.
+async function respondPermission(req, answerId) {
+  if (!selectedSession.value || req.answering) return
+  req.answering = true
+  try {
+    await api.respondPermission(selectedSession.value, req.request_id, answerId)
+    // Optimistically clear; the permission_resolved event also clears it.
+    permissionRequests.value = permissionRequests.value.filter(p => p.request_id !== req.request_id)
+  } catch (e) {
+    console.error('Failed to respond to permission:', e)
+    req.answering = false
+  }
+}
+
+function permTypeIcon(t) {
+  if (t === 'filesystem') return '📂'
+  if (t === 'network') return '🌐'
+  return '❓'
 }
 
 function addFiles(fileList) {
@@ -2831,6 +2899,43 @@ function turnComplexity(turn) {
 .ask-user-block {
   max-width: 90%;
 }
+
+.permission-block {
+  max-width: 90%;
+  border: 1px solid rgba(232, 167, 53, 0.5);
+  border-radius: var(--radius-sm, 6px);
+  padding: 0.6rem 0.75rem;
+}
+.perm-badge {
+  font-size: 0.65rem;
+  color: #e8a735;
+  background: rgba(232, 167, 53, 0.15);
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.perm-target {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.4rem 0;
+  flex-wrap: wrap;
+}
+.perm-type { font-size: 0.8rem; text-transform: capitalize; color: var(--text-muted, #adbac7); }
+.perm-code {
+  font-family: monospace;
+  font-size: 0.82rem;
+  background: rgba(255,255,255,0.06);
+  padding: 1px 6px;
+  border-radius: 4px;
+  word-break: break-all;
+}
+.perm-reason { font-size: 0.82rem; color: var(--text-muted, #adbac7); margin-bottom: 0.5rem; }
+.perm-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.perm-approve { border-color: rgba(74, 222, 128, 0.5) !important; color: #4ade80 !important; }
+.perm-deny { border-color: rgba(248, 113, 113, 0.5) !important; color: #f87171 !important; }
+.perm-actions button:disabled { opacity: 0.5; cursor: wait; }
 
 .ask-badge {
   font-size: 0.65rem;

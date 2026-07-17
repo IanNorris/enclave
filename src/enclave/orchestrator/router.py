@@ -285,6 +285,24 @@ class MessageRouter:
         control_sock = os.path.join(self._data_dir, "control.sock")
         self._control = ControlServer(control_sock, self)
 
+        # Surface approval requests through the control socket so the web UI can
+        # answer them (the Matrix-independent approval channel).
+        self._approval.on_ui_request = self._emit_approval_ui
+
+    async def _emit_approval_ui(self, event: dict) -> None:
+        """Push an approval request/resolution to subscribed web UI clients."""
+        session_id = event.get("session_id")
+        if not session_id:
+            return
+        if event.get("kind") == "request":
+            self._control.emit_permission_request(session_id, event)
+        else:
+            self._control.emit_permission_resolved(session_id, event)
+
+    def resolve_web_approval(self, request_id: int, answer_id: str, sender: str) -> bool:
+        """Resolve a pending approval from the web UI. Returns True if resolved."""
+        return self._approval.resolve_external(request_id, answer_id, sender)
+
     async def start(self) -> None:
         """Wire up all the event handlers."""
         self.matrix.on_message(self._on_matrix_message)

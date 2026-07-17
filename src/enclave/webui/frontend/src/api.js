@@ -101,6 +101,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ content }),
   }),
+  respondPermission: (session, requestId, answerId) => request(`/chat/${session}/permission`, {
+    method: 'POST',
+    body: JSON.stringify({ request_id: requestId, answer_id: answerId }),
+  }),
   getModels: (session, refresh = false) => request(`/chat/${session}/models${refresh ? '?refresh=true' : ''}`),
   getCredits: (sessionId) => request(`/chat/credits${sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''}`),
   setModel: (session, model) => request(`/chat/${session}/model`, {
