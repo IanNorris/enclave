@@ -1363,3 +1363,44 @@ class TestAutoRestore:
             if "1 failed" in m.get("body", "")
         ]
         assert len(fail_msgs) == 1
+
+
+class TestHostApprovalGate:
+    """Test the host approval gate bypass logic.
+
+    These tests bind ``_host_gate_bypassed`` against a lightweight stand-in
+    rather than a full MessageRouter, so they are independent of the router
+    construction fixtures.
+    """
+
+    @staticmethod
+    def _check(cfg: Any, session_id: str) -> bool:
+        stub = MagicMock()
+        stub._host_approval_config = cfg
+        session = MagicMock()
+        session.id = session_id
+        return MessageRouter._host_gate_bypassed(stub, session)
+
+    def test_gate_on_not_listed_is_gated(self) -> None:
+        from enclave.common.config import HostApprovalConfig
+        cfg = HostApprovalConfig(gate=True, bypass_sessions=[])
+        assert self._check(cfg, "brook-8c7de217") is False
+
+    def test_gate_on_listed_session_bypasses(self) -> None:
+        from enclave.common.config import HostApprovalConfig
+        cfg = HostApprovalConfig(
+            gate=True,
+            bypass_sessions=["enclave-1366790d", "khione-system-51942e91"],
+        )
+        assert self._check(cfg, "enclave-1366790d") is True
+        assert self._check(cfg, "khione-system-51942e91") is True
+        assert self._check(cfg, "brook-8c7de217") is False
+
+    def test_gate_off_bypasses_everyone(self) -> None:
+        from enclave.common.config import HostApprovalConfig
+        cfg = HostApprovalConfig(gate=False, bypass_sessions=[])
+        assert self._check(cfg, "brook-8c7de217") is True
+
+    def test_no_config_fails_closed_to_gate(self) -> None:
+        # Missing config must gate (safe default), never silently allow.
+        assert self._check(None, "brook-8c7de217") is False

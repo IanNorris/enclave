@@ -113,6 +113,7 @@ class MessageRouter:
         memory_config: Any | None = None,
         mimir_config: Any | None = None,
         concierge_config: Any | None = None,
+        host_approval_config: Any | None = None,
     ):
         self.matrix = matrix
         self.ipc = ipc
@@ -251,6 +252,7 @@ class MessageRouter:
         self._memory_config = memory_config
         self._mimir_config = mimir_config
         self._concierge_config = concierge_config
+        self._host_approval_config = host_approval_config
         self._data_dir = data_dir or os.path.expanduser("~/.local/share/enclave")
 
         # ── Mimir librarian worker ──
@@ -2502,6 +2504,21 @@ class MessageRouter:
         )
         await self.ipc.send_to(session.id, reply)
 
+    def _host_gate_bypassed(self, session: "Session") -> bool:
+        """Return True if the host approval gate should be skipped for *session*.
+
+        The gate is bypassed when it is globally off (master switch or the
+        ENCLAVE_HOST_APPROVAL=off escape hatch, both folded into the config's
+        `gate` field at load time) or when this session is on the trusted
+        bypass list. Non-host sessions are containerised and never gated here.
+        """
+        cfg = self._host_approval_config
+        if cfg is None:
+            return False
+        if not getattr(cfg, "gate", True):
+            return True
+        return session.id in (getattr(cfg, "bypass_sessions", []) or [])
+
     async def _handle_permission_request(
         self, session: Session, msg: Message
     ) -> None:
@@ -2514,6 +2531,21 @@ class MessageRouter:
             perm_type = PermissionType(perm_type_str)
         except ValueError:
             perm_type = PermissionType.FILESYSTEM
+
+        # Safety valve: trusted/bypass sessions and a globally-off gate
+        # short-circuit to approval so we can never lock out host work if the
+        # approval UI is unreachable. Audited so bypasses stay visible.
+        if self._host_gate_bypassed(session):
+            self._audit.log(
+                "permission_bypassed", session_id=session.id,
+                perm_type=perm_type.value, target=target, reason=reason,
+            )
+            await self.ipc.send_to(session.id, Message(
+                type=MessageType.PERMISSION_RESPONSE,
+                payload={"approved": True, "scope": None, "target": target},
+                reply_to=msg.id,
+            ))
+            return
 
         log.info(
             "Permission request from %s: %s %s (%s)",
