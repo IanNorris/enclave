@@ -67,6 +67,7 @@ class Session:
     host_pid: int | None = None  # PID for host-mode subprocess agents
     nix_shell_path: str = ""  # path to shell.nix/flake.nix for nix-shell wrapping
     pending_nix_nudge: bool = False  # needs continuation nudge after nix-shell restart
+    pending_restart_nudge: bool = False  # was mid-turn at orchestrator restart; wake to resume
     extra_mounts: list[dict[str, str]] = field(default_factory=list)  # [{source, mount_name}]
     port_mappings: list[dict[str, Any]] = field(default_factory=list)  # [{container_port, host_port, protocol}]
     # ACP remote agent fields
@@ -163,6 +164,7 @@ class SessionManager:
                     user_pronouns=s.get("user_pronouns", ""),
                     nix_shell_path=s.get("nix_shell_path", ""),
                     pending_nix_nudge=s.get("pending_nix_nudge", False),
+                    pending_restart_nudge=s.get("pending_restart_nudge", False),
                     extra_mounts=s.get("extra_mounts", []),
                     port_mappings=s.get("port_mappings", []),
                     acp_host=s.get("acp_host", ""),
@@ -195,6 +197,7 @@ class SessionManager:
                 "container_id": s.container_id,
                 "nix_shell_path": s.nix_shell_path,
                 "pending_nix_nudge": s.pending_nix_nudge,
+                "pending_restart_nudge": s.pending_restart_nudge,
                 "extra_mounts": s.extra_mounts,
                 "port_mappings": s.port_mappings,
                 "acp_host": s.acp_host,

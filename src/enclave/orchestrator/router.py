@@ -1072,6 +1072,12 @@ class MessageRouter:
         elif msg.type == MessageType.TURN_START:
             log.info("Agent %s turn started", session.id)
             self._turn_start_time[session.id] = time.monotonic()
+            # Persist that this session is mid-turn, so if the orchestrator
+            # restarts before the turn ends we can wake it to resume its
+            # interrupted work (ENC-008). Cleared at TURN_END.
+            if not session.pending_restart_nudge:
+                session.pending_restart_nudge = True
+                self.sessions.save_sessions()
             self._control.cancel_turn_end(session.id)
             self._control.notify_turn_start(session.id)
             self._start_typing_refresh(session)
@@ -1084,6 +1090,10 @@ class MessageRouter:
             awaiting_input = bool(msg.payload.get("awaiting_input")) if msg.payload else False
             log.info("Agent %s turn ended (%.1fs, awaiting_input=%s)",
                      session.id, elapsed, awaiting_input)
+            # Turn completed cleanly — clear the mid-turn restart flag.
+            if session.pending_restart_nudge:
+                session.pending_restart_nudge = False
+                self.sessions.save_sessions()
             self._stop_typing_refresh(session.id)
             self._control.notify_turn_end(session.id, awaiting_input=awaiting_input)
             # Snapshot SDK state after every interaction
@@ -2035,6 +2045,32 @@ class MessageRouter:
                     },
                 )
                 await self.ipc.send_to(session.id, nudge)
+
+            # Wake a session that was mid-turn when the orchestrator restarted
+            # (ENC-008). The SDK resumes from its checkpoint but the agent loop
+            # comes back idle, so without this nudge the interrupted work stalls
+            # until a human pokes it. Skip if the user already has messages
+            # queued (they will drive it) or a nix nudge just fired (avoid a
+            # double continuation prompt).
+            elif session.pending_restart_nudge:
+                session.pending_restart_nudge = False
+                self.sessions.save_sessions()
+                if not self._pending_messages.get(session.id):
+                    nudge = Message(
+                        type=MessageType.USER_MESSAGE,
+                        payload={
+                            "content": (
+                                "[Enclave Coordinator] The orchestrator restarted "
+                                "while you were mid-task. Your session has resumed "
+                                "from checkpoint. Please review where you left off "
+                                "and continue with your current task."
+                            ),
+                            "sender": "system",
+                            "room_id": session.room_id,
+                        },
+                    )
+                    await self.ipc.send_to(session.id, nudge)
+                    log.info("Sent restart-resume nudge to %s", session.id)
 
             # Flush any messages queued during session restore
             pending = self._pending_messages.pop(session.id, [])
