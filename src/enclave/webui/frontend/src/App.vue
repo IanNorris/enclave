@@ -170,7 +170,7 @@ import SpecProgressBar from './components/SpecProgressBar.vue'
 const route = useRoute()
 const router = useRouter()
 const sidebarOpen = ref(false)
-const { sessions, selectedSessionId, loadSessions } = useSessionStore()
+const { sessions, selectedSessionId, loadSessions, touchSessionActive } = useSessionStore()
 
 // Sort helper: concierge pinned to the top, then most-recently-active first.
 function byRecency(list) {
@@ -337,6 +337,17 @@ async function seedActivity() {
   } catch { /* ignore */ }
 }
 
+// Debounced full session-list reload, used when an activity event names a
+// session we don't yet know about (ENC-009). Coalesces bursts of events.
+let sessionRefreshTimer = null
+function scheduleSessionRefresh() {
+  if (sessionRefreshTimer) return
+  sessionRefreshTimer = setTimeout(() => {
+    sessionRefreshTimer = null
+    loadSessions()
+  }, 500)
+}
+
 function connectNotifWs() {
   if (!hasToken.value) return
   const token = localStorage.getItem('enclave_token')
@@ -350,6 +361,11 @@ function connectNotifWs() {
       if (msg && msg.type === 'session_activity') {
         // Live per-session activity for the sidebar indicators.
         activityState.value = { ...activityState.value, [msg.session_id]: msg.state }
+        // Keep the sidebar list itself live: a session emitting activity is
+        // running and just became recent, so surface it out of the "More…"
+        // overflow immediately (ENC-009). If it isn't in our list yet (e.g. a
+        // freshly-created session), pull a fresh list.
+        if (!touchSessionActive(msg.session_id)) scheduleSessionRefresh()
         return
       }
       if (msg && msg.type === 'major_reply') {
@@ -459,6 +475,7 @@ onUnmounted(() => {
   if (askPollTimer) clearInterval(askPollTimer)
   if (notifPollTimer) clearInterval(notifPollTimer)
   if (notifReconnect) clearTimeout(notifReconnect)
+  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   if (notifWs) { try { notifWs.close() } catch { /* ignore */ } }
 })
 watch(isLoginPage, (isLogin) => {

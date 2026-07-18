@@ -44,6 +44,20 @@ function selectSession(id) {
   selectedSessionId.value = id
 }
 
+// Live-patch a session as active in response to a streamed activity event, so
+// the sidebar's recency sort and "More…" overflow re-partition immediately
+// without waiting for a manual page refresh (ENC-009). Returns false if the
+// session isn't in the list yet, so the caller can trigger a full reload.
+function touchSessionActive(id) {
+  const s = sessions.value.find(s => s.id === id)
+  if (!s) return false
+  s.status = 'running'
+  s.last_active = Date.now() / 1000
+  // Reassign so array-level computeds (sort/slice) re-run reactively.
+  sessions.value = [...sessions.value]
+  return true
+}
+
 export function useSessionStore() {
   return {
     sessions,
@@ -52,5 +66,6 @@ export function useSessionStore() {
     loading,
     loadSessions,
     selectSession,
+    touchSessionActive,
   }
 }
