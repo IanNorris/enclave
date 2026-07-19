@@ -74,3 +74,27 @@ def test_unknown_session_does_not_raise(tmp_path):
     srv = _server(tmp_path, "known")
     # Session not found → no workspace, no write, no crash.
     srv.notify_response("ghost", "lost?")
+
+
+def test_file_send_persists_size_for_download(tmp_path):
+    """A non-image file_send persists its size so the web UI can show it and
+    offer a download (ENC-010)."""
+    import json
+
+    sid = "sess-file"
+    srv = _server(tmp_path, sid)
+
+    srv.notify_file_send(
+        sid,
+        filename="enclave-debug.apk",
+        mimetype="application/vnd.android.package-archive",
+        file_path="/ws/enclave-debug.apk",
+        size=4_900_123,
+    )
+
+    rows = _rows(tmp_path, sid)
+    assert [r[0] for r in rows] == ["file_send"]
+    data = json.loads(rows[0][1])
+    assert data["size"] == 4_900_123
+    assert data["filename"] == "enclave-debug.apk"
+    assert data["file_path"] == "/ws/enclave-debug.apk"

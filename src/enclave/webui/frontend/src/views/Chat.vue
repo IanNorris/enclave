@@ -68,6 +68,13 @@
                     <img v-if="evt.data?.file_path" :src="workspaceFileUrl(evt.data.file_path)" class="file-send-img clickable-img" @click="openLightbox(workspaceFileUrl(evt.data.file_path))" />
                     <img v-else-if="evt.data?.mxc_url" :src="mediaUrl(evt.data.mxc_url)" class="file-send-img clickable-img" @click="openLightbox(mediaUrl(evt.data.mxc_url))" />
                   </div>
+                  <a v-else-if="fileSendUrl(evt.data)" class="file-download-card" :href="fileSendUrl(evt.data)" :download="evt.data?.filename || 'file'">
+                    <span class="file-download-icon">{{ fileIcon(evt.data?.filename, evt.data?.mimetype) }}</span>
+                    <span class="file-download-meta">
+                      <span class="file-download-name">{{ evt.data?.filename || 'file' }}</span>
+                      <span class="file-download-sub">{{ evt.data?.size ? formatSize(evt.data.size) : '' }}<span class="file-download-action">⬇ Download</span></span>
+                    </span>
+                  </a>
                 </div>
               </template>
             </template>
@@ -292,6 +299,13 @@
                 <img v-if="evt.filePath" :src="workspaceFileUrl(evt.filePath)" class="file-send-img clickable-img" @click="openLightbox(workspaceFileUrl(evt.filePath))" />
                 <img v-else-if="evt.mxcUrl" :src="mediaUrl(evt.mxcUrl)" class="file-send-img clickable-img" @click="openLightbox(mediaUrl(evt.mxcUrl))" />
               </div>
+              <a v-else-if="fileSendUrl({ file_path: evt.filePath, mxc_url: evt.mxcUrl })" class="file-download-card" :href="fileSendUrl({ file_path: evt.filePath, mxc_url: evt.mxcUrl })" :download="evt.filename || 'file'">
+                <span class="file-download-icon">{{ fileIcon(evt.filename, evt.mimetype) }}</span>
+                <span class="file-download-meta">
+                  <span class="file-download-name">{{ evt.filename || 'file' }}</span>
+                  <span class="file-download-sub">{{ evt.size ? formatSize(evt.size) : '' }}<span class="file-download-action">⬇ Download</span></span>
+                </span>
+              </a>
             </div>
 
             <!-- Fusion run: model combo + tappable trace -->
@@ -1394,6 +1408,7 @@ function handleStreamEvent(msg) {
       filePath: msg.file_path || '',
       mxcUrl,
       mimetype: msg.mimetype || '',
+      size: msg.size || 0,
       collapsed: false,
     }))
     nextTick(() => scrollToBottom())
@@ -1916,6 +1931,28 @@ function mediaUrl(mxcUrl) {
   if (parts.length < 2) return ''
   const token = localStorage.getItem('enclave_token') || ''
   return `/api/chat/media/${parts[0]}/${parts[1]}?token=${encodeURIComponent(token)}`
+}
+
+// Build a download URL for an agent-sent file (non-image). Prefers the
+// workspace file proxy (Matrix-independent); falls back to Matrix media.
+function fileSendUrl(data) {
+  if (!data) return ''
+  if (data.file_path) return workspaceFileUrl(data.file_path)
+  if (data.mxc_url) return mediaUrl(data.mxc_url)
+  return ''
+}
+
+// Pick a coarse emoji icon for a non-image file from its name/mimetype.
+function fileIcon(filename, mimetype) {
+  const name = (filename || '').toLowerCase()
+  const mt = mimetype || ''
+  if (mt.startsWith('video/')) return '🎬'
+  if (mt.startsWith('audio/')) return '🎵'
+  if (mt.startsWith('text/') || /\.(txt|log|md|csv|json|ya?ml|xml)$/.test(name)) return '📄'
+  if (/\.(zip|tar|gz|tgz|bz2|xz|7z|rar)$/.test(name)) return '🗜️'
+  if (name.endsWith('.pdf')) return '📕'
+  if (/\.(apk|deb|rpm|exe|dmg|appimage)$/.test(name)) return '📦'
+  return '📎'
 }
 
 // Gallery / lightbox
@@ -3025,6 +3062,50 @@ function turnComplexity(turn) {
   max-height: 300px;
   border-radius: var(--radius-sm);
   cursor: zoom-in;
+}
+
+.file-download-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  max-width: 420px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-active);
+  text-decoration: none;
+  color: inherit;
+  transition: background 0.15s, border-color 0.15s;
+}
+.file-download-card:hover {
+  background: var(--bg-hover, var(--bg-active));
+  border-color: var(--accent, var(--border));
+}
+.file-download-icon {
+  font-size: 1.4rem;
+  line-height: 1;
+}
+.file-download-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.file-download-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-download-sub {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+.file-download-action {
+  color: var(--accent, var(--text-muted));
 }
 
 .user-images {

@@ -2223,9 +2223,13 @@ class MessageRouter:
             import mimetypes
             mimetype = mimetypes.guess_type(file_path)[0] or ""
             filename = os.path.basename(file_path)
+            try:
+                size = os.path.getsize(host_path)
+            except OSError:
+                size = 0
             self._control.notify_file_send(
                 session.id, filename=filename, mimetype=mimetype,
-                event_id=event_id, file_path=file_path,
+                event_id=event_id, file_path=file_path, size=size,
             )
 
         return Message(
