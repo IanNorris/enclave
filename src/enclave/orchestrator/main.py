@@ -17,7 +17,9 @@ import yaml
 from enclave.common.config import load_config
 from enclave.common.logging import get_logger, setup_logging
 from enclave.orchestrator.ipc import IPCServer
-from enclave.orchestrator.matrix_client import EnclaveMatrixClient
+# NOTE: EnclaveMatrixClient is imported lazily inside run() so that matrix-nio
+# is only imported when Matrix is enabled — this is what makes Matrix genuinely
+# optional at import time (web-UI-only deploys need not install nio).
 from enclave.orchestrator.router import MessageRouter
 from enclave.orchestrator.session_manager import SessionManager
 
@@ -75,54 +77,81 @@ async def run() -> None:
 
     log.info("Starting Enclave orchestrator")
 
-    # Matrix client
-    matrix = EnclaveMatrixClient(
-        homeserver=config.matrix.homeserver,
-        user_id=config.matrix.user_id,
-        password=config.matrix.password,
-        store_path=config.matrix.store_path,
-        device_name=config.matrix.device_name,
-    )
+    matrix_enabled = config.matrix.enabled
+    control_room_id = ""
 
-    if not await matrix.login():
-        log.error("Matrix login failed — exiting")
-        sys.exit(1)
-
-    await matrix.initial_sync()
-
-    # Resolve or create the control room
-    control_room_id = config.matrix.control_room_id
-    if not control_room_id or control_room_id not in matrix.client.rooms:
-        # Check if we're already in a room with the configured name
-        for rid, room in matrix.client.rooms.items():
-            if room.name == config.matrix.control_room_name:
-                control_room_id = rid
-                log.info("Found existing control room '%s': %s",
-                         config.matrix.control_room_name, rid)
-                break
-        else:
-            # Create the control room and invite configured users
-            invite_users = [u.matrix_id for u in config.users] if config.users else []
-            control_room_id = await matrix.create_room(
-                name=config.matrix.control_room_name,
-                topic="Enclave orchestrator control room",
-                invite=invite_users,
-                space_id=config.matrix.space_id or None,
+    if matrix_enabled:
+        # Enabled but no credentials → the operator explicitly asked for Matrix
+        # yet we can't log in. Fail loud rather than silently degrade.
+        if not config.matrix.has_credentials():
+            log.error(
+                "Matrix is enabled but credentials are incomplete "
+                "(need homeserver + user_id + password). "
+                "Set them, or disable Matrix (matrix.enabled: false / "
+                "ENCLAVE_MATRIX_ENABLED=false) to run web-UI-only."
             )
-            if not control_room_id:
-                log.error("Failed to create control room — exiting")
-                sys.exit(1)
-            log.info("Created control room '%s': %s",
-                     config.matrix.control_room_name, control_room_id)
+            sys.exit(1)
 
-            # Invite users (create_room passes invite=[] currently, so do it explicitly)
-            for user_id in invite_users:
-                await matrix.invite_user(control_room_id, user_id)
+        # Import nio-backed client lazily — only when Matrix is actually used.
+        from enclave.orchestrator.matrix_client import EnclaveMatrixClient
 
-        # Persist the room ID so we reuse it next startup
-        if control_room_id != config.matrix.control_room_id:
-            config.matrix.control_room_id = control_room_id
-            _persist_control_room_id(config_path, control_room_id)
+        matrix = EnclaveMatrixClient(
+            homeserver=config.matrix.homeserver,
+            user_id=config.matrix.user_id,
+            password=config.matrix.password,
+            store_path=config.matrix.store_path,
+            device_name=config.matrix.device_name,
+        )
+
+        if not await matrix.login():
+            log.error("Matrix login failed — exiting")
+            sys.exit(1)
+
+        await matrix.initial_sync()
+
+        # Resolve or create the control room
+        control_room_id = config.matrix.control_room_id
+        if not control_room_id or control_room_id not in matrix.client.rooms:
+            # Check if we're already in a room with the configured name
+            for rid, room in matrix.client.rooms.items():
+                if room.name == config.matrix.control_room_name:
+                    control_room_id = rid
+                    log.info("Found existing control room '%s': %s",
+                             config.matrix.control_room_name, rid)
+                    break
+            else:
+                # Create the control room and invite configured users
+                invite_users = [u.matrix_id for u in config.users] if config.users else []
+                control_room_id = await matrix.create_room(
+                    name=config.matrix.control_room_name,
+                    topic="Enclave orchestrator control room",
+                    invite=invite_users,
+                    space_id=config.matrix.space_id or None,
+                )
+                if not control_room_id:
+                    log.error("Failed to create control room — exiting")
+                    sys.exit(1)
+                log.info("Created control room '%s': %s",
+                         config.matrix.control_room_name, control_room_id)
+
+                # Invite users (create_room passes invite=[] currently, so do it explicitly)
+                for user_id in invite_users:
+                    await matrix.invite_user(control_room_id, user_id)
+
+            # Persist the room ID so we reuse it next startup
+            if control_room_id != config.matrix.control_room_id:
+                config.matrix.control_room_id = control_room_id
+                _persist_control_room_id(config_path, control_room_id)
+    else:
+        # Web-UI-only mode: no login, no control room, no sync loop. self.matrix
+        # is a no-op NullMatrixClient so the ~81 call sites stay unchanged.
+        from enclave.orchestrator.null_matrix_client import NullMatrixClient
+
+        log.warning(
+            "Matrix is DISABLED — running web-UI-only. "
+            "No Matrix login, control room, or sync loop."
+        )
+        matrix = NullMatrixClient()
 
     # IPC server
     ipc = IPCServer(socket_dir=config.container.socket_dir)
@@ -173,8 +202,10 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_signal)
 
-    # Start Matrix sync in background with watchdog
-    sync_task = asyncio.create_task(matrix.sync_forever())
+    # Start Matrix sync in background with watchdog — only when Matrix is on.
+    # With Matrix off we never create the task at all (tracked as Task | None),
+    # so "Matrix disabled = no Matrix background work" is literally true.
+    sync_task: asyncio.Task[None] | None = None
     watchdog_task = asyncio.create_task(_watchdog_loop())
 
     def _on_sync_done(task: asyncio.Task[None]) -> None:
@@ -190,18 +221,21 @@ async def run() -> None:
         sync_task = asyncio.create_task(matrix.sync_forever())
         sync_task.add_done_callback(_on_sync_done)
 
-    sync_task.add_done_callback(_on_sync_done)
+    if matrix_enabled:
+        sync_task = asyncio.create_task(matrix.sync_forever())
+        sync_task.add_done_callback(_on_sync_done)
 
     # Wait for shutdown
     await stop_event.wait()
 
     # Cleanup
     log.info("Shutting down...")
-    sync_task.cancel()
-    try:
-        await sync_task
-    except asyncio.CancelledError:
-        pass
+    if sync_task is not None:
+        sync_task.cancel()
+        try:
+            await sync_task
+        except asyncio.CancelledError:
+            pass
 
     await router.stop()
     await ipc.close_all()

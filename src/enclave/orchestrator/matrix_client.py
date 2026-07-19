@@ -68,6 +68,11 @@ class EnclaveMatrixClient:
     Persists device keys across restarts.
     """
 
+    #: Distinguishes the live client from NullMatrixClient at call sites that
+    #: genuinely need to know whether Matrix is active (startup announce,
+    #: status display). The ~81 ordinary call sites never check this.
+    enabled: bool = True
+
     def __init__(
         self,
         homeserver: str,

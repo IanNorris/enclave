@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from enclave.common.audit import AuditLog
-from enclave.common.config import UserMapping
+from enclave.common.config import UserMapping, make_synthetic_room_id
 from enclave.common.cost_tracker import CostTracker
 from enclave.common.logging import get_logger
 from enclave.common import panel as panel_mod
@@ -317,7 +317,10 @@ class MessageRouter:
 
         # Send startup announcement — also establishes Megolm session
         # The bot may not have joined the control room yet (awaiting invite).
-        if self.control_room_id not in self.matrix.client.rooms:
+        # Skipped entirely when Matrix is disabled (no control room exists).
+        if not getattr(self.matrix, "enabled", True):
+            log.info("Matrix disabled — skipping control-room startup announcement")
+        elif self.control_room_id not in self.matrix.client.rooms:
             log.warning(
                 "Control room %s not joined — waiting for invite", self.control_room_id
             )
@@ -2218,24 +2221,27 @@ class MessageRouter:
             session.room_id, host_path, body=body
         )
 
-        # Notify WebUI so images show in the web interface
-        if event_id:
-            import mimetypes
-            mimetype = mimetypes.guess_type(file_path)[0] or ""
-            filename = os.path.basename(file_path)
-            try:
-                size = os.path.getsize(host_path)
-            except OSError:
-                size = 0
-            self._control.notify_file_send(
-                session.id, filename=filename, mimetype=mimetype,
-                event_id=event_id, file_path=file_path, size=size,
-            )
+        # Notify the web UI so the file shows in the web interface. This is
+        # independent of the Matrix upload: the web UI renders from file_path
+        # (served by the workspace file proxy), so it must fire even when
+        # Matrix is disabled and event_id is None — otherwise send_file would
+        # be invisible in web-UI-only mode.
+        import mimetypes
+        mimetype = mimetypes.guess_type(file_path)[0] or ""
+        filename = os.path.basename(file_path)
+        try:
+            size = os.path.getsize(host_path)
+        except OSError:
+            size = 0
+        self._control.notify_file_send(
+            session.id, filename=filename, mimetype=mimetype,
+            event_id=event_id or "", file_path=file_path, size=size,
+        )
 
         return Message(
             type=MessageType.AGENT_RESPONSE,
             payload={
-                "sent": event_id is not None,
+                "sent": True,
                 "event_id": event_id,
             },
             reply_to=msg.id,
@@ -3198,21 +3204,29 @@ class MessageRouter:
         resolved_profile = profile or self.containers.config.default_profile
         profile_obj = self.containers.config.get_profile(resolved_profile)
 
-        log.info("[project:%s] Creating room (profile=%s)...", project_name, resolved_profile)
-        room_id = await self.matrix.create_room(
-            name=f"🏰 {project_name}",
-            topic=f"Enclave project: {project_name} [{resolved_profile}]",
-            encrypted=True,
-            space_id=self.space_id,
-        )
-
-        if room_id is None:
-            await self._reply_control(
-                f"❌ Failed to create room for **{project_name}**."
+        if not getattr(self.matrix, "enabled", True):
+            # Web-UI-only: mint a synthetic non-Matrix room id instead of
+            # creating a real room. The web UI drives the session via the
+            # control socket; no Matrix room is needed.
+            room_id = make_synthetic_room_id()
+            log.info("[project:%s] Matrix disabled — synthetic room: %s",
+                     project_name, room_id)
+        else:
+            log.info("[project:%s] Creating room (profile=%s)...", project_name, resolved_profile)
+            room_id = await self.matrix.create_room(
+                name=f"🏰 {project_name}",
+                topic=f"Enclave project: {project_name} [{resolved_profile}]",
+                encrypted=True,
+                space_id=self.space_id,
             )
-            return None
 
-        log.info("[project:%s] Room created: %s", project_name, room_id)
+            if room_id is None:
+                await self._reply_control(
+                    f"❌ Failed to create room for **{project_name}**."
+                )
+                return None
+
+            log.info("[project:%s] Room created: %s", project_name, room_id)
 
         log.info("[project:%s] Creating IPC socket...", project_name)
         socket_path = await self.ipc.create_socket(f"pending-{project_name}")
@@ -4031,7 +4045,7 @@ class MessageRouter:
             f"**🏰 Enclave Status**\n\n"
             f"  Sessions: {total} total, {len(active)} running\n"
             f"  IPC: {connected} agents connected\n"
-            f"  Matrix: {'connected' if self.matrix.client.logged_in else 'disconnected'}"
+            f"  Matrix: {'connected' if getattr(self.matrix, 'enabled', True) and self.matrix.client.logged_in else 'disabled'}"
         )
 
     async def _cmd_cleanup(self, cmd: ParsedCommand) -> None:

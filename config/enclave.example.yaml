@@ -2,6 +2,12 @@
 # Copy to enclave.yaml and fill in your values
 
 matrix:
+  # Set to false to run Enclave web-UI-only (no Matrix login, control room,
+  # or sync loop). When omitted, Matrix is enabled automatically only if
+  # credentials (homeserver + user_id + password) are present; a fresh deploy
+  # with no credentials starts web-UI-only instead of failing. Override at
+  # runtime with ENCLAVE_MATRIX_ENABLED=true|false.
+  enabled: false
   homeserver: "https://matrix.example.com"
   bot_user: "@enclave:example.com"
   bot_password: ""  # Or use access_token instead
