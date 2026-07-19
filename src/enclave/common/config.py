@@ -21,6 +21,29 @@ DEFAULT_CONFIG_PATHS = [
 ]
 
 
+# Prefix for synthetic (non-Matrix) room ids used when Matrix is disabled.
+# Deliberately NOT a Matrix "!room:server" look-alike, so if such an id ever
+# reaches the nio layer it fails loudly instead of silently misbehaving.
+SYNTHETIC_ROOM_PREFIX = "local:"
+
+
+def make_synthetic_room_id() -> str:
+    """Return a fresh synthetic room id for a web-UI-only (Matrix-off) session."""
+    import uuid
+    return f"{SYNTHETIC_ROOM_PREFIX}{uuid.uuid4()}"
+
+
+def is_synthetic_room(room_id: str | None) -> bool:
+    """True if *room_id* is a synthetic (non-Matrix) id, never a real room."""
+    return bool(room_id) and room_id.startswith(SYNTHETIC_ROOM_PREFIX)
+
+
+# Sentinel marking MatrixConfig.enabled as "not explicitly set", so it can be
+# derived from credential presence in __post_init__. A real bool (from yaml or
+# the ENCLAVE_MATRIX_ENABLED env override) always overrides the derivation.
+_MATRIX_ENABLED_UNSET: Any = object()
+
+
 @dataclass
 class MatrixConfig:
     """Matrix connection settings."""
@@ -33,6 +56,20 @@ class MatrixConfig:
     control_room_id: str = ""
     control_room_name: str = "Enclave Control"
     space_id: str = ""
+    # Whether Matrix is used at all. When False, Enclave runs web-UI-only:
+    # no login, no control room, no sync loop, and self.matrix is a no-op
+    # NullMatrixClient. Left as the _UNSET sentinel it is derived in
+    # __post_init__ from whether credentials are present (creds → True,
+    # no creds → False); an explicit bool (yaml/env) always wins.
+    enabled: "bool | object" = _MATRIX_ENABLED_UNSET
+
+    def __post_init__(self) -> None:
+        if self.enabled is _MATRIX_ENABLED_UNSET:
+            self.enabled = self.has_credentials()
+
+    def has_credentials(self) -> bool:
+        """True if the minimum Matrix login credentials are all present."""
+        return bool(self.homeserver and self.user_id and self.password)
 
 
 @dataclass
@@ -305,6 +342,12 @@ def _apply_env_overrides(config: EnclaveConfig) -> None:
     if host_gate is not None:
         config.host_approval.gate = _coerce_bool(host_gate)
 
+    # Matrix on/off override — parsed as a real boolean (avoids the
+    # bool("false") is True trap). Wins over yaml and credential derivation.
+    matrix_enabled = os.environ.get("ENCLAVE_MATRIX_ENABLED")
+    if matrix_enabled is not None:
+        config.matrix.enabled = _coerce_bool(matrix_enabled)
+
 
 def _parse_user_mapping(data: dict[str, Any]) -> UserMapping:
     """Parse a single user mapping from config dict."""
@@ -356,6 +399,9 @@ def load_config(path: Path | str | None = None) -> EnclaveConfig:
                 control_room_id=m.get("control_room_id", ""),
                 control_room_name=m.get("control_room_name", "Enclave Control"),
                 space_id=m.get("space_id", ""),
+                # Resolve enabled: explicit yaml value wins; otherwise derive
+                # from whether credentials are present (see _resolve_matrix_enabled).
+                enabled=m.get("enabled", _MATRIX_ENABLED_UNSET),
             )
 
         if "container" in data:

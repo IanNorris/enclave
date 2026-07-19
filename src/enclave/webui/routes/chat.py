@@ -616,12 +616,26 @@ async def send_message(request: Request, session_id: str, body: SendMessage):
     if sent:
         return {"sent": True, "via": "control_socket"}
 
-    # Fallback: direct Matrix send (won't wake agent if it's idle/stopped)
+    # Fallback: direct Matrix send (won't wake agent if it's idle/stopped).
+    # With Matrix disabled the room id is synthetic and there is no Matrix
+    # channel, so fail loudly rather than silently dropping the operator's
+    # message onto a no-op client.
+    from enclave.common.config import is_synthetic_room
+
+    config = _matrix_config(request)
     room_id = _get_room_id(request, session_id)
+    if not getattr(config, "enabled", True) or is_synthetic_room(room_id):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Agent is not reachable (control socket down) and Matrix is "
+                "disabled, so there is no fallback delivery channel. The "
+                "session may be stopped — try again once it is running."
+            ),
+        )
     if not room_id:
         raise HTTPException(status_code=404, detail="Session room not found")
 
-    config = _matrix_config(request)
     event_id = await _send_matrix_message(config, room_id, body.content)
     return {"sent": True, "event_id": event_id, "via": "matrix"}
 
