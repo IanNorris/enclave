@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import html as _html_mod
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -3712,11 +3713,24 @@ class MessageRouter:
             ))
             return
 
-        # Translate container paths to host paths
+        # Translate the container mount point (/workspace) to the host path.
+        # Anchored to a path-token boundary so it only rewrites the mount
+        # prefix — NOT the substring "/workspace" inside the host base
+        # "/data/.../workspaces/..." (ENC-011). Host-absolute paths the agent
+        # may pass (already under workspace_path) contain "/workspaces" and are
+        # therefore left untouched, avoiding the doubled/mangled path.
         extra_env: dict[str, str] = {}
-        if "/workspace" in command and session.workspace_path:
-            command = command.replace("/workspace", session.workspace_path)
-            log.debug("Translated GUI command path: %s", command)
+        if session.workspace_path:
+            # Lambda replacement avoids re.sub interpreting backslashes / group
+            # refs in the host path.
+            new_command = re.sub(
+                r"/workspace(?![\w-])",
+                lambda _m: session.workspace_path,
+                command,
+            )
+            if new_command != command:
+                command = new_command
+                log.debug("Translated GUI command path: %s", command)
 
         # Require approval for GUI launches. Do this BEFORE touching the
         # agent-supplied binary (e.g. ldd in _resolve_missing_libs), since
@@ -3777,10 +3791,21 @@ class MessageRouter:
                 )
                 log.info("Added LD_LIBRARY_PATH for GUI: %s", extra_env["LD_LIBRARY_PATH"])
 
-        success = await self._display.launch_app(command, extra_env=extra_env)
+        # Launch with the session workspace as cwd, so relative script names /
+        # asset paths resolve (ENC-011). launch_app now reports early failures
+        # (missing script, bad args) instead of silently returning success.
+        result = await self._display.launch_app(
+            command, extra_env=extra_env, cwd=session.workspace_path or None,
+        )
+        payload: dict[str, Any] = {"ok": result.ok, "command": command}
+        if result.rc is not None:
+            payload["exit_code"] = result.rc
+        if result.error:
+            # On failure this is the reason; on success it's non-fatal stderr.
+            payload["error" if not result.ok else "stderr"] = result.error
         await self.ipc.send_to(session.id, Message(
             type=MessageType.GUI_LAUNCH_REQUEST,
-            payload={"ok": success, "command": command},
+            payload=payload,
             reply_to=msg.id,
         ))
 
