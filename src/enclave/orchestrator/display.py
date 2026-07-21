@@ -19,11 +19,28 @@ import asyncio
 import os
 import json
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from enclave.common.logging import get_logger
 
 log = get_logger("display")
+
+
+@dataclass
+class LaunchResult:
+    """Outcome of a GUI launch attempt.
+
+    ``ok`` is False when the launcher couldn't even start the process, or when
+    the process exited non-zero within the brief startup-watch window (e.g. a
+    missing script → bash exits 127). ``rc`` is the early exit code if the
+    process died during the watch window, else None (still running). ``error``
+    carries any captured stderr / failure reason to hand back to the agent.
+    """
+
+    ok: bool
+    rc: int | None = None
+    error: str = ""
 
 
 class DisplayManager:
@@ -174,7 +191,12 @@ class DisplayManager:
         except FileNotFoundError:
             return -1, "", f"{args[0]} not found"
 
-    async def launch_app(self, command: str, extra_env: dict[str, str] | None = None) -> bool:
+    async def launch_app(
+        self,
+        command: str,
+        extra_env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> LaunchResult:
         """Launch a GUI application on the desktop.
 
         Uses compositor-native launching when available, otherwise
@@ -183,28 +205,36 @@ class DisplayManager:
         Args:
             command: The command to run (e.g., "firefox", "code .")
             extra_env: Additional environment variables to set.
+            cwd: Working directory for the launched process (so relative
+                script names / asset paths resolve).
 
         Returns:
-            True if launched successfully.
+            A LaunchResult. ``ok`` is False if the process couldn't start or
+            exited non-zero within the brief startup-watch window; ``error``
+            carries the reason (e.g. captured stderr) to relay to the agent.
         """
         if not self._display_available:
             log.info("No desktop available, cannot launch GUI: %s", command)
-            return False
+            return LaunchResult(ok=False, error="No desktop session available")
 
-        # Compositor-native launch (better window management)
+        # Compositor-native launch (better window management). These dispatch
+        # to the compositor and return before the app's own exit is known, so
+        # we can only report the dispatch result, not the app's early failure.
         if self._compositor == "hyprland":
             rc, _, err = await self._run_cmd("hyprctl", "dispatch", "exec", command)
             if rc == 0:
                 log.info("Launched via hyprctl: %s", command)
-                return True
+                return LaunchResult(ok=True)
             log.warning("hyprctl launch failed: %s", err)
+            return LaunchResult(ok=False, rc=rc, error=err or "hyprctl exec failed")
 
         elif self._compositor == "sway":
             rc, _, err = await self._run_cmd("swaymsg", "exec", command)
             if rc == 0:
                 log.info("Launched via swaymsg: %s", command)
-                return True
+                return LaunchResult(ok=True)
             log.warning("swaymsg launch failed: %s", err)
+            return LaunchResult(ok=False, rc=rc, error=err or "swaymsg exec failed")
 
         # Generic fallback — spawn with display env
         env = dict(os.environ)
@@ -217,26 +247,52 @@ class DisplayManager:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd or None,
                 start_new_session=True,
             )
-            log.info("Launched GUI app (generic): %s (pid=%d)", command, proc.pid)
+            log.info("Launched GUI app (generic): %s (pid=%d, cwd=%s)",
+                     command, proc.pid, cwd or os.getcwd())
 
-            # Monitor stderr briefly for early failures
-            async def _watch_stderr() -> None:
-                try:
-                    data = await asyncio.wait_for(proc.stderr.read(4096), timeout=5.0)
-                    if data:
-                        log.warning("GUI app stderr: %s", data.decode(errors="replace").strip())
-                except asyncio.TimeoutError:
-                    pass  # Still running, no early error
-                except Exception:
-                    pass
-            asyncio.create_task(_watch_stderr())
+            # Watch briefly for an early exit so genuine failures (missing
+            # script, bad args → bash exits 127) are reported to the agent
+            # rather than silently succeeding. An app still running after the
+            # window is treated as a successful launch.
+            try:
+                rc = await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                rc = None  # still running after the window → launched OK
 
-            return True
+            # Read whatever stderr was produced (available immediately once the
+            # process has exited; best-effort while still running).
+            err_text = ""
+            try:
+                data = await asyncio.wait_for(proc.stderr.read(4096), timeout=0.5)
+                err_text = data.decode(errors="replace").strip()
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+
+            if rc is not None and rc != 0:
+                log.warning(
+                    "GUI app exited early rc=%d: %s | stderr: %s",
+                    rc, command, err_text,
+                )
+                return LaunchResult(
+                    ok=False, rc=rc,
+                    error=err_text or f"process exited with code {rc}",
+                )
+
+            if err_text:
+                # Running (or exited 0) but wrote to stderr — pass it through
+                # as non-fatal context for the agent.
+                log.warning("GUI app stderr: %s", err_text)
+                return LaunchResult(ok=True, error=err_text)
+
+            return LaunchResult(ok=True)
         except Exception as e:
             log.error("Failed to launch GUI app: %s", e)
-            return False
+            return LaunchResult(ok=False, error=str(e))
 
     async def get_active_window(self) -> dict | None:
         """Get info about the currently active window.

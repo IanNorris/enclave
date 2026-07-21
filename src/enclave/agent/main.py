@@ -2454,13 +2454,21 @@ async def try_init_copilot(
                     timeout=360.0,
                 )
                 rp = response.payload
-                if rp.get("error"):
+                if not rp.get("ok", False) or rp.get("error"):
+                    detail = rp.get("error") or "launch failed"
+                    if rp.get("exit_code") is not None:
+                        detail = f"{detail} (exit code {rp['exit_code']})"
                     return ToolResult(
-                        text_result_for_llm=f"GUI launch failed: {rp['error']}",
+                        text_result_for_llm=f"GUI launch failed: {detail}",
                         result_type="error",
                     )
+                # Launched OK; pass through any non-fatal stderr as context.
+                stderr = rp.get("stderr")
+                msg_text = f"GUI app launched: {command}"
+                if stderr:
+                    msg_text += f"\n(stderr: {stderr})"
                 return ToolResult(
-                    text_result_for_llm=f"GUI app launched: {command}",
+                    text_result_for_llm=msg_text,
                 )
             except asyncio.TimeoutError:
                 return ToolResult(
