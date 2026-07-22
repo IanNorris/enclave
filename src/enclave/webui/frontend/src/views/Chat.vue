@@ -1823,10 +1823,14 @@ function renderMarkdown(text) {
   const authToken = encodeURIComponent(localStorage.getItem('enclave_token') || '')
   cleaned = cleaned.replace(/mxc:\/\/([^/\s]+)\/([^)\s]+)/g,
     (_, server, id) => `/api/chat/media/${server}/${id}?token=${authToken}`)
-  // Rewrite /workspace/ paths to proxy URLs so embedded images work
+  // Rewrite /workspace/ paths to authenticated proxy URLs so embedded images
+  // load. Scoped to markdown link/image TARGETS only — `](/workspace/…)` — so
+  // bare /workspace paths in prose or inline-code stay literal and the auth
+  // token is never injected into non-URL text (ENC-012). Matching the closing
+  // paren also stops the path from swallowing a trailing backtick.
   if (selectedSession.value) {
-    cleaned = cleaned.replace(/\/workspace\/([^)\s"']+)/g, (_, p) =>
-      `/api/chat/${selectedSession.value}/file/${p.split('/').map(encodeURIComponent).join('/')}?token=${authToken}`)
+    cleaned = cleaned.replace(/\]\(\/workspace\/([^)\s"']+)\)/g, (_, p) =>
+      `](/api/chat/${selectedSession.value}/file/${p.split('/').map(encodeURIComponent).join('/')}?token=${authToken})`)
   }
   const display = cleaned.length > 10000 ? cleaned.slice(0, 10000) + '\n\n…(truncated)' : cleaned
   return md.render(display)
