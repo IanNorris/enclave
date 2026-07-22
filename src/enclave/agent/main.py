@@ -1333,6 +1333,12 @@ def _copilot_cli_bin() -> str:
         return "copilot"
 
 
+# Minimum idle gap (seconds) for _run_oneshot_warm's activity-based timeout —
+# floors the per-call `timeout` so a normal streaming pause is never mistaken
+# for a stall. Module-level so tests can lower it for fast timing checks.
+_ONESHOT_MIN_IDLE_GAP = 15.0
+
+
 async def _run_oneshot_warm(
     client: object, model: str, prompt: str, *, timeout: float = 180.0,
     reasoning_effort: str = "",
@@ -1347,11 +1353,21 @@ async def _run_oneshot_warm(
     ``copilot -p`` from inside a live tool handler. Never raises; returns a
     bracketed marker on failure so callers can degrade gracefully.
 
+    Timeout is ACTIVITY-BASED, not absolute: *timeout* is the maximum idle gap
+    — the call only gives up after that many seconds with NO streamed activity
+    (reasoning/message deltas, tool events, etc.). As long as the model keeps
+    producing tokens the wait extends, so a long-but-live reasoning pass is
+    never killed mid-stream. An absolute ceiling (``hard_cap``) still bounds a
+    pathological continuous-stream case.
+
     When *reasoning_effort* is set, it's clamped to the model's supported levels
     and applied via set_model after creation; rejection falls back to the
     model's default effort rather than failing the call.
     """
-    from copilot.generated.session_events import AssistantMessageData
+    from copilot.generated.session_events import (
+        AssistantMessageData,
+        SessionEventType,
+    )
 
     async def _deny(_req: object) -> object:
         return None  # tools disabled — no permission request should arrive
@@ -1377,12 +1393,50 @@ async def _run_oneshot_warm(
                     f"'{effort}' ({e}); using default",
                     file=sys.stderr,
                 )
-        resp = await session.send_and_wait(prompt, timeout=timeout)
-        if resp is not None and isinstance(resp.data, AssistantMessageData):
-            return (resp.data.content or "").strip()
-        return "[No response]"
-    except asyncio.TimeoutError:
-        return f"[Timed out after {int(timeout)}s]"
+
+        # Activity-based wait. Events arrive on the SDK's background thread, so
+        # the handler must be thread-safe: bump a monotonic timestamp (atomic
+        # under the GIL) and signal completion via call_soon_threadsafe.
+        loop = asyncio.get_running_loop()
+        idle_gap = max(float(timeout), _ONESHOT_MIN_IDLE_GAP)
+        hard_cap = max(idle_gap * 6.0, 1200.0)  # absolute ceiling (safety)
+        state: dict[str, object] = {"content": None, "last": time.monotonic()}
+        done = asyncio.Event()
+
+        def _on_event(event: object) -> None:
+            state["last"] = time.monotonic()  # any event = activity
+            etype = getattr(event, "type", None)
+            data = getattr(event, "data", None)
+            if etype == SessionEventType.ASSISTANT_MESSAGE and isinstance(
+                data, AssistantMessageData
+            ):
+                state["content"] = (data.content or "").strip()
+            if etype in (SessionEventType.SESSION_IDLE, SessionEventType.SESSION_ERROR):
+                loop.call_soon_threadsafe(done.set)
+
+        unsub = session.on(_on_event)
+        try:
+            await session.send(prompt)
+            start = time.monotonic()
+            while not done.is_set():
+                now = time.monotonic()
+                if now - start >= hard_cap:
+                    return f"[Timed out after {int(now - start)}s (hard cap)]"
+                idle_remaining = idle_gap - (now - float(state["last"]))
+                if idle_remaining <= 0:
+                    return f"[Timed out after {int(idle_gap)}s of inactivity]"
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=min(idle_remaining, 5.0))
+                except asyncio.TimeoutError:
+                    continue  # re-check activity; deltas keep bumping state["last"]
+        finally:
+            try:
+                unsub()
+            except Exception:
+                pass
+
+        content = state.get("content")
+        return content if content else "[No response]"
     except Exception as e:
         print(f"[agent] _run_oneshot_warm Exception: {type(e).__name__}: {e}", file=sys.stderr)
         return f"[Error: {e}]"
@@ -1538,16 +1592,49 @@ async def _configure_model(
 ) -> None:
     """Switch to the best available preferred model with reasoning enabled.
 
-    Tries each model in _MODEL_PREFERENCES in order and uses the first one
+    Tries each model in the preference list in order and uses the first one
     that's actually available for this session. Needed because set_model()
     silently falls back to a default model if the requested one is unavailable
     (e.g. claude-opus-4.7 not rolled out yet) — logging success but actually
     using a weaker model.
+
+    Auto Fusion: when this session runs in Auto Fusion mode, the fusion
+    config's ``base_model`` is the intended model for routine (non-fusion)
+    turns — the cheap baseline, with the fusion panel handling hard turns.
+    It is honored here as the top preference (ENC-013); previously it was
+    ignored and routine turns ran on _MODEL_PREFERENCES[0].
     """
     global _AVAILABLE_MODEL_IDS
-    # Try to discover available models via the client.
-    target = _MODEL_PREFERENCES[0]
     global _MODEL_REASONING_EFFORTS
+
+    # Build the effective preference list. In Auto Fusion, prepend the fusion
+    # config's base_model (still falling back to _MODEL_PREFERENCES if it's
+    # empty or unavailable). base_reasoning_effort, if set, overrides the
+    # default effort for the base model.
+    prefs: tuple[str, ...] = _MODEL_PREFERENCES
+    base_effort = ""
+    if os.environ.get("ENCLAVE_AUTO_FUSION", "").strip() in ("1", "true", "yes"):
+        try:
+            _fdoc = _fusion_mod.load_workspace_fusion(_workspace_root())
+            _bm = str(_fdoc.get("base_model") or "").strip()
+            base_effort = str(_fdoc.get("base_reasoning_effort") or "").strip()
+            if _bm:
+                prefs = (_bm,) + tuple(m for m in _MODEL_PREFERENCES if m != _bm)
+                print(
+                    f"[agent] Auto Fusion base model: {_bm} "
+                    f"(effort={base_effort or _REASONING_EFFORT})",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(
+                f"[agent] Auto Fusion base_model load failed (non-fatal): {e}",
+                file=sys.stderr,
+            )
+
+    effort = base_effort or _REASONING_EFFORT
+
+    # Try to discover available models via the client.
+    target = prefs[0]
     try:
         if client is not None:
             try:
@@ -1580,20 +1667,20 @@ async def _configure_model(
                     for m in raw.get("models", []) if m.get("id")
                 }
             chosen = next(
-                (m for m in _MODEL_PREFERENCES if m in _AVAILABLE_MODEL_IDS),
+                (m for m in prefs if m in _AVAILABLE_MODEL_IDS),
                 None,
             )
             if chosen is None:
                 print(
-                    f"[agent] WARNING: none of {_MODEL_PREFERENCES} are available. "
+                    f"[agent] WARNING: none of {prefs} are available. "
                     f"Available: {sorted(_AVAILABLE_MODEL_IDS)}",
                     file=sys.stderr,
                 )
                 return
             target = chosen
-            if target != _MODEL_PREFERENCES[0]:
+            if target != prefs[0]:
                 print(
-                    f"[agent] Preferred model {_MODEL_PREFERENCES[0]} unavailable; "
+                    f"[agent] Preferred model {prefs[0]} unavailable; "
                     f"falling back to {target}",
                     file=sys.stderr,
                 )
@@ -1605,9 +1692,9 @@ async def _configure_model(
             await session.set_model(target)
             print(f"[agent] Model set to {target} (no reasoning effort)", file=sys.stderr)
         else:
-            await session.set_model(target, reasoning_effort=_REASONING_EFFORT)
+            await session.set_model(target, reasoning_effort=effort)
             print(
-                f"[agent] Model set to {target} (reasoning={_REASONING_EFFORT})",
+                f"[agent] Model set to {target} (reasoning={effort})",
                 file=sys.stderr,
             )
     except Exception as e:
@@ -1631,7 +1718,7 @@ async def _configure_model(
         models_info = {
             "current": target,
             "available": sorted(_AVAILABLE_MODEL_IDS) if _AVAILABLE_MODEL_IDS else [target],
-            "preferences": list(_MODEL_PREFERENCES),
+            "preferences": list(prefs),
         }
         models_path = _workspace_root() / ".enclave-models.json"
         models_path.write_text(_json.dumps(models_info, indent=2))
