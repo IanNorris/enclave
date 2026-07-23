@@ -184,6 +184,30 @@ async def test_auto_fusion_base_model_used(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_fusion_base_model_via_mode_file(tmp_path, monkeypatch):
+    """Auto-fusion enabled via the per-session mode file (the model-picker
+    path — how Brook actually has it) must also apply base_model, even when
+    the ENCLAVE_AUTO_FUSION env flag is unset (dev profile). Regression for the
+    ENC-013 follow-up where the fix gated only on the env var."""
+    import json
+    from enclave.common import fusion as _fusion
+    (tmp_path / ".enclave-fusion.json").write_text(json.dumps({
+        "version": 1,
+        "presets": [{"id": "frontier", "participants": [["claude-opus-4.8"]], "enabled": True}],
+        "base_model": "gpt-5.6-terra", "base_reasoning_effort": "", "auto_threshold": 4,
+    }))
+    _fusion.write_fusion_mode(tmp_path, _fusion.AUTO_FUSION_MODEL_ID)
+    monkeypatch.setenv("ENCLAVE_WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("ENCLAVE_AUTO_FUSION", raising=False)  # env flag OFF
+
+    session = _FakeConfigSession()
+    client = _FakeConfigClient(["claude-opus-4.8", "gpt-5.6-terra"])
+    await agent_main._configure_model(session, client)
+
+    assert session.set_model_calls[0][0] == "gpt-5.6-terra"
+
+
+@pytest.mark.asyncio
 async def test_no_auto_fusion_uses_default_preferences(tmp_path, monkeypatch):
     import json
     (tmp_path / ".enclave-fusion.json").write_text(json.dumps({
