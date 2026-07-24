@@ -749,6 +749,10 @@ const inputEl = ref(null)
 // ── Voice dictation (record → local Whisper → insert into composer) ──
 const isRecording = ref(false)
 const isTranscribing = ref(false)
+// True when the current draft contains dictated (speech-transcribed) text, so
+// we can prefix a [Dictated] tag on send — cueing the agent that there may be
+// transcription errors. Cleared when the draft is emptied (see watch below).
+const draftDictated = ref(false)
 let mediaRecorder = null
 let recordedChunks = []
 let recordStream = null
@@ -763,6 +767,9 @@ function loadDraft(id) {
 watch(draft, (v) => {
   const id = selectedSession.value
   nextTick(autoGrow)
+  // If the draft is emptied (sent, or manually cleared), the next content is
+  // fresh — drop the dictated flag so a later typed message isn't mistagged.
+  if (!v) draftDictated.value = false
   if (!id) return
   if (v) localStorage.setItem(draftKey(id), v)
   else localStorage.removeItem(draftKey(id))
@@ -1533,8 +1540,14 @@ function autoGrow() {
 
 async function send() {
   if ((!draft.value.trim() && !pendingFiles.value.length) || !selectedSession.value) return
-  const content = draft.value.trim()
+  // Prefix a [Dictated] tag when the draft came from voice, so the agent knows
+  // the text was speech-transcribed and may contain recognition errors.
+  const wasDictated = draftDictated.value && !!draft.value.trim()
+  const content = wasDictated
+    ? `[Dictated - transcription may contain errors] ${draft.value.trim()}`
+    : draft.value.trim()
   draft.value = ''
+  draftDictated.value = false
   sending.value = true
   nextTick(autoGrow)
 
@@ -1720,6 +1733,7 @@ async function onRecordingStop() {
     if (t) {
       // Insert at the cursor, or append with a space if the draft is non-empty.
       draft.value = draft.value ? `${draft.value.replace(/\s+$/, '')} ${t}` : t
+      draftDictated.value = true
       await nextTick()
       autoGrow()
       inputEl.value?.focus()

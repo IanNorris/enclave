@@ -30,7 +30,7 @@ from enclave.common.logging import get_logger
 log = get_logger("stt")
 
 # Configuration (env-overridable).
-_MODEL_NAME = os.environ.get("ENCLAVE_STT_MODEL", "base.en")
+_MODEL_NAME = os.environ.get("ENCLAVE_STT_MODEL", "small.en")
 _DEVICE = os.environ.get("ENCLAVE_STT_DEVICE", "cpu")
 _COMPUTE_TYPE = os.environ.get("ENCLAVE_STT_COMPUTE", "int8")
 

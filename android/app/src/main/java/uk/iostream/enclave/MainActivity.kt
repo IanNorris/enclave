@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -24,6 +25,9 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooserCode = 1001
+    private val micPermissionCode = 1003
+    // A WebView mic-permission request awaiting the OS RECORD_AUDIO grant.
+    private var pendingWebPermission: PermissionRequest? = null
     // Skip the first onResume (it fires right after onCreate's initial load).
     private var didInitialLoad = false
     // A session to select on the next page (re)load, e.g. from a notification tap.
@@ -119,6 +123,35 @@ class MainActivity : Activity() {
                     skipNextResumeReload = false
                     fileCallback = null
                     false
+                }
+            }
+
+            // getUserMedia() inside the WebView (voice dictation) asks the host
+            // app to grant the mic. Grant it only if we hold the OS RECORD_AUDIO
+            // permission; otherwise request that first and grant on the result.
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                request ?: return
+                val wantsMic = request.resources.any {
+                    it == PermissionRequest.RESOURCE_AUDIO_CAPTURE
+                }
+                if (!wantsMic) {
+                    runOnUiThread { request.deny() }
+                    return
+                }
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED) {
+                    runOnUiThread {
+                        request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                    }
+                } else {
+                    pendingWebPermission = request
+                    // The permission dialog fires onResume on return, which would
+                    // otherwise reload the WebView and abort the in-page recording
+                    // flow — suppress that one reload (as the file chooser does).
+                    skipNextResumeReload = true
+                    requestPermissions(
+                        arrayOf(Manifest.permission.RECORD_AUDIO), micPermissionCode,
+                    )
                 }
             }
         }
@@ -226,6 +259,25 @@ class MainActivity : Activity() {
             val result = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
             fileCallback?.onReceiveValue(result)
             fileCallback = null
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == micPermissionCode) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val req = pendingWebPermission
+            pendingWebPermission = null
+            runOnUiThread {
+                if (granted && req != null) {
+                    req.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                } else {
+                    req?.deny()
+                }
+            }
         }
     }
 
