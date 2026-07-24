@@ -1611,9 +1611,21 @@ async def _configure_model(
     # config's base_model (still falling back to _MODEL_PREFERENCES if it's
     # empty or unavailable). base_reasoning_effort, if set, overrides the
     # default effort for the base model.
+    #
+    # A session is in Auto Fusion via EITHER signal:
+    #   - the profile flag → ENCLAVE_AUTO_FUSION=1 env, or
+    #   - the per-session fusion mode file (.enclave-fusion-mode == "auto-fusion"),
+    #     set live via the model picker — this is how most sessions (e.g. Brook
+    #     on the dev profile, whose auto_fusion flag is False) actually enable it.
+    # Gating on only the env var missed the picker path entirely (ENC-013).
     prefs: tuple[str, ...] = _MODEL_PREFERENCES
     base_effort = ""
-    if os.environ.get("ENCLAVE_AUTO_FUSION", "").strip() in ("1", "true", "yes"):
+    _env_af = os.environ.get("ENCLAVE_AUTO_FUSION", "").strip() in ("1", "true", "yes")
+    try:
+        _mode_af = _fusion_mod.read_fusion_mode(_workspace_root()) == _fusion_mod.AUTO_FUSION_MODEL_ID
+    except Exception:
+        _mode_af = False
+    if _env_af or _mode_af:
         try:
             _fdoc = _fusion_mod.load_workspace_fusion(_workspace_root())
             _bm = str(_fdoc.get("base_model") or "").strip()
@@ -1622,7 +1634,8 @@ async def _configure_model(
                 prefs = (_bm,) + tuple(m for m in _MODEL_PREFERENCES if m != _bm)
                 print(
                     f"[agent] Auto Fusion base model: {_bm} "
-                    f"(effort={base_effort or _REASONING_EFFORT})",
+                    f"(effort={base_effort or _REASONING_EFFORT}, "
+                    f"via={'env' if _env_af else 'mode-file'})",
                     file=sys.stderr,
                 )
         except Exception as e:
