@@ -421,6 +421,13 @@
       <div class="input-bar">
         <button class="secondary attach-btn" @click="$refs.chatFile.click()" title="Attach files">📎</button>
         <input type="file" ref="chatFile" style="display:none" @change="attachFiles" multiple accept="image/*,application/pdf,text/*" />
+        <button
+          class="secondary mic-btn"
+          :class="{ recording: isRecording, transcribing: isTranscribing }"
+          @click="toggleRecording"
+          :disabled="isTranscribing"
+          :title="isRecording ? 'Stop and transcribe' : (isTranscribing ? 'Transcribing…' : 'Dictate')"
+        >{{ isTranscribing ? '⏳' : (isRecording ? '⏹️' : '🎤') }}</button>
         <textarea
           v-model="draft"
           :placeholder="composerPlaceholder"
@@ -738,6 +745,13 @@ const draft = ref('')
 const sending = ref(false)
 const messagesEl = ref(null)
 const inputEl = ref(null)
+
+// ── Voice dictation (record → local Whisper → insert into composer) ──
+const isRecording = ref(false)
+const isTranscribing = ref(false)
+let mediaRecorder = null
+let recordedChunks = []
+let recordStream = null
 
 // ─── Per-session draft persistence ───
 // Keep an unsent message around if the user navigates away and returns.
@@ -1656,6 +1670,65 @@ function attachFiles(event) {
   const files = event.target.files
   if (files?.length) addFiles(files)
   event.target.value = ''
+}
+
+// ── Voice dictation ──
+async function toggleRecording() {
+  if (isRecording.value) {
+    stopRecording()
+    return
+  }
+  if (isTranscribing.value) return
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    alert('Voice dictation is not supported in this browser.')
+    return
+  }
+  try {
+    recordStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+  } catch (e) {
+    alert('Microphone access was denied.')
+    return
+  }
+  recordedChunks = []
+  // Prefer opus in webm/ogg; fall back to the browser default.
+  let mime = ''
+  for (const m of ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']) {
+    if (MediaRecorder.isTypeSupported(m)) { mime = m; break }
+  }
+  mediaRecorder = new MediaRecorder(recordStream, mime ? { mimeType: mime } : undefined)
+  mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recordedChunks.push(e.data) }
+  mediaRecorder.onstop = onRecordingStop
+  mediaRecorder.start()
+  isRecording.value = true
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop()
+  isRecording.value = false
+}
+
+async function onRecordingStop() {
+  // Release the mic.
+  if (recordStream) { recordStream.getTracks().forEach(t => t.stop()); recordStream = null }
+  const blob = new Blob(recordedChunks, { type: mediaRecorder?.mimeType || 'audio/webm' })
+  recordedChunks = []
+  if (!blob.size || !selectedSession.value) return
+  isTranscribing.value = true
+  try {
+    const { text } = await api.transcribe(selectedSession.value, blob)
+    const t = (text || '').trim()
+    if (t) {
+      // Insert at the cursor, or append with a space if the draft is non-empty.
+      draft.value = draft.value ? `${draft.value.replace(/\s+$/, '')} ${t}` : t
+      await nextTick()
+      autoGrow()
+      inputEl.value?.focus()
+    }
+  } catch (e) {
+    alert(`Transcription failed: ${e.message || e}`)
+  } finally {
+    isTranscribing.value = false
+  }
 }
 
 function onPaste(event) {
@@ -2722,6 +2795,26 @@ function turnComplexity(turn) {
   padding: 0.5rem 0.7rem;
   font-size: 1.1rem;
   cursor: pointer;
+}
+
+.input-bar .mic-btn {
+  padding: 0.5rem 0.7rem;
+  font-size: 1.1rem;
+  cursor: pointer;
+  align-self: flex-end;
+}
+.input-bar .mic-btn.recording {
+  color: #fff;
+  background: var(--danger, #d64545);
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+.input-bar .mic-btn.transcribing {
+  opacity: 0.7;
+  cursor: progress;
+}
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(214, 69, 69, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(214, 69, 69, 0); }
 }
 
 .input-bar textarea {

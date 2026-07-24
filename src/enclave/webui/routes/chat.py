@@ -872,6 +872,42 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
     return {"sent": True, "via": "workspace_only", "filename": filename}
 
 
+@router.post("/{session_id}/transcribe")
+async def transcribe_audio(request: Request, file: UploadFile = File(...)):
+    """Transcribe recorded voice to text (local Whisper) for dictation.
+
+    The browser records audio (webm/opus via MediaRecorder) and posts it here;
+    we return the transcript for the client to insert into the composer.
+    Runs entirely on the host (no audio leaves the box). Auth is inherited from
+    the chat router's get_current_user dependency.
+    """
+    import asyncio
+    from enclave.webui import stt
+
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+
+    # Derive a suffix hint from the content type / filename so PyAV picks the
+    # right demuxer (webm/ogg/wav/mp4…). Defaults to .webm (MediaRecorder).
+    ct = (file.content_type or "").lower()
+    name = (file.filename or "").lower()
+    suffix = ".webm"
+    for ext in (".webm", ".ogg", ".wav", ".mp4", ".m4a", ".mp3"):
+        if ext[1:] in ct or name.endswith(ext):
+            suffix = ext
+            break
+
+    try:
+        text = await asyncio.to_thread(stt.transcribe, audio, suffix)
+    except Exception as e:
+        import logging
+        logging.getLogger("enclave.webui").error("Transcription failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+
+    return {"text": text}
+
+
 def _validate_file_auth(request: Request, token_param: str | None):
     """Validate auth via ?token= query param or Authorization header.
 
