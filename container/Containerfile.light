@@ -53,6 +53,11 @@ RUN chmod +x /usr/local/bin/kagi && \
     ln -sf kagi /usr/local/bin/kagi_search && \
     ln -sf kagi /usr/local/bin/kagi_extract
 
+# qemu-console — talk to a QEMU console/monitor on a unix socket (see
+# Containerfile / docs/qemu-console.md). Stdlib only.
+COPY container/qemu-console.py /usr/local/bin/qemu-console
+RUN chmod +x /usr/local/bin/qemu-console
+
 # markitdown — local document -> Markdown converter (see Containerfile for rationale).
 RUN pip install --no-cache-dir 'markitdown[pdf,docx,pptx,xlsx,xls]'
 

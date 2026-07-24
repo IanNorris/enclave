@@ -174,6 +174,14 @@ RUN chmod +x /usr/local/bin/kagi && \
 # handles remote web pages; markitdown handles local files. Exposed as `markitdown`.
 RUN pip install --no-cache-dir 'markitdown[pdf,docx,pptx,xlsx,xls]'
 
+# qemu-console — talk to a QEMU console/monitor exposed on a unix socket
+# (e.g. a QEMU launched host-side via launch_gui with -qmp/-serial on sockets
+# placed in the workspace). Lets a containerised agent drive the VM (QMP),
+# run monitor commands (HMP), or hold a stateful serial session via a bridge.
+# Stdlib only. See docs/qemu-console.md.
+COPY container/qemu-console.py /usr/local/bin/qemu-console
+RUN chmod +x /usr/local/bin/qemu-console
+
 WORKDIR /workspace
 
 # Entrypoint: install Nix on first run (if profile uses it), then start agent
