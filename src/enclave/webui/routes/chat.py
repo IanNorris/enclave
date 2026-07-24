@@ -57,6 +57,20 @@ def _matrix_config(request: Request):
     return request.app.state.config.matrix
 
 
+def _matrix_write_ok(config, room_id: str | None) -> bool:
+    """True if the web UI may post to Matrix for this session.
+
+    The web UI process talks to Matrix DIRECTLY (not through the orchestrator's
+    NullMatrixClient), so every direct-Matrix write must independently respect
+    the Matrix-disabled setting — otherwise a session that still carries a real
+    (pre-disable) Matrix room id would keep leaking uploads/messages to Matrix
+    even though Matrix is off. Requires Matrix enabled AND a real (non-synthetic)
+    room id.
+    """
+    from enclave.common.config import is_synthetic_room
+    return bool(getattr(config, "enabled", True)) and bool(room_id) and not is_synthetic_room(room_id)
+
+
 def _read_turns(db_path: Path, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
     """Read conversation turns from session-store.db."""
     if not db_path.exists():
@@ -762,18 +776,31 @@ async def set_model(request: Request, session_id: str, body: SendMessage):
             raise HTTPException(status_code=500, detail=f"Failed to set fusion mode: {e}")
         return {"sent": True, "model": body.content, "fusion_mode": body.content}
 
-    # Real model pick: clear any fusion mode, then change the SDK model.
+    # Real model pick: clear any fusion mode, then change the SDK model by
+    # delivering a `/model` command (a Copilot SDK slash command) to the agent.
     try:
         _fusion.write_fusion_mode(ws_base, "")
     except Exception:
         pass
 
-    room_id = _get_room_id(request, session_id)
-    if not room_id:
-        raise HTTPException(status_code=404, detail="Session room not found")
-
-    config = _matrix_config(request)
-    event_id = await _send_matrix_message(config, room_id, f"/model {body.content}")
+    # Prefer the control socket (works with Matrix off, and wakes idle agents);
+    # fall back to a direct Matrix message only when Matrix is enabled and the
+    # session has a real room. Previously this ALWAYS went via Matrix, which both
+    # leaked to Matrix for pre-disable sessions and silently did nothing when
+    # Matrix was off (the orchestrator no longer syncs Matrix).
+    data_dir = Path(request.app.state.config.data_dir)
+    sent = await _send_via_control_socket(data_dir, session_id, f"/model {body.content}")
+    event_id = None
+    if not sent:
+        room_id = _get_room_id(request, session_id)
+        config = _matrix_config(request)
+        if _matrix_write_ok(config, room_id):
+            event_id = await _send_matrix_message(config, room_id, f"/model {body.content}")
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="Agent unreachable (control socket down) and Matrix is disabled.",
+            )
 
     # Update the current model in the models file
     models_path = ws_base / ".enclave-models.json"
@@ -826,13 +853,16 @@ async def upload_file(request: Request, session_id: str, file: UploadFile = File
         data_dir, session_id, text_content, attachments=[attachment_meta]
     )
 
-    # Also upload to Matrix for the conversation record (best-effort)
+    # Also upload to Matrix for the conversation record (best-effort) — only
+    # when Matrix is actually enabled and this is a real Matrix room. Skipped
+    # for Matrix-off / synthetic-room sessions so uploads don't leak to Matrix
+    # (the file is already in the workspace and served via the file proxy).
     room_id = _get_room_id(request, session_id)
-    if room_id:
+    config = request.app.state.config.matrix
+    if _matrix_write_ok(config, room_id):
         try:
-            mat_config = _matrix_config(request)
-            mxc_uri = await _upload_matrix_file(mat_config, filename, content, content_type)
-            await _send_matrix_file(mat_config, room_id, mxc_uri, filename, len(content), content_type)
+            mxc_uri = await _upload_matrix_file(config, filename, content, content_type)
+            await _send_matrix_file(config, room_id, mxc_uri, filename, len(content), content_type)
         except Exception:
             pass  # Matrix upload is best-effort for the record
 
