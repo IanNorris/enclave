@@ -421,6 +421,13 @@
       <div class="input-bar">
         <button class="secondary attach-btn" @click="$refs.chatFile.click()" title="Attach files">📎</button>
         <input type="file" ref="chatFile" style="display:none" @change="attachFiles" multiple accept="image/*,application/pdf,text/*" />
+        <button
+          class="secondary mic-btn"
+          :class="{ recording: isRecording, transcribing: isTranscribing }"
+          @click="toggleRecording"
+          :disabled="isTranscribing"
+          :title="isRecording ? 'Stop and transcribe' : (isTranscribing ? 'Transcribing…' : 'Dictate')"
+        >{{ isTranscribing ? '⏳' : (isRecording ? '⏹️' : '🎤') }}</button>
         <textarea
           v-model="draft"
           :placeholder="composerPlaceholder"
@@ -739,6 +746,17 @@ const sending = ref(false)
 const messagesEl = ref(null)
 const inputEl = ref(null)
 
+// ── Voice dictation (record → local Whisper → insert into composer) ──
+const isRecording = ref(false)
+const isTranscribing = ref(false)
+// True when the current draft contains dictated (speech-transcribed) text, so
+// we can prefix a [Dictated] tag on send — cueing the agent that there may be
+// transcription errors. Cleared when the draft is emptied (see watch below).
+const draftDictated = ref(false)
+let mediaRecorder = null
+let recordedChunks = []
+let recordStream = null
+
 // ─── Per-session draft persistence ───
 // Keep an unsent message around if the user navigates away and returns.
 const DRAFT_PREFIX = 'enclave_chat_draft_'
@@ -749,6 +767,9 @@ function loadDraft(id) {
 watch(draft, (v) => {
   const id = selectedSession.value
   nextTick(autoGrow)
+  // If the draft is emptied (sent, or manually cleared), the next content is
+  // fresh — drop the dictated flag so a later typed message isn't mistagged.
+  if (!v) draftDictated.value = false
   if (!id) return
   if (v) localStorage.setItem(draftKey(id), v)
   else localStorage.removeItem(draftKey(id))
@@ -1519,8 +1540,14 @@ function autoGrow() {
 
 async function send() {
   if ((!draft.value.trim() && !pendingFiles.value.length) || !selectedSession.value) return
-  const content = draft.value.trim()
+  // Prefix a [Dictated] tag when the draft came from voice, so the agent knows
+  // the text was speech-transcribed and may contain recognition errors.
+  const wasDictated = draftDictated.value && !!draft.value.trim()
+  const content = wasDictated
+    ? `[Dictated - transcription may contain errors] ${draft.value.trim()}`
+    : draft.value.trim()
   draft.value = ''
+  draftDictated.value = false
   sending.value = true
   nextTick(autoGrow)
 
@@ -1656,6 +1683,101 @@ function attachFiles(event) {
   const files = event.target.files
   if (files?.length) addFiles(files)
   event.target.value = ''
+}
+
+// ── Voice dictation ──
+// Acquire the mic, tolerating transient "source busy" failures. Android WebView
+// (and some desktop setups) intermittently throw NotReadableError/AbortError
+// when the audio device can't be opened on the first try -- a short retry, then
+// a retry with audio processing disabled, clears most of these.
+async function acquireMic() {
+  const attempts = [
+    { audio: true },
+    { audio: true },
+    { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } },
+  ]
+  let lastErr
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(attempts[i])
+    } catch (e) {
+      lastErr = e
+      // Only the transient "can't open the source" class is worth retrying;
+      // permission/no-device errors won't fix themselves.
+      if (e?.name !== 'NotReadableError' && e?.name !== 'AbortError') break
+      if (i < attempts.length - 1) await new Promise(r => setTimeout(r, 350))
+    }
+  }
+  throw lastErr
+}
+
+async function toggleRecording() {
+  if (isRecording.value) {
+    stopRecording()
+    return
+  }
+  if (isTranscribing.value) return
+  if (typeof window !== 'undefined' && window.isSecureContext === false) {
+    alert('Voice dictation needs a secure (HTTPS) connection. This page is not a secure context, so the microphone is unavailable.')
+    return
+  }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    alert('Voice dictation is not supported in this browser.')
+    return
+  }
+  try {
+    recordStream = await acquireMic()
+  } catch (e) {
+    const name = e?.name || 'Error'
+    const msg = e?.message || String(e)
+    if (name === 'NotReadableError' || name === 'AbortError') {
+      alert('Could not start the microphone. Another app (or a Bluetooth headset routing audio) may be holding it. Close/disconnect it and try again.')
+    } else {
+      alert(`Microphone unavailable (${name}): ${msg}`)
+    }
+    return
+  }
+  recordedChunks = []
+  // Prefer opus in webm/ogg; fall back to the browser default.
+  let mime = ''
+  for (const m of ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']) {
+    if (MediaRecorder.isTypeSupported(m)) { mime = m; break }
+  }
+  mediaRecorder = new MediaRecorder(recordStream, mime ? { mimeType: mime } : undefined)
+  mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recordedChunks.push(e.data) }
+  mediaRecorder.onstop = onRecordingStop
+  mediaRecorder.start()
+  isRecording.value = true
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop()
+  isRecording.value = false
+}
+
+async function onRecordingStop() {
+  // Release the mic.
+  if (recordStream) { recordStream.getTracks().forEach(t => t.stop()); recordStream = null }
+  const blob = new Blob(recordedChunks, { type: mediaRecorder?.mimeType || 'audio/webm' })
+  recordedChunks = []
+  if (!blob.size || !selectedSession.value) return
+  isTranscribing.value = true
+  try {
+    const { text } = await api.transcribe(selectedSession.value, blob)
+    const t = (text || '').trim()
+    if (t) {
+      // Insert at the cursor, or append with a space if the draft is non-empty.
+      draft.value = draft.value ? `${draft.value.replace(/\s+$/, '')} ${t}` : t
+      draftDictated.value = true
+      await nextTick()
+      autoGrow()
+      inputEl.value?.focus()
+    }
+  } catch (e) {
+    alert(`Transcription failed: ${e.message || e}`)
+  } finally {
+    isTranscribing.value = false
+  }
 }
 
 function onPaste(event) {
@@ -2722,6 +2844,26 @@ function turnComplexity(turn) {
   padding: 0.5rem 0.7rem;
   font-size: 1.1rem;
   cursor: pointer;
+}
+
+.input-bar .mic-btn {
+  padding: 0.5rem 0.7rem;
+  font-size: 1.1rem;
+  cursor: pointer;
+  align-self: flex-end;
+}
+.input-bar .mic-btn.recording {
+  color: #fff;
+  background: var(--danger, #d64545);
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+.input-bar .mic-btn.transcribing {
+  opacity: 0.7;
+  cursor: progress;
+}
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(214, 69, 69, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(214, 69, 69, 0); }
 }
 
 .input-bar textarea {

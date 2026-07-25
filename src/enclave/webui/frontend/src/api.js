@@ -101,6 +101,23 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ content }),
   }),
+  // Transcribe recorded audio (webm/opus blob) via local Whisper → { text }.
+  // Uses raw fetch (multipart) since request() forces a JSON content-type.
+  transcribe: async (session, blob) => {
+    const fd = new FormData()
+    fd.append('file', blob, 'audio.webm')
+    const token = getToken()
+    const res = await fetch(`${BASE}/chat/${session}/transcribe`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: fd,
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || 'Transcription failed')
+    }
+    return res.json()
+  },
   respondPermission: (session, requestId, answerId) => request(`/chat/${session}/permission`, {
     method: 'POST',
     body: JSON.stringify({ request_id: requestId, answer_id: answerId }),

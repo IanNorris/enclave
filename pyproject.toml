@@ -33,6 +33,12 @@ dev = [
 mcp = [
     "mcp[cli]>=1.0",
 ]
+voice = [
+    # Local speech-to-text for voice dictation. Bundles PyAV (ffmpeg libs), so
+    # no system ffmpeg is required. ~200MB of wheels; the STT model downloads
+    # on first use. See src/enclave/webui/stt.py.
+    "faster-whisper>=1.0",
+]
 webui = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",

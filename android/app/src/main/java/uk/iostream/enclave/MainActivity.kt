@@ -2,17 +2,25 @@ package uk.iostream.enclave
 
 import android.Manifest
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
+import okhttp3.Request
 import org.json.JSONObject
+import java.io.File
 import kotlin.concurrent.thread
 
 /** Full-screen WebView hosting the existing Enclave web UI. The bearer token
@@ -24,6 +32,11 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooserCode = 1001
+    private val micPermissionCode = 1003
+    // Startup RECORD_AUDIO request whose result gates the WebView creation.
+    private val micStartupCode = 1004
+    // A WebView mic-permission request awaiting the OS RECORD_AUDIO grant.
+    private var pendingWebPermission: PermissionRequest? = null
     // Skip the first onResume (it fires right after onCreate's initial load).
     private var didInitialLoad = false
     // A session to select on the next page (re)load, e.g. from a notification tap.
@@ -42,9 +55,34 @@ class MainActivity : Activity() {
             return
         }
 
-        requestNotificationPermissionIfNeeded()
         NotificationService.start(this)
 
+        // The WebView's audio-capture stack only picks up RECORD_AUDIO if the
+        // permission is already held when the WebView is created. Granting it
+        // after init leaves getUserMedia failing with NotReadableError ("could
+        // not start audio source") until the app is restarted. So if we don't
+        // hold it yet, request it first and build the WebView from the result;
+        // otherwise build it now. Notifications are bundled into the same request
+        // (a second concurrent requestPermissions() call would be dropped).
+        val micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        val toRequest = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED) {
+            toRequest += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (!micGranted) toRequest += Manifest.permission.RECORD_AUDIO
+
+        if (micGranted) {
+            if (toRequest.isNotEmpty()) requestPermissions(toRequest.toTypedArray(), 2002)
+            setupWebView()
+        } else {
+            requestPermissions(toRequest.toTypedArray(), micStartupCode)
+        }
+    }
+
+    private fun setupWebView() {
         webView = WebView(this)
         setContentView(webView)
 
@@ -55,6 +93,15 @@ class MainActivity : Activity() {
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = true
             cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+        }
+
+        // The web UI serves agent-sent files (send_file / structured_response
+        // downloads) as authenticated URLs. A plain WebView ignores <a download>
+        // clicks, so route them through the app's HTTP client (which trusts the
+        // server's self-signed CA via network_security_config) and save to the
+        // device Downloads collection.
+        webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            downloadFile(url, contentDisposition, mimeType)
         }
 
         val baseUrl = Prefs.serverUrl(this)!!
@@ -121,10 +168,41 @@ class MainActivity : Activity() {
                     false
                 }
             }
+
+            // getUserMedia() inside the WebView (voice dictation) asks the host
+            // app to grant the mic. Grant it only if we hold the OS RECORD_AUDIO
+            // permission; otherwise request that first and grant on the result.
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                request ?: return
+                val wantsMic = request.resources.any {
+                    it == PermissionRequest.RESOURCE_AUDIO_CAPTURE
+                }
+                if (!wantsMic) {
+                    runOnUiThread { request.deny() }
+                    return
+                }
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED) {
+                    runOnUiThread {
+                        request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                    }
+                } else {
+                    pendingWebPermission = request
+                    // The permission dialog fires onResume on return, which would
+                    // otherwise reload the WebView and abort the in-page recording
+                    // flow — suppress that one reload (as the file chooser does).
+                    skipNextResumeReload = true
+                    requestPermissions(
+                        arrayOf(Manifest.permission.RECORD_AUDIO), micPermissionCode,
+                    )
+                }
+            }
         }
 
-        // Handle a notification tap that targets a specific session.
-        val targetSession = intent?.getStringExtra(EXTRA_SESSION)
+        // Handle a notification tap that targets a specific session. A tap that
+        // arrived (via onNewIntent) before the WebView existed is held in
+        // pendingSession; otherwise read it from the launch intent.
+        val targetSession = pendingSession ?: intent?.getStringExtra(EXTRA_SESSION)
         if (targetSession != null) {
             pendingSession = targetSession
             webView.loadUrl("$baseUrl/chat")
@@ -156,6 +234,12 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         val session = intent?.getStringExtra(EXTRA_SESSION) ?: return
         val baseUrl = Prefs.serverUrl(this) ?: return
+        // If the WebView hasn't been created yet (still resolving the startup
+        // mic permission), just record the target; setupWebView() will honor it.
+        if (!this::webView.isInitialized) {
+            pendingSession = session
+            return
+        }
         // Select the session on the next load (injected in onPageStarted before
         // the web UI reads localStorage), then navigate to chat. The onResume
         // that follows this intent must not reload over it.
@@ -212,12 +296,65 @@ class MainActivity : Activity() {
         webView.evaluateJavascript(js, null)
     }
 
-    private fun requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2002)
+    /** Fetch an authenticated file URL through the app's HTTP client (which
+     *  trusts the server CA) and write it into the device Downloads collection.
+     *  Runs off the UI thread; toasts the outcome. */
+    private fun downloadFile(url: String, contentDisposition: String?, mimeType: String?) {
+        val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        val mime = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+        Toast.makeText(this, "Downloading $name…", Toast.LENGTH_SHORT).show()
+        thread {
+            val ok = try {
+                Api.client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+                    val body = resp.body
+                    if (!resp.isSuccessful || body == null) {
+                        false
+                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        saveToMediaStore(name, mime, body.byteStream())
+                    } else {
+                        @Suppress("DEPRECATION")
+                        val dir = Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS,
+                        )
+                        dir.mkdirs()
+                        File(dir, name).outputStream().use { out ->
+                            body.byteStream().copyTo(out)
+                        }
+                        true
+                    }
+                }
+            } catch (e: Exception) {
+                false
+            }
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    if (ok) "Saved $name to Downloads" else "Download failed: $name",
+                    Toast.LENGTH_LONG,
+                ).show()
             }
         }
+    }
+
+    private fun saveToMediaStore(
+        name: String, mime: String, input: java.io.InputStream,
+    ): Boolean {
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, mime)
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val resolver = contentResolver
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: return false
+        val wrote = resolver.openOutputStream(uri)?.use { out ->
+            input.copyTo(out)
+            true
+        } ?: false
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+        return wrote
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -226,6 +363,33 @@ class MainActivity : Activity() {
             val result = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
             fileCallback?.onReceiveValue(result)
             fileCallback = null
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == micStartupCode) {
+            // The WebView was deferred until the mic permission resolved (granted
+            // or not) so its audio stack initializes with the permission state in
+            // place. Build it now regardless — the rest of the app must work even
+            // if the user declined the mic.
+            if (!this::webView.isInitialized) setupWebView()
+            return
+        }
+        if (requestCode == micPermissionCode) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val req = pendingWebPermission
+            pendingWebPermission = null
+            runOnUiThread {
+                if (granted && req != null) {
+                    req.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                } else {
+                    req?.deny()
+                }
+            }
         }
     }
 
