@@ -1686,6 +1686,31 @@ function attachFiles(event) {
 }
 
 // ── Voice dictation ──
+// Acquire the mic, tolerating transient "source busy" failures. Android WebView
+// (and some desktop setups) intermittently throw NotReadableError/AbortError
+// when the audio device can't be opened on the first try -- a short retry, then
+// a retry with audio processing disabled, clears most of these.
+async function acquireMic() {
+  const attempts = [
+    { audio: true },
+    { audio: true },
+    { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } },
+  ]
+  let lastErr
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(attempts[i])
+    } catch (e) {
+      lastErr = e
+      // Only the transient "can't open the source" class is worth retrying;
+      // permission/no-device errors won't fix themselves.
+      if (e?.name !== 'NotReadableError' && e?.name !== 'AbortError') break
+      if (i < attempts.length - 1) await new Promise(r => setTimeout(r, 350))
+    }
+  }
+  throw lastErr
+}
+
 async function toggleRecording() {
   if (isRecording.value) {
     stopRecording()
@@ -1701,14 +1726,15 @@ async function toggleRecording() {
     return
   }
   try {
-    recordStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    recordStream = await acquireMic()
   } catch (e) {
-    // Surface the real error so failures are diagnosable (esp. in the Android
-    // WebView, where a bare "denied" hides NotAllowedError vs NotFoundError vs
-    // a Security/permission-plumbing issue).
     const name = e?.name || 'Error'
     const msg = e?.message || String(e)
-    alert(`Microphone unavailable (${name}): ${msg}`)
+    if (name === 'NotReadableError' || name === 'AbortError') {
+      alert('Could not start the microphone. Another app (or a Bluetooth headset routing audio) may be holding it. Close/disconnect it and try again.')
+    } else {
+      alert(`Microphone unavailable (${name}): ${msg}`)
+    }
     return
   }
   recordedChunks = []
