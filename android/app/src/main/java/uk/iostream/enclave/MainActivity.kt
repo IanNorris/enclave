@@ -2,18 +2,25 @@ package uk.iostream.enclave
 
 import android.Manifest
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
+import okhttp3.Request
 import org.json.JSONObject
+import java.io.File
 import kotlin.concurrent.thread
 
 /** Full-screen WebView hosting the existing Enclave web UI. The bearer token
@@ -47,6 +54,7 @@ class MainActivity : Activity() {
         }
 
         requestNotificationPermissionIfNeeded()
+        requestMicPermissionIfNeeded()
         NotificationService.start(this)
 
         webView = WebView(this)
@@ -59,6 +67,15 @@ class MainActivity : Activity() {
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = true
             cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+        }
+
+        // The web UI serves agent-sent files (send_file / structured_response
+        // downloads) as authenticated URLs. A plain WebView ignores <a download>
+        // clicks, so route them through the app's HTTP client (which trusts the
+        // server's self-signed CA via network_security_config) and save to the
+        // device Downloads collection.
+        webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            downloadFile(url, contentDisposition, mimeType)
         }
 
         val baseUrl = Prefs.serverUrl(this)!!
@@ -251,6 +268,79 @@ class MainActivity : Activity() {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2002)
             }
         }
+    }
+
+    /** Ask for RECORD_AUDIO up front so that when the in-page voice dictation
+     *  calls getUserMedia(), our onPermissionRequest handler can grant the mic
+     *  synchronously. Deferring the grant across an async OS permission dialog
+     *  causes the WebView to reject the in-flight getUserMedia as "denied", so
+     *  holding the OS permission ahead of time is the reliable path. */
+    private fun requestMicPermissionIfNeeded() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2003)
+        }
+    }
+
+    /** Fetch an authenticated file URL through the app's HTTP client (which
+     *  trusts the server CA) and write it into the device Downloads collection.
+     *  Runs off the UI thread; toasts the outcome. */
+    private fun downloadFile(url: String, contentDisposition: String?, mimeType: String?) {
+        val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        val mime = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+        Toast.makeText(this, "Downloading $name…", Toast.LENGTH_SHORT).show()
+        thread {
+            val ok = try {
+                Api.client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+                    val body = resp.body
+                    if (!resp.isSuccessful || body == null) {
+                        false
+                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        saveToMediaStore(name, mime, body.byteStream())
+                    } else {
+                        @Suppress("DEPRECATION")
+                        val dir = Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS,
+                        )
+                        dir.mkdirs()
+                        File(dir, name).outputStream().use { out ->
+                            body.byteStream().copyTo(out)
+                        }
+                        true
+                    }
+                }
+            } catch (e: Exception) {
+                false
+            }
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    if (ok) "Saved $name to Downloads" else "Download failed: $name",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    private fun saveToMediaStore(
+        name: String, mime: String, input: java.io.InputStream,
+    ): Boolean {
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, mime)
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val resolver = contentResolver
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: return false
+        val wrote = resolver.openOutputStream(uri)?.use { out ->
+            input.copyTo(out)
+            true
+        } ?: false
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+        return wrote
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

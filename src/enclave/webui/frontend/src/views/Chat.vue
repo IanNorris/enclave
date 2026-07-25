@@ -1692,6 +1692,10 @@ async function toggleRecording() {
     return
   }
   if (isTranscribing.value) return
+  if (typeof window !== 'undefined' && window.isSecureContext === false) {
+    alert('Voice dictation needs a secure (HTTPS) connection. This page is not a secure context, so the microphone is unavailable.')
+    return
+  }
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
     alert('Voice dictation is not supported in this browser.')
     return
@@ -1699,7 +1703,12 @@ async function toggleRecording() {
   try {
     recordStream = await navigator.mediaDevices.getUserMedia({ audio: true })
   } catch (e) {
-    alert('Microphone access was denied.')
+    // Surface the real error so failures are diagnosable (esp. in the Android
+    // WebView, where a bare "denied" hides NotAllowedError vs NotFoundError vs
+    // a Security/permission-plumbing issue).
+    const name = e?.name || 'Error'
+    const msg = e?.message || String(e)
+    alert(`Microphone unavailable (${name}): ${msg}`)
     return
   }
   recordedChunks = []
