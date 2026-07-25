@@ -33,6 +33,8 @@ class MainActivity : Activity() {
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooserCode = 1001
     private val micPermissionCode = 1003
+    // Startup RECORD_AUDIO request whose result gates the WebView creation.
+    private val micStartupCode = 1004
     // A WebView mic-permission request awaiting the OS RECORD_AUDIO grant.
     private var pendingWebPermission: PermissionRequest? = null
     // Skip the first onResume (it fires right after onCreate's initial load).
@@ -53,10 +55,34 @@ class MainActivity : Activity() {
             return
         }
 
-        requestNotificationPermissionIfNeeded()
-        requestMicPermissionIfNeeded()
         NotificationService.start(this)
 
+        // The WebView's audio-capture stack only picks up RECORD_AUDIO if the
+        // permission is already held when the WebView is created. Granting it
+        // after init leaves getUserMedia failing with NotReadableError ("could
+        // not start audio source") until the app is restarted. So if we don't
+        // hold it yet, request it first and build the WebView from the result;
+        // otherwise build it now. Notifications are bundled into the same request
+        // (a second concurrent requestPermissions() call would be dropped).
+        val micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        val toRequest = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED) {
+            toRequest += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (!micGranted) toRequest += Manifest.permission.RECORD_AUDIO
+
+        if (micGranted) {
+            if (toRequest.isNotEmpty()) requestPermissions(toRequest.toTypedArray(), 2002)
+            setupWebView()
+        } else {
+            requestPermissions(toRequest.toTypedArray(), micStartupCode)
+        }
+    }
+
+    private fun setupWebView() {
         webView = WebView(this)
         setContentView(webView)
 
@@ -173,8 +199,10 @@ class MainActivity : Activity() {
             }
         }
 
-        // Handle a notification tap that targets a specific session.
-        val targetSession = intent?.getStringExtra(EXTRA_SESSION)
+        // Handle a notification tap that targets a specific session. A tap that
+        // arrived (via onNewIntent) before the WebView existed is held in
+        // pendingSession; otherwise read it from the launch intent.
+        val targetSession = pendingSession ?: intent?.getStringExtra(EXTRA_SESSION)
         if (targetSession != null) {
             pendingSession = targetSession
             webView.loadUrl("$baseUrl/chat")
@@ -206,6 +234,12 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         val session = intent?.getStringExtra(EXTRA_SESSION) ?: return
         val baseUrl = Prefs.serverUrl(this) ?: return
+        // If the WebView hasn't been created yet (still resolving the startup
+        // mic permission), just record the target; setupWebView() will honor it.
+        if (!this::webView.isInitialized) {
+            pendingSession = session
+            return
+        }
         // Select the session on the next load (injected in onPageStarted before
         // the web UI reads localStorage), then navigate to chat. The onResume
         // that follows this intent must not reload over it.
@@ -260,26 +294,6 @@ class MainActivity : Activity() {
         pendingSession = null
         val js = "try{localStorage.setItem('enclave_selected_session', ${JSONObject.quote(s)});}catch(e){}"
         webView.evaluateJavascript(js, null)
-    }
-
-    private fun requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2002)
-            }
-        }
-    }
-
-    /** Ask for RECORD_AUDIO up front so that when the in-page voice dictation
-     *  calls getUserMedia(), our onPermissionRequest handler can grant the mic
-     *  synchronously. Deferring the grant across an async OS permission dialog
-     *  causes the WebView to reject the in-flight getUserMedia as "denied", so
-     *  holding the OS permission ahead of time is the reliable path. */
-    private fun requestMicPermissionIfNeeded() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2003)
-        }
     }
 
     /** Fetch an authenticated file URL through the app's HTTP client (which
@@ -356,6 +370,14 @@ class MainActivity : Activity() {
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == micStartupCode) {
+            // The WebView was deferred until the mic permission resolved (granted
+            // or not) so its audio stack initializes with the permission state in
+            // place. Build it now regardless — the rest of the app must work even
+            // if the user declined the mic.
+            if (!this::webView.isInitialized) setupWebView()
+            return
+        }
         if (requestCode == micPermissionCode) {
             val granted = grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
