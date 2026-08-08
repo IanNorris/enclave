@@ -325,6 +325,40 @@ async def _send_via_control_socket(
     return False
 
 
+async def _set_model_via_control_socket(
+    data_dir: Path, session_id: str, model: str
+) -> bool:
+    """Switch a session's model via the dedicated control-socket action.
+
+    Uses the SET_MODEL command path rather than injecting a `/model X` chat
+    message (which the Copilot SDK never interpreted as a command, so the switch
+    silently never happened). Returns True if the agent accepted the command.
+    """
+    sock_path = data_dir / "control.sock"
+    if not sock_path.exists():
+        return False
+
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        req = json.dumps({
+            "action": "set_model",
+            "session": session_id,
+            "model": model,
+        })
+        writer.write(req.encode() + b"\n")
+        await writer.drain()
+
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        writer.close()
+        await writer.wait_closed()
+        if line:
+            resp = json.loads(line.decode())
+            return bool(resp.get("ok"))
+    except (OSError, asyncio.TimeoutError, json.JSONDecodeError):
+        pass
+    return False
+
+
 # ─── Models ─────────────────────────────────────────────────────────────────
 
 
@@ -776,43 +810,28 @@ async def set_model(request: Request, session_id: str, body: SendMessage):
             raise HTTPException(status_code=500, detail=f"Failed to set fusion mode: {e}")
         return {"sent": True, "model": body.content, "fusion_mode": body.content}
 
-    # Real model pick: clear any fusion mode, then change the SDK model by
-    # delivering a `/model` command (a Copilot SDK slash command) to the agent.
+    # Real model pick: clear any fusion mode, then switch the SDK model via the
+    # dedicated SET_MODEL control command. Previously this injected a `/model X`
+    # chat message, but the Copilot SDK does not interpret slash commands in its
+    # message API, so the switch silently never happened (it just posted the
+    # command into the transcript). The agent now applies it out-of-band and
+    # writes the authoritative `current` into `.enclave-models.json`, so we no
+    # longer optimistically write it here (which made the picker look switched
+    # even when it wasn't).
     try:
         _fusion.write_fusion_mode(ws_base, "")
     except Exception:
         pass
 
-    # Prefer the control socket (works with Matrix off, and wakes idle agents);
-    # fall back to a direct Matrix message only when Matrix is enabled and the
-    # session has a real room. Previously this ALWAYS went via Matrix, which both
-    # leaked to Matrix for pre-disable sessions and silently did nothing when
-    # Matrix was off (the orchestrator no longer syncs Matrix).
     data_dir = Path(request.app.state.config.data_dir)
-    sent = await _send_via_control_socket(data_dir, session_id, f"/model {body.content}")
-    event_id = None
+    sent = await _set_model_via_control_socket(data_dir, session_id, body.content)
     if not sent:
-        room_id = _get_room_id(request, session_id)
-        config = _matrix_config(request)
-        if _matrix_write_ok(config, room_id):
-            event_id = await _send_matrix_message(config, room_id, f"/model {body.content}")
-        else:
-            raise HTTPException(
-                status_code=503,
-                detail="Agent unreachable (control socket down) and Matrix is disabled.",
-            )
+        raise HTTPException(
+            status_code=503,
+            detail="Agent unreachable or not connected; model not switched.",
+        )
 
-    # Update the current model in the models file
-    models_path = ws_base / ".enclave-models.json"
-    try:
-        if models_path.exists():
-            data = json.loads(models_path.read_text())
-            data["current"] = body.content
-            models_path.write_text(json.dumps(data, indent=2))
-    except Exception:
-        pass
-
-    return {"sent": True, "event_id": event_id, "model": body.content}
+    return {"sent": True, "model": body.content}
 
 
 @router.post("/{session_id}/upload")

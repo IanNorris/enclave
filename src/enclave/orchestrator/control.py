@@ -431,6 +431,8 @@ class ControlServer:
                 await self._handle_delete(req, writer)
             elif action == "models":
                 await self._handle_models(req, writer)
+            elif action == "set_model":
+                await self._handle_set_model(req, writer)
             elif action == "credits":
                 await self._handle_credits(req, writer)
             elif action == "complexity":
@@ -654,6 +656,36 @@ class ControlServer:
         except Exception as e:
             log.warning("Models query error for %s: %s", session_id, e)
             await self._write(writer, {"ok": False, "error": str(e)})
+
+    async def _handle_set_model(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Switch a session's live model via the dedicated SET_MODEL command.
+
+        Replaces the old approach of injecting a `/model X` chat message (which
+        the Copilot SDK never interpreted as a command, so the switch silently
+        never happened). The agent applies it out-of-band and records it in
+        ``.enclave-models.json``; the web UI confirms by re-reading that file.
+        """
+        session_id = req.get("session", "")
+        model = req.get("model", "")
+        if not session_id or not model:
+            await self._write(writer, {"ok": False, "error": "Missing session or model"})
+            return
+
+        session = self._router.containers.get_session(session_id)
+        if not session:
+            await self._write(writer, {"ok": False, "error": f"Session not found: {session_id}"})
+            return
+
+        try:
+            sent = await self._router.set_session_model(session_id, model)
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+
+        if sent:
+            await self._write(writer, {"ok": True, "type": "model_set", "model": model})
+        else:
+            await self._write(writer, {"ok": False, "error": "Agent not connected"})
 
     async def _handle_credits(self, req: dict, writer: asyncio.StreamWriter) -> None:
         """Return AI Credits info: account entitlement snapshot + per-session usage.

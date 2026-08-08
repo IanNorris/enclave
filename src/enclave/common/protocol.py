@@ -27,6 +27,7 @@ class MessageType(str, Enum):
     PERMISSION_RESPONSE = "permission_response"
     MOUNT_RESPONSE = "mount_response"
     SHUTDOWN = "shutdown"
+    SET_MODEL = "set_model"
 
     # Agent → Orchestrator
     AGENT_RESPONSE = "agent_response"
