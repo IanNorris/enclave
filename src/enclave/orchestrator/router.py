@@ -371,6 +371,27 @@ class MessageRouter:
         self._perm_db.close()
         log.info("Router stopped")
 
+    async def set_session_model(self, session_id: str, model: str) -> bool:
+        """Ask a running agent to switch its live SDK model.
+
+        Delivered as a dedicated SET_MODEL command (not a chat message), so the
+        agent applies it out-of-band via session.set_model() rather than posting
+        `/model X` into the transcript (which the Copilot SDK never interpreted
+        as a command). Returns True if the command was delivered to the agent.
+        """
+        session = self.containers.get_session(session_id)
+        if not session:
+            return False
+        msg = Message(
+            type=MessageType.SET_MODEL,
+            payload={"model": model},
+        )
+        sent = await self.ipc.send_to(session_id, msg)
+        if sent:
+            self._touch_activity(session_id)
+            log.info("Sent SET_MODEL to %s: %s", session_id, model)
+        return sent
+
     async def inject_message(
         self, session_id: str, content: str, attachments: list[dict] | None = None
     ) -> bool:

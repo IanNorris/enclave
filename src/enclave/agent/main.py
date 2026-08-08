@@ -953,6 +953,75 @@ async def _download_attachments(
     return sdk_attachments
 
 
+def _persist_current_model(target: str) -> None:
+    """Update the ``current`` field in the workspace models file after a switch.
+
+    Keeps the file the web UI reads (``.enclave-models.json``) in sync so the
+    picker reflects the model that is actually active, not just what was
+    optimistically requested. This is the authoritative record of the live
+    model — it is written only after the SDK confirms the switch.
+    """
+    import json as _json
+    p = _workspace_root() / ".enclave-models.json"
+    try:
+        data = _json.loads(p.read_text()) if p.exists() else {}
+    except Exception:
+        data = {}
+    data["current"] = target
+    avail = data.get("available") or []
+    if target not in avail:
+        avail.append(target)
+        data["available"] = avail
+    p.write_text(_json.dumps(data, indent=2))
+
+
+async def _apply_model_request(state: "AgentState", target: str) -> tuple[bool, str]:
+    """Switch the live SDK session to ``target`` and persist it authoritatively.
+
+    Invoked by the dedicated SET_MODEL control command (web UI model picker →
+    control socket → orchestrator → agent). Deliberately does NOT emit any chat
+    turn: a model switch is a control action, not a conversational message.
+    Returns (ok, detail) for logging; the web UI confirms via the updated
+    ``.enclave-models.json`` current field.
+    """
+    global _AVAILABLE_MODEL_IDS
+    target = (target or "").strip()
+    if not target:
+        return False, "empty model id"
+
+    # Populate the available-model set if we don't have it yet, so we can reject
+    # a typo rather than let set_model silently fall back to a default model.
+    client = state.sdk_client
+    if not _AVAILABLE_MODEL_IDS and client is not None:
+        try:
+            models = await client.list_models()
+            _AVAILABLE_MODEL_IDS = {m.id for m in models}
+        except Exception:
+            try:
+                raw = await client._client.request("models.list", {})
+                _AVAILABLE_MODEL_IDS = {
+                    m.get("id") for m in raw.get("models", []) if m.get("id")
+                }
+            except Exception:
+                pass
+
+    if _AVAILABLE_MODEL_IDS and target not in _AVAILABLE_MODEL_IDS:
+        return False, f"model '{target}' not available"
+
+    session = state.sdk_session
+    if session is None:
+        return False, "no active SDK session"
+
+    ok = await _apply_model(session, target, _REASONING_EFFORT)
+    if ok:
+        try:
+            _persist_current_model(target)
+        except Exception as e:
+            print(f"[agent] persist current model failed (non-fatal): {e}", file=sys.stderr)
+        return True, target
+    return False, "set_model failed"
+
+
 async def handle_user_message(
     state: AgentState,
     msg: Message,
@@ -1587,6 +1656,43 @@ def _format_fusion_result(result: dict) -> str:
     )
 
 
+async def _apply_model(
+    session: _CopilotSession, target: str, effort: str,
+) -> bool:
+    """Apply a model to the live SDK session, handling reasoning-effort quirks.
+
+    Returns True if set_model succeeded. Some models reject a reasoning-effort
+    setting; we retry without it rather than silently keeping the SDK default.
+    Shared by startup configuration and the runtime `/model` command so both
+    take exactly the same path.
+    """
+    try:
+        if target in _NO_REASONING_EFFORT_MODELS:
+            await session.set_model(target)
+            print(f"[agent] Model set to {target} (no reasoning effort)", file=sys.stderr)
+        else:
+            await session.set_model(target, reasoning_effort=effort)
+            print(
+                f"[agent] Model set to {target} (reasoning={effort})",
+                file=sys.stderr,
+            )
+        return True
+    except Exception as e:
+        if "reasoning effort" in str(e).lower():
+            try:
+                await session.set_model(target)
+                print(
+                    f"[agent] Model set to {target} (no reasoning effort support)",
+                    file=sys.stderr,
+                )
+                return True
+            except Exception as e2:
+                print(f"[agent] set_model retry failed (non-fatal): {e2}", file=sys.stderr)
+                return False
+        print(f"[agent] set_model failed (non-fatal): {e}", file=sys.stderr)
+        return False
+
+
 async def _configure_model(
     session: _CopilotSession, client: _CopilotClient | None = None,
 ) -> None:
@@ -1700,30 +1806,7 @@ async def _configure_model(
     except Exception as e:
         print(f"[agent] list_models failed (using {target}): {e}", file=sys.stderr)
 
-    try:
-        if target in _NO_REASONING_EFFORT_MODELS:
-            await session.set_model(target)
-            print(f"[agent] Model set to {target} (no reasoning effort)", file=sys.stderr)
-        else:
-            await session.set_model(target, reasoning_effort=effort)
-            print(
-                f"[agent] Model set to {target} (reasoning={effort})",
-                file=sys.stderr,
-            )
-    except Exception as e:
-        # Some models reject a reasoning-effort setting; retry without it rather
-        # than silently keeping the SDK default model.
-        if "reasoning effort" in str(e).lower():
-            try:
-                await session.set_model(target)
-                print(
-                    f"[agent] Model set to {target} (no reasoning effort support)",
-                    file=sys.stderr,
-                )
-            except Exception as e2:
-                print(f"[agent] set_model retry failed (non-fatal): {e2}", file=sys.stderr)
-        else:
-            print(f"[agent] set_model failed (non-fatal): {e}", file=sys.stderr)
+    await _apply_model(session, target, effort)
 
     # Write available models to workspace for webui consumption
     try:
@@ -5875,6 +5958,22 @@ async def main() -> None:
         await ipc.disconnect()
         return None
 
+    async def on_set_model(msg: Message) -> Message | None:
+        """Switch the live SDK model via the dedicated control command.
+
+        The web UI model picker routes here (control socket → orchestrator →
+        agent) instead of injecting a `/model` chat message, which the Copilot
+        SDK never interpreted as a command. Applies the switch out-of-band and
+        records it authoritatively; no chat turn is emitted.
+        """
+        target = msg.payload.get("model", "")
+        ok, detail = await _apply_model_request(state, target)
+        if ok:
+            print(f"[agent] Model switched to {detail} (control command)", file=sys.stderr)
+        else:
+            print(f"[agent] Model switch to '{target}' failed: {detail}", file=sys.stderr)
+        return None
+
     async def on_dream_request(msg: Message) -> Message | None:
         """Auto-dreaming: extract noteworthy memories from context."""
         print("[agent] Dream request received — extracting memories", file=sys.stderr)
@@ -5970,6 +6069,7 @@ async def main() -> None:
     ipc.on_message(MessageType.SCHEDULE_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.TIMER_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.SHUTDOWN, on_shutdown)
+    ipc.on_message(MessageType.SET_MODEL, on_set_model)
     ipc.on_message(MessageType.DREAM_REQUEST, on_dream_request)
     ipc.on_message(MessageType.FILE_CHANGE, on_file_change)
 
