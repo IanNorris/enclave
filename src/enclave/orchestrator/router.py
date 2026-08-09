@@ -365,7 +365,12 @@ class MessageRouter:
             except asyncio.CancelledError:
                 pass
         await self._scheduler.stop()
+        # The control server holds long-lived web UI subscribe connections; its
+        # stop() cancels them so wait_closed() can't stall shutdown (previously
+        # a ~90s hang). Log around it so any future stall is easy to localise.
+        log.debug("Stopping control server")
         await self._control.stop()
+        log.debug("Control server stopped")
         if self._mimir_librarian is not None:
             await self._mimir_librarian.stop()
         self._perm_db.close()
