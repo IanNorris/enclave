@@ -646,21 +646,56 @@ class ContainerManager:
     async def _monitor_host_process(
         self, session: Session, proc: asyncio.subprocess.Process
     ) -> None:
-        """Monitor a host-mode agent subprocess, streaming stderr to log."""
+        """Monitor a host-mode agent subprocess and keep both pipes drained.
+
+        ``Process.communicate()`` reads both stdout and stderr itself, so it
+        must not run alongside a separate stderr reader. Doing both caused two
+        coroutines to read the same StreamReader, aborting stderr draining
+        during SDK startup and leaving the agent blocked on a full pipe
+        (ENC-016).
+        """
+        stdout_tail = bytearray()
         try:
-            # Stream stderr in real time so we can see SDK init messages
-            async def _stream_stderr():
+            async def _stream_stderr() -> None:
                 assert proc.stderr is not None
-                async for line in proc.stderr:
-                    text = line.decode().rstrip()
+                pending = bytearray()
+
+                def _log_stderr(data: bytes) -> None:
+                    text = data.decode(errors="replace").rstrip()
                     if text:
                         log.info("[host:%s] %s", session.id, text)
 
+                while chunk := await proc.stderr.read(65536):
+                    pending.extend(chunk)
+                    while (newline := pending.find(b"\n")) >= 0:
+                        _log_stderr(bytes(pending[:newline]))
+                        del pending[: newline + 1]
+                    # A single unterminated line must not grow without bound or
+                    # trip StreamReader.readline()'s separator limit.
+                    if len(pending) >= 65536:
+                        _log_stderr(bytes(pending))
+                        pending.clear()
+                if pending:
+                    _log_stderr(bytes(pending))
+
+            async def _drain_stdout() -> None:
+                assert proc.stdout is not None
+                while chunk := await proc.stdout.read(65536):
+                    stdout_tail.extend(chunk)
+                    if len(stdout_tail) > 500:
+                        del stdout_tail[:-500]
+
             stderr_task = asyncio.create_task(_stream_stderr())
-            stdout, _ = await proc.communicate()
-            await stderr_task
-            if stdout:
-                log.info("[host:%s] stdout: %s", session.id, stdout.decode()[-500:])
+            stdout_task = asyncio.create_task(_drain_stdout())
+            await proc.wait()
+            await asyncio.gather(stderr_task, stdout_task)
+
+            if stdout_tail:
+                log.info(
+                    "[host:%s] stdout: %s",
+                    session.id,
+                    stdout_tail.decode(errors="replace"),
+                )
             if proc.returncode != 0:
                 log.warning(
                     "[host:%s] Agent exited with code %d",

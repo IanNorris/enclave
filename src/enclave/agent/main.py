@@ -1052,12 +1052,15 @@ async def handle_user_message(
     if fusion_mode and content.strip():
         if fusion_mode == _fusion_mod.AUTO_FUSION_MODEL_ID:
             content = (
-                "<auto_fusion>For this message, if it is a substantive unit of "
-                "work (planning, design, a tricky algorithm, an architectural or "
-                "high-risk change), FIRST call `grade_complexity`; on tier "
-                "**fusion** (4-5) call the `fusion` tool and base your answer on "
-                "its synthesized result. Skip grading for trivial chatter or "
-                "obvious one-liners.</auto_fusion>\n\n"
+                "<auto_fusion>Internal routing policy; this is not part of the "
+                "user's request. Apply it silently: do not mention, explain, or "
+                "ask the user about grading. For a substantive unit of work "
+                "(planning, design, a tricky algorithm, an architectural choice, "
+                "or a high-risk change), call `grade_complexity` exactly once "
+                "before doing the work. On tier **base** (1-3), proceed normally. "
+                "On tier **fusion** (4-5), call the `fusion` tool and base the "
+                "work on its synthesized result. Skip grading for trivial chatter, "
+                "obvious one-liners, and simple follow-ups.</auto_fusion>\n\n"
             ) + content
         elif fusion_mode.startswith(_fusion_mod.FUSION_MODEL_PREFIX):
             preset_id = fusion_mode[len(_fusion_mod.FUSION_MODEL_PREFIX):]
@@ -2151,21 +2154,23 @@ async def try_init_copilot(
         if os.environ.get("ENCLAVE_AUTO_FUSION", "").strip() in ("1", "true", "yes"):
             prompt_parts.append(
                 "# Auto Fusion mode (ENABLED)\n\n"
-                "This session runs in **Auto Fusion**: use a cheaper model for "
-                "routine work, and escalate to a panel of models (Fusion) for "
-                "high-complexity work — automatically.\n\n"
-                "**At the start of any substantive task** (planning, design, a "
-                "tricky algorithm, an architectural choice, or a high-risk "
-                "change), FIRST call `grade_complexity` with a short description "
-                "of what you're about to do. It returns a 1-5 score and a tier:\n"
+                "This is an internal routing policy, not part of the user's "
+                "request. Apply it silently: never mention, explain, or ask the "
+                "user about grading. Route routine work to the base model and "
+                "high-complexity work to the Fusion panel automatically.\n\n"
+                "At the start of a substantive task (planning, design, a tricky "
+                "algorithm, an architectural choice, or a high-risk change), "
+                "call `grade_complexity` exactly once with a short description "
+                "of the task before doing the work. It returns a 1-5 score and "
+                "a tier:\n"
                 "- tier **base** (1-3): just do the work yourself as normal.\n"
                 "- tier **fusion** (4-5): call the `fusion` tool with the task "
                 "as the prompt, then base your answer/implementation on its "
                 "synthesized result.\n\n"
-                "Do NOT grade trivial chatter, obvious one-liners, or simple "
-                "follow-ups — only grade genuine units of work. Never grade more "
-                "than once for the same unit of work. The grade is shown to the "
-                "user live, so be honest, not inflationary."
+                "Do not grade trivial chatter, obvious one-liners, or simple "
+                "follow-ups. Never grade more than once for the same unit of "
+                "work. The grade is visible in activity output, so keep it honest "
+                "and non-inflationary, but do not narrate it in your response."
             )
             print("[agent] Auto Fusion mode enabled", file=sys.stderr)
 
