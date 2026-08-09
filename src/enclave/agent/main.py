@@ -1924,6 +1924,72 @@ def _configure_graphify_mcp(working_directory: str, state_dir: str) -> None:
         print(f"[agent] Failed to configure graphify MCP server: {e}", file=sys.stderr)
 
 
+_AUTH_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
+
+
+async def _wait_for_copilot_auth(
+    client: object,
+    retry_delays: tuple[float, ...] = _AUTH_RETRY_DELAYS,
+) -> bool:
+    """Wait for the Copilot subprocess authentication state to become ready.
+
+    ``CopilotClient.start()`` can return before the subprocess has finished
+    loading its token. During concurrent host-session restore, an immediate
+    ``get_auth_status()`` may therefore report ``isAuthenticated=False`` even
+    with a valid token (ENC-018). Treat both false and transient query errors as
+    retryable during this bounded startup window; only return false after every
+    attempt is exhausted.
+    """
+    attempts = len(retry_delays) + 1
+    for index in range(attempts):
+        try:
+            auth = await client.get_auth_status()
+            if auth.isAuthenticated:
+                if index:
+                    print(
+                        f"[agent] Copilot SDK authenticated on attempt {index + 1}/{attempts}",
+                        file=sys.stderr,
+                    )
+                return True
+            detail = "not authenticated yet"
+        except Exception as e:
+            detail = f"auth check failed: {e}"
+
+        if index == attempts - 1:
+            print(
+                f"[agent] Copilot SDK {detail} after {attempts} attempts",
+                file=sys.stderr,
+            )
+            return False
+
+        delay = retry_delays[index]
+        print(
+            f"[agent] Copilot SDK {detail}; retrying in {delay:g}s "
+            f"(attempt {index + 1}/{attempts})",
+            file=sys.stderr,
+        )
+        await asyncio.sleep(delay)
+
+    return False
+
+
+async def _authenticate_started_client(client: object) -> bool:
+    """Wait for auth readiness and clean up if startup is cancelled."""
+    try:
+        return await _wait_for_copilot_auth(client)
+    except asyncio.CancelledError:
+        # The new client is not stored in AgentState until try_init_copilot()
+        # returns, so outer shutdown cleanup cannot see it yet.
+        try:
+            await client.stop()
+        except Exception as e:
+            print(
+                f"[agent] Copilot SDK cleanup after cancelled auth failed: {e}",
+                file=sys.stderr,
+            )
+        raise
+
+
 async def try_init_copilot(
     working_directory: str = "/workspace",
     ipc: IPCClient | None = None,
@@ -1980,15 +2046,18 @@ async def try_init_copilot(
             client = CopilotClient(sdk_config)
             await client.start()
 
-            # Verify authentication before creating a session
-            try:
-                auth = await client.get_auth_status()
-                if not auth.isAuthenticated:
-                    print("[agent] Copilot SDK: not authenticated, falling back to echo", file=sys.stderr)
-                    await client.stop()
-                    return None
-            except Exception as e:
-                print(f"[agent] Copilot SDK auth check failed: {e}", file=sys.stderr)
+            # start() may return before the subprocess has loaded its token.
+            # During concurrent host-session restore, a single immediate check
+            # can transiently report false and permanently strand a valid
+            # session in echo mode (ENC-018).
+            authenticated = await _authenticate_started_client(client)
+
+            if not authenticated:
+                print(
+                    "[agent] Copilot SDK: authentication unavailable after "
+                    "startup retries, falling back to echo",
+                    file=sys.stderr,
+                )
                 await client.stop()
                 return None
 
