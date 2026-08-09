@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -45,6 +46,45 @@ class TestHostModeDetection:
         config = _make_config(tmp_path)
         profile = config.get_profile("dev")
         assert profile.image != ""
+
+
+class TestHostProcessMonitor:
+    """Regression coverage for host-agent stdout/stderr draining."""
+
+    @pytest.mark.asyncio
+    async def test_drains_both_pipes_without_concurrent_reader_race(
+        self, tmp_path: Path
+    ) -> None:
+        """Large output on both pipes must not block or race StreamReaders."""
+        manager = ContainerManager(_make_config(tmp_path))
+        session = Session(id="host-test", name="Host Test", room_id="!test:local")
+        session.status = "running"
+
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "os.write(1, b'o' * 200_000); "
+                "os.write(2, b'e' * 200_000)"
+            ),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        session.host_pid = proc.pid
+
+        try:
+            await asyncio.wait_for(
+                manager._monitor_host_process(session, proc), timeout=5
+            )
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+
+        assert proc.returncode == 0
+        assert session.status == "stopped"
+        assert session.host_pid is None
 
 
 class TestHostModeStart:
