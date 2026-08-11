@@ -65,6 +65,11 @@ class ControlServer:
         # broadcast on the global channel so the Web UI sidebar can show a live
         # per-session indicator. Only re-broadcast on change to avoid spam.
         self._activity_state: dict[str, str] = {}
+        # In-flight client handler tasks. Subscribe handlers block in a long
+        # `while True` loop for the life of the (web UI) connection, so
+        # ``Server.wait_closed()`` would otherwise hang shutdown until each one
+        # times out. We track them here to cancel them explicitly on stop().
+        self._client_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +84,19 @@ class ControlServer:
     async def stop(self) -> None:
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            # Long-lived subscribe handlers never return on their own, so cancel
+            # them before waiting — otherwise wait_closed() blocks until each
+            # connection's per-iteration timeout elapses (stalling shutdown).
+            tasks = list(self._client_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Defense-in-depth: never let server teardown hang shutdown.
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=5.0)
+            except asyncio.TimeoutError:
+                log.warning("Control server wait_closed timed out; continuing shutdown")
         if self._socket_path.exists():
             self._socket_path.unlink(missing_ok=True)
 
@@ -404,6 +421,10 @@ class ControlServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        # Track this handler so stop() can cancel long-lived subscribe loops.
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=10.0)
             if not raw:
@@ -465,6 +486,9 @@ class ControlServer:
             await self._write(writer, {"ok": False, "error": "Timeout reading request"})
         except json.JSONDecodeError as e:
             await self._write(writer, {"ok": False, "error": f"Invalid JSON: {e}"})
+        except asyncio.CancelledError:
+            # Server shutdown cancels long-lived subscribe handlers — expected.
+            raise
         except Exception as e:
             log.warning("Control client error: %s", e)
             try:
@@ -472,6 +496,8 @@ class ControlServer:
             except Exception:
                 pass
         finally:
+            if task is not None:
+                self._client_tasks.discard(task)
             writer.close()
             try:
                 await writer.wait_closed()
