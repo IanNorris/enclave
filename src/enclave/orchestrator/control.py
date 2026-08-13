@@ -256,10 +256,13 @@ class ControlServer:
         """Called by the router with the latest account "AI Credits" snapshot.
 
         Live-only (not in PERSIST_TYPES): the durable copy lives in the cost
-        tracker DB; this just pushes an update to any subscribed web UI so the
-        header refreshes without a reload.
+        tracker DB. The session stream refreshes its chat header, while the
+        global notification stream keeps account-wide sidebar UI current even
+        when the reporting container is not the selected session.
         """
-        self._emit(session_id, {"ok": True, "type": "credits", **payload})
+        event = {"ok": True, "type": "credits", "session_id": session_id, **payload}
+        self._emit(session_id, event)
+        self._emit_notification(event)
 
     def notify_fusion(self, session_id: str, payload: dict) -> None:
         """Called by the router on Auto Fusion grade + fusion events.

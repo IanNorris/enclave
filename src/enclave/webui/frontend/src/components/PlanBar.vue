@@ -3,31 +3,39 @@
     <div
       class="plan-bar"
       tabindex="0"
-      role="progressbar"
-      :aria-label="tooltipText"
-      :aria-valuenow="usedCredits"
-      :aria-valuemin="0"
-      :aria-valuemax="totalCredits"
     >
-      <div class="progress-bar" aria-hidden="true">
+      <div
+        class="progress-bar"
+        role="progressbar"
+        :aria-label="tooltipText"
+        :aria-valuenow="usedCredits"
+        :aria-valuemin="0"
+        :aria-valuemax="totalCredits"
+      >
         <div class="progress-fill" :style="{ width: `${progressPercent}%` }"></div>
       </div>
+      <button
+        class="plan-refresh"
+        type="button"
+        :disabled="creditsRefreshing"
+        title="Reload the latest reported quota"
+        @click.stop="loadCredits()"
+      >{{ creditsRefreshing ? '⟳' : '↻' }}</button>
       <div class="plan-tooltip" role="tooltip">
         <strong>{{ usedCredits }} / {{ totalCredits }} AI credits</strong>
         <span>{{ remainingCredits }} remaining</span>
         <span>Resets {{ resetDate }}</span>
+        <span class="plan-tooltip-note">Reload checks Enclave's latest reported quota.</span>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue'
-import { api } from '../api.js'
+import { computed, onMounted } from 'vue'
+import { useModels } from '../composables/useModels.js'
 
-const credits = ref(null)
-
-const plan = computed(() => credits.value?.snapshots?.premium_interactions || null)
+const { premiumCredits: plan, creditsRefreshing, loadCredits } = useModels()
 
 const usedCredits = computed(() => plan.value?.used ?? 0)
 const totalCredits = computed(() => plan.value?.entitlement ?? 0)
@@ -54,11 +62,7 @@ const tooltipText = computed(() => {
 })
 
 onMounted(async () => {
-  try {
-    credits.value = await api.getCredits()
-  } catch (err) {
-    console.warn('Failed to fetch credit plan:', err)
-  }
+  await loadCredits()
 })
 </script>
 
@@ -77,11 +81,40 @@ onMounted(async () => {
 }
 
 .progress-bar {
+  margin-right: 1.75rem;
   height: 6px;
   background: var(--bg-hover);
   border-radius: 3px;
   overflow: hidden;
   border: 1px solid var(--border);
+}
+
+.plan-refresh {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  width: 1.4rem;
+  height: 1.4rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm, 4px);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  transform: translateY(-50%);
+}
+
+.plan-refresh:hover:not(:disabled),
+.plan-refresh:focus-visible {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.plan-refresh:disabled {
+  cursor: wait;
+  opacity: 0.6;
 }
 
 .progress-fill {
@@ -117,5 +150,11 @@ onMounted(async () => {
 .plan-bar:focus-visible .plan-tooltip {
   opacity: 1;
   transform: translateY(0);
+}
+
+.plan-tooltip-note {
+  margin-top: 0.15rem;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
 }
 </style>

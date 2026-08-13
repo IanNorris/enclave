@@ -9,6 +9,7 @@ const models = ref({ current: null, available: [], preferences: [] })
 const currentModel = ref('')
 const modelsRefreshing = ref(false)
 const aiCredits = ref(null)
+const creditsRefreshing = ref(false)
 // Tracks which session `models` currently reflects, so a merge is only applied
 // on same-session reloads (not on a switch, which must replace outright).
 let _lastModelsSession = null
@@ -43,6 +44,8 @@ function pickCreditsSnapshot(snapshots) {
     || keys[0]
   return { key: preferred, ...snapshots[preferred] }
 }
+
+const premiumCredits = computed(() => pickCreditsSnapshot(aiCredits.value?.snapshots))
 
 const creditsLabel = computed(() => {
   const c = aiCredits.value
@@ -135,8 +138,9 @@ async function changeModel(sessionId) {
   }
 }
 
-async function loadCredits(sessionId) {
-  if (!sessionId) { aiCredits.value = null; return }
+async function loadCredits(sessionId = '') {
+  if (creditsRefreshing.value) return
+  creditsRefreshing.value = true
   try {
     const data = await api.getCredits(sessionId)
     const hasSnapshots = data && data.snapshots && Object.keys(data.snapshots).length
@@ -146,16 +150,20 @@ async function loadCredits(sessionId) {
     }
   } catch (e) {
     console.error('Failed to load AI credits:', e)
+  } finally {
+    creditsRefreshing.value = false
   }
 }
 
-// Apply a live "credits" websocket message (forwarded from Chat's stream).
-function applyCreditsUpdate(msg) {
+// Apply a live "credits" websocket message. The global sidebar receives updates
+// from any session, so it must not replace selected-session usage with another
+// container's usage.
+function applyCreditsUpdate(msg, includeSession = true) {
   if ((msg.snapshots && Object.keys(msg.snapshots).length) ||
-      (msg.session && Object.keys(msg.session).length)) {
+       (msg.session && Object.keys(msg.session).length)) {
     aiCredits.value = {
       snapshots: msg.snapshots || aiCredits.value?.snapshots || {},
-      session: msg.session || aiCredits.value?.session || {},
+      session: includeSession ? (msg.session || aiCredits.value?.session || {}) : (aiCredits.value?.session || {}),
       ts: msg.ts || new Date().toISOString(),
       last_cost: msg.last_cost || 0,
       model: msg.model || '',
@@ -169,6 +177,8 @@ export function useModels() {
     currentModel,
     modelsRefreshing,
     aiCredits,
+    creditsRefreshing,
+    premiumCredits,
     creditsLabel,
     creditsTitle,
     loadModels,

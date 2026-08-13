@@ -70,6 +70,26 @@ def test_emit_still_fans_out_to_subscribers(tmp_path):
     assert evt["type"] == "response" and evt["content"] == "hi"
 
 
+def test_credit_notification_reaches_session_and_global_subscribers(tmp_path):
+    import asyncio
+
+    sid = "sess-credits"
+    srv = _server(tmp_path, sid)
+    session_queue: asyncio.Queue = asyncio.Queue()
+    global_queue: asyncio.Queue = asyncio.Queue()
+    srv._subscribers[sid] = {session_queue}
+    srv._notification_subscribers.add(global_queue)
+
+    snapshots = {"premium_interactions": {"entitlement": 7000, "used": 175}}
+    srv.notify_credits(sid, {"snapshots": snapshots})
+
+    session_event = session_queue.get_nowait()
+    global_event = global_queue.get_nowait()
+    assert session_event == global_event
+    assert session_event["session_id"] == sid
+    assert session_event["snapshots"] == snapshots
+
+
 def test_unknown_session_does_not_raise(tmp_path):
     srv = _server(tmp_path, "known")
     # Session not found → no workspace, no write, no crash.

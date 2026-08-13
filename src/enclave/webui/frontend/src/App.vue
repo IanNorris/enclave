@@ -166,6 +166,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from './stores/session.js'
+import { useModels } from './composables/useModels.js'
 import { api } from './api.js'
 import SessionTabBar from './components/SessionTabBar.vue'
 import SpecProgressBar from './components/SpecProgressBar.vue'
@@ -175,6 +176,7 @@ const route = useRoute()
 const router = useRouter()
 const sidebarOpen = ref(false)
 const { sessions, selectedSessionId, loadSessions, touchSessionActive } = useSessionStore()
+const { applyCreditsUpdate, loadCredits } = useModels()
 
 // Sort helper: concierge pinned to the top, then most-recently-active first.
 function byRecency(list) {
@@ -376,6 +378,10 @@ function connectNotifWs() {
         // Consumed by the Android client only; no browser-side action.
         return
       }
+      if (msg && msg.type === 'credits') {
+        applyCreditsUpdate(msg, false)
+        return
+      }
       loadNotifications()
     }
     notifWs.onclose = () => {
@@ -463,6 +469,7 @@ onMounted(() => {
   window.addEventListener('resize', applyViewportHeight)
   if (!isLoginPage.value && hasToken.value) {
     loadSessions()
+    loadCredits()
     pollAskCount()
     askPollTimer = setInterval(pollAskCount, 30000)
     loadNotifications()
