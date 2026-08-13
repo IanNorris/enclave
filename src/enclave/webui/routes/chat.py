@@ -409,6 +409,21 @@ async def get_credits(request: Request, session: str = ""):
     return empty
 
 
+@router.get("/plan")
+async def get_plan(request: Request):
+    """Return the current billing plan details.
+    
+    Includes the monthly AI credit cap. The cap defaults to 7000 AI credits
+    per month and can be overridden via ENCLAVE_PLAN_MONTHLY_CAP environment variable.
+    """
+    import os
+    monthly_cap = int(os.getenv("ENCLAVE_PLAN_MONTHLY_CAP", "7000"))
+    return {
+        "monthly_cap": monthly_cap,
+        "currency": "AI credits",
+    }
+
+
 @router.get("/complexity")
 async def get_complexity(request: Request, session: str = "", limit: int = 500):
     """Return recorded Auto Fusion complexity grades (for the graph).

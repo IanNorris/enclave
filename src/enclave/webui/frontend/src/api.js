@@ -124,6 +124,7 @@ export const api = {
   }),
   getModels: (session, refresh = false) => request(`/chat/${session}/models${refresh ? '?refresh=true' : ''}`),
   getCredits: (sessionId) => request(`/chat/credits${sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''}`),
+  getPlan: () => request('/chat/plan'),
   setModel: (session, model) => request(`/chat/${session}/model`, {
     method: 'POST',
     body: JSON.stringify({ content: model }),

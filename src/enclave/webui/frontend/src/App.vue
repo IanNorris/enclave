@@ -156,6 +156,7 @@
         <router-view />
       </div>
     </main>
+    <PlanBar />
   </div>
 </template>
 
@@ -166,6 +167,7 @@ import { useSessionStore } from './stores/session.js'
 import { api } from './api.js'
 import SessionTabBar from './components/SessionTabBar.vue'
 import SpecProgressBar from './components/SpecProgressBar.vue'
+import PlanBar from './components/PlanBar.vue'
 
 const route = useRoute()
 const router = useRouter()
