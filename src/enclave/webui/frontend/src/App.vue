@@ -128,6 +128,9 @@
 
       <div class="sidebar-spacer"></div>
 
+      <!-- Plan info bar -->
+      <PlanBar />
+
       <!-- Settings: global / cross-session sections -->
       <div class="settings-footer">
         <div v-if="settingsOpen" class="settings-menu">
@@ -156,7 +159,6 @@
         <router-view />
       </div>
     </main>
-    <PlanBar />
   </div>
 </template>
 
