@@ -459,6 +459,8 @@ class ControlServer:
                 await self._handle_set_model(req, writer)
             elif action == "credits":
                 await self._handle_credits(req, writer)
+            elif action == "refresh_credits":
+                await self._handle_refresh_credits(req, writer)
             elif action == "complexity":
                 await self._handle_complexity(req, writer)
             elif action == "profiles":
@@ -739,6 +741,22 @@ class ControlServer:
         payload.update(credits)
         payload["session"] = session_credits or {}
         await self._write(writer, payload)
+
+    async def _handle_refresh_credits(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Request a fresh account quota snapshot from a selected live agent."""
+        session_id = req.get("session", "")
+        if not session_id:
+            await self._write(writer, {"ok": False, "error": "Missing session"})
+            return
+        try:
+            sent = await self._router.refresh_session_credits(session_id)
+        except Exception as e:
+            await self._write(writer, {"ok": False, "error": str(e)})
+            return
+        if sent:
+            await self._write(writer, {"ok": True, "type": "credits_refresh_requested"})
+        else:
+            await self._write(writer, {"ok": False, "error": "Agent not connected"})
 
     async def _handle_complexity(self, req: dict, writer: asyncio.StreamWriter) -> None:
         """Return recorded Auto Fusion complexity grades for the graph.

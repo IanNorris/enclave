@@ -18,14 +18,14 @@
         class="plan-refresh"
         type="button"
         :disabled="creditsRefreshing"
-        title="Reload the latest reported quota"
-        @click.stop="loadCredits()"
+        title="Fetch the current Copilot account quota"
+        @click.stop="refreshCredits(selectedSessionId)"
       >{{ creditsRefreshing ? '⟳' : '↻' }}</button>
       <div class="plan-tooltip" role="tooltip">
         <strong>{{ usedCredits }} / {{ totalCredits }} AI credits</strong>
         <span>{{ remainingCredits }} remaining</span>
         <span>Resets {{ resetDate }}</span>
-        <span class="plan-tooltip-note">Reload checks Enclave's latest reported quota.</span>
+        <span class="plan-tooltip-note">Refresh fetches the current Copilot quota.</span>
       </div>
     </div>
   </div>
@@ -33,9 +33,11 @@
 
 <script setup>
 import { computed, onMounted } from 'vue'
+import { useSessionStore } from '../stores/session.js'
 import { useModels } from '../composables/useModels.js'
 
-const { premiumCredits: plan, creditsRefreshing, loadCredits } = useModels()
+const { selectedSessionId } = useSessionStore()
+const { premiumCredits: plan, creditsRefreshing, loadCredits, refreshCredits } = useModels()
 
 const usedCredits = computed(() => plan.value?.used ?? 0)
 const totalCredits = computed(() => plan.value?.entitlement ?? 0)

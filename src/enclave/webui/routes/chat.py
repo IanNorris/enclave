@@ -409,6 +409,31 @@ async def get_credits(request: Request, session: str = ""):
     return empty
 
 
+@router.post("/credits/refresh")
+async def refresh_credits(request: Request, session: str):
+    """Request a fresh Copilot account quota snapshot from a live agent."""
+    data_dir = Path(request.app.state.config.data_dir)
+    sock_path = data_dir / "control.sock"
+    if not sock_path.exists():
+        raise HTTPException(status_code=503, detail="Orchestrator is not running")
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        writer.write(json.dumps({"action": "refresh_credits", "session": session}).encode() + b"\n")
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, asyncio.TimeoutError) as e:
+        raise HTTPException(status_code=503, detail="Credit refresh is unavailable") from e
+    try:
+        response = json.loads(line.decode()) if line else {}
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail="Invalid refresh response") from e
+    if not response.get("ok"):
+        raise HTTPException(status_code=409, detail=response.get("error", "Credit refresh failed"))
+    return {"ok": True}
+
+
 @router.get("/complexity")
 async def get_complexity(request: Request, session: str = "", limit: int = 500):
     """Return recorded Auto Fusion complexity grades (for the graph).

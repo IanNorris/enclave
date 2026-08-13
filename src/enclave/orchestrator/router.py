@@ -397,6 +397,20 @@ class MessageRouter:
             log.info("Sent SET_MODEL to %s: %s", session_id, model)
         return sent
 
+    async def refresh_session_credits(self, session_id: str) -> bool:
+        """Ask a running agent to fetch the current account quota from Copilot."""
+        session = self.containers.get_session(session_id)
+        if not session:
+            return False
+        sent = await self.ipc.send_to(
+            session_id,
+            Message(type=MessageType.REFRESH_CREDITS),
+        )
+        if sent:
+            self._touch_activity(session_id)
+            log.info("Requested account quota refresh from %s", session_id)
+        return sent
+
     async def inject_message(
         self, session_id: str, content: str, attachments: list[dict] | None = None
     ) -> bool:

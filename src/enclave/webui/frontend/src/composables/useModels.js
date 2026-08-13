@@ -155,6 +155,18 @@ async function loadCredits(sessionId = '') {
   }
 }
 
+async function refreshCredits(sessionId) {
+  if (!sessionId || creditsRefreshing.value) return
+  creditsRefreshing.value = true
+  try {
+    await api.refreshCredits(sessionId)
+  } catch (e) {
+    console.error('Failed to refresh AI credits:', e)
+  } finally {
+    creditsRefreshing.value = false
+  }
+}
+
 // Apply a live "credits" websocket message. The global sidebar receives updates
 // from any session, so it must not replace selected-session usage with another
 // container's usage.
@@ -185,6 +197,7 @@ export function useModels() {
     refreshModels,
     changeModel,
     loadCredits,
+    refreshCredits,
     applyCreditsUpdate,
   }
 }

@@ -6048,6 +6048,30 @@ async def main() -> None:
             print(f"[agent] Model switch to '{target}' failed: {detail}", file=sys.stderr)
         return None
 
+    async def on_refresh_credits(msg: Message) -> Message | None:
+        """Fetch a fresh account quota snapshot without starting a chat turn."""
+        if not state.sdk_client:
+            print("[agent] Credit refresh unavailable: no Copilot client", file=sys.stderr)
+            return None
+        try:
+            from copilot.rpc import AccountGetQuotaRequest
+
+            result = await asyncio.wait_for(
+                state.sdk_client.rpc.account.get_quota(AccountGetQuotaRequest()),
+                timeout=15.0,
+            )
+            snapshots = _serialize_quota_snapshots(result.quota_snapshots)
+            if not snapshots:
+                print("[agent] Credit refresh returned no quota snapshots", file=sys.stderr)
+                return None
+            await ipc.send(Message(
+                type=MessageType.USAGE_REPORT,
+                payload={"quota_snapshots": snapshots},
+            ))
+        except Exception as e:
+            print(f"[agent] Credit refresh failed: {e}", file=sys.stderr)
+        return None
+
     async def on_dream_request(msg: Message) -> Message | None:
         """Auto-dreaming: extract noteworthy memories from context."""
         print("[agent] Dream request received — extracting memories", file=sys.stderr)
@@ -6144,6 +6168,7 @@ async def main() -> None:
     ipc.on_message(MessageType.TIMER_TRIGGER, on_scheduled_trigger)
     ipc.on_message(MessageType.SHUTDOWN, on_shutdown)
     ipc.on_message(MessageType.SET_MODEL, on_set_model)
+    ipc.on_message(MessageType.REFRESH_CREDITS, on_refresh_credits)
     ipc.on_message(MessageType.DREAM_REQUEST, on_dream_request)
     ipc.on_message(MessageType.FILE_CHANGE, on_file_change)
 
