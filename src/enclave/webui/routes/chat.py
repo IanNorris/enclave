@@ -409,38 +409,6 @@ async def get_credits(request: Request, session: str = ""):
     return empty
 
 
-@router.get("/plan")
-async def get_plan(request: Request):
-    """Return the current billing plan details with usage.
-    
-    Includes the monthly AI credit cap and total credits used this month.
-    Cap defaults to 7000 AI credits and can be overridden via
-    ENCLAVE_PLAN_MONTHLY_CAP environment variable.
-    """
-    import os
-    from pathlib import Path
-    from src.enclave.common.cost_tracker import CostTracker
-    
-    monthly_cap = int(os.getenv("ENCLAVE_PLAN_MONTHLY_CAP", "7000"))
-    
-    used = 0.0
-    try:
-        data_dir = Path(request.app.state.config.data_dir)
-        tracker = CostTracker(str(data_dir))
-        credits = tracker.get_total_credits()
-        used = credits.get("aiu", 0.0)
-        tracker.close()
-    except Exception as e:
-        import logging
-        logging.getLogger("enclave.webui").warning("Failed to get total credits: %s", e)
-    
-    return {
-        "monthly_cap": monthly_cap,
-        "used": used,
-        "currency": "AI credits",
-    }
-
-
 @router.get("/complexity")
 async def get_complexity(request: Request, session: str = "", limit: int = 500):
     """Return recorded Auto Fusion complexity grades (for the graph).

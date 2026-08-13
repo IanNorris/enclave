@@ -423,23 +423,6 @@ class CostTracker:
             "updated_at": row["updated_at"],
         }
 
-    def get_total_credits(self) -> dict[str, Any]:
-        """Return total AI Credits consumed across all sessions this month.
-        
-        Sums nano_aiu from all sessions and returns the human-readable total.
-        """
-        row = self._conn.execute(
-            "SELECT SUM(nano_aiu) as total_nano_aiu FROM session_credits",
-        ).fetchone()
-        if not row:
-            nano = 0.0
-        else:
-            nano = row["total_nano_aiu"] or 0.0
-        return {
-            "nano_aiu": nano,
-            "aiu": round(nano / 1_000_000_000, 2),
-        }
-
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()
