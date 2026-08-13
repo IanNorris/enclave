@@ -1,15 +1,42 @@
 <template>
-  <div class="plan-bar" v-if="planInfo">
-    <span class="plan-label">Plan:</span>
-    <span class="plan-detail">{{ planInfo.monthly_cap }} {{ planInfo.currency }}/mo</span>
+  <div class="plan-bar-container" v-if="planInfo">
+    <div class="plan-bar" :title="tooltipText">
+      <div class="bar-wrapper">
+        <div class="progress-bar">
+          <div class="progress-fill" :style="{ width: progressPercent + '%' }"></div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { api } from '../api.js'
 
 const planInfo = ref(null)
+
+const usedCredits = computed(() => {
+  if (!planInfo.value) return 0
+  return Math.round((planInfo.value.used || 0) * 100) / 100
+})
+
+const totalCredits = computed(() => {
+  return planInfo.value?.monthly_cap || 7000
+})
+
+const progressPercent = computed(() => {
+  if (!totalCredits.value) return 0
+  return Math.min(100, (usedCredits.value / totalCredits.value) * 100)
+})
+
+const tooltipText = computed(() => {
+  if (!planInfo.value) return ''
+  const used = usedCredits.value
+  const total = totalCredits.value
+  const remaining = Math.max(0, total - used)
+  return `Used: ${used} / ${total} AI credits\nRemaining: ${remaining}\nResets monthly`
+})
 
 onMounted(async () => {
   try {
@@ -21,25 +48,36 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.plan-bar {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
+.plan-bar-container {
   padding: 0.5rem 0.6rem;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   color: var(--text-secondary);
-  white-space: nowrap;
 }
 
-.plan-label {
-  font-weight: 500;
-  opacity: 0.7;
+.plan-bar {
+  cursor: help;
 }
 
-.plan-detail {
-  color: var(--text-primary);
-  font-weight: 500;
+.bar-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.progress-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-hover);
+  border-radius: 3px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  transition: width 0.3s ease;
 }
 </style>
